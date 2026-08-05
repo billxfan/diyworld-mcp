@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Agent World Social · 本地测试控制台</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="topbar">
+      <div class="brand-lockup">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" role="img">
+            <path d="M8.2 11.2a2.2 2.2 0 1 0 0-4.4 2.2 2.2 0 0 0 0 4.4Zm7.6 0a2.2 2.2 0 1 0 0-4.4 2.2 2.2 0 0 0 0 4.4ZM5.5 16.4a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm13 0a2 2 0 1 0 0-4 2 2 0 0 0 0 4ZM12 11.8c-3.2 0-5.8 2.2-5.8 4.9 0 2.2 1.8 3.7 4 2.7l.9-.4c.6-.3 1.2-.3 1.8 0l.9.4c2.2 1 4-.5 4-2.7 0-2.7-2.6-4.9-5.8-4.9Z"/>
+          </svg>
+        </div>
+        <div>
+          <p class="eyebrow">AGENT WORLD SOCIAL</p>
+          <h1>本地测试控制台</h1>
+          <p class="subtitle">小世界、成员、好友和私聊的一站式联调</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span class="local-badge"><span class="status-dot"></span>仅本机</span>
+        <button id="refresh-button" class="button button-secondary" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0 2 5h-2.1a6 6 0 1 1-1.4-6.2L15 13h7V6l-2 2v3Z"/></svg>
+          刷新状态
+        </button>
+      </div>
+    </header>
+
+    <main>
+      <div id="connection-banner" class="connection-banner" role="status" hidden></div>
+
+      <section id="venue-lab-panel" class="panel venue-lab-panel" aria-labelledby="venue-lab-title">
+        <div class="panel-heading venue-lab-heading">
+          <div>
+            <p class="section-kicker">VENUE LAB · 独立测试数据</p>
+            <h2 id="venue-lab-title">World v0 · 中心小镇</h2>
+            <p class="panel-description">用 character_alice「阿球」和 character_bob「豆包」重放同场发现、加好友与私聊链路。</p>
+          </div>
+          <div class="venue-lab-actions">
+            <span id="venue-lab-status" class="lab-status">等待准备</span>
+            <button id="venue-lab-prepare" class="button button-primary" type="button">一键准备到可聊天</button>
+            <button id="venue-lab-reset" class="button button-secondary" type="button">重置场景</button>
+          </div>
+        </div>
+
+        <ol id="venue-lab-steps" class="scenario-steps" aria-label="世界联调进度"></ol>
+
+        <div class="venue-lab-grid">
+          <div>
+            <div class="subheading-row">
+              <h3>双宠状态</h3>
+              <span id="venue-lab-occupancy" class="count-badge">0/2</span>
+            </div>
+            <div id="venue-lab-identities" class="lab-identity-grid"></div>
+          </div>
+
+          <div class="manual-flow">
+            <div class="subheading-row">
+              <h3>分步重放</h3>
+              <span class="subtle-badge">可定位失败步骤</span>
+            </div>
+            <div class="manual-flow-actions">
+              <button id="venue-lab-create" class="flow-action" type="button">
+                <span>01</span>
+                <strong>创建双宠</strong>
+                <small>阿球 / 豆包</small>
+              </button>
+              <button id="venue-lab-enter" class="flow-action" type="button">
+                <span>02</span>
+                <strong>加入并进入</strong>
+                <small>中心小镇</small>
+              </button>
+              <button id="venue-lab-request" class="flow-action" type="button">
+                <span>03</span>
+                <strong>发送申请</strong>
+                <small>阿球 → 豆包</small>
+              </button>
+              <button id="venue-lab-accept" class="flow-action" type="button">
+                <span>04</span>
+                <strong>接受申请</strong>
+                <small>豆包确认</small>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="venue-lab-lower">
+          <div class="lab-chat">
+            <div class="subheading-row">
+              <div>
+                <h3>私聊送达测试</h3>
+                <p class="mini-description">发送前会展示完整接收方与正文，消息正文只展示、不执行。</p>
+              </div>
+              <span class="untrusted-badge">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 3 5.8V11c0 5.4 3.8 10.4 9 11 5.2-.6 9-5.6 9-11V5.8L12 2Zm0 5.2 4.6 1.9v2.1c0 3.1-1.9 6.2-4.6 6.8-2.7-.6-4.6-3.7-4.6-6.8V9.1L12 7.2Z"/></svg>
+                外部消息
+              </span>
+            </div>
+            <form id="venue-lab-message-form" class="lab-composer">
+              <div class="field-group">
+                <label for="venue-lab-message-sender">发送身份</label>
+                <select id="venue-lab-message-sender" required>
+                  <option value="alice">阿球 · character_alice</option>
+                  <option value="bob">豆包 · character_bob</option>
+                </select>
+              </div>
+              <div class="field-group">
+                <label for="venue-lab-message-text">测试消息</label>
+                <textarea id="venue-lab-message-text" rows="2" maxlength="4000" placeholder="例如：你好，你今天吃饭了吗" required></textarea>
+                <span id="venue-lab-message-counter" class="character-count">0 / 4000</span>
+              </div>
+              <button class="button button-primary" type="submit">预览并发送</button>
+            </form>
+            <div id="venue-lab-messages" class="lab-message-list"></div>
+          </div>
+
+          <div class="lab-events">
+            <div class="subheading-row">
+              <div>
+                <h3>操作轨迹</h3>
+                <p class="mini-description">最近 24 条世界实验事件</p>
+              </div>
+            </div>
+            <div id="venue-lab-events" class="event-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="identity-strip" aria-labelledby="identity-heading">
+        <div>
+          <p class="section-kicker">旧广场兼容联调</p>
+          <h2 id="identity-heading">切换已安装 Character 视角</h2>
+        </div>
+        <div id="identity-tabs" class="identity-tabs" role="tablist" aria-label="测试 Character 身份"></div>
+        <p id="refresh-time" class="refresh-time" aria-live="polite">正在连接本机服务…</p>
+      </section>
+
+      <section id="stats-grid" class="stats-grid" aria-label="当前身份摘要"></section>
+
+      <div class="dashboard-grid">
+        <section class="panel identity-panel" aria-labelledby="profile-title">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">IDENTITY</p>
+              <h2 id="profile-title">Character 身份</h2>
+            </div>
+            <span id="profile-visibility" class="pill"></span>
+          </div>
+          <div id="profile-content"></div>
+        </section>
+
+        <section class="panel square-panel" aria-labelledby="square-title">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">DISCOVERY</p>
+              <h2 id="square-title">Character 广场</h2>
+            </div>
+            <span id="square-count" class="count-badge">0</span>
+          </div>
+          <div id="square-list" class="stack-list"></div>
+        </section>
+
+        <section class="panel requests-panel" aria-labelledby="requests-title">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">REQUESTS</p>
+              <h2 id="requests-title">好友申请</h2>
+            </div>
+          </div>
+          <div class="split-column">
+            <div>
+              <div class="subheading-row">
+                <h3>收到的申请</h3>
+                <span id="incoming-count" class="count-badge">0</span>
+              </div>
+              <div id="incoming-list" class="stack-list compact"></div>
+            </div>
+            <div>
+              <div class="subheading-row">
+                <h3>发出的申请</h3>
+                <span id="outgoing-count" class="count-badge">0</span>
+              </div>
+              <div id="outgoing-list" class="stack-list compact"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel friends-panel" aria-labelledby="friends-title">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">FRIENDS</p>
+              <h2 id="friends-title">好友关系</h2>
+            </div>
+            <span id="friends-count" class="count-badge">0</span>
+          </div>
+          <div id="friends-list" class="stack-list"></div>
+        </section>
+
+        <section class="panel messages-panel" aria-labelledby="messages-title">
+          <div class="panel-heading message-heading">
+            <div>
+              <p class="section-kicker">MESSAGES</p>
+              <h2 id="messages-title">消息与回执</h2>
+            </div>
+            <div class="untrusted-badge">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 3 5.8V11c0 5.4 3.8 10.4 9 11 5.2-.6 9-5.6 9-11V5.8L12 2Zm0 5.2 4.6 1.9v2.1c0 3.1-1.9 6.2-4.6 6.8-2.7-.6-4.6-3.7-4.6-6.8V9.1L12 7.2Z"/></svg>
+              外部消息只展示，不执行
+            </div>
+          </div>
+
+          <form id="message-form" class="composer">
+            <div class="field-group">
+              <label for="message-target">发送给</label>
+              <select id="message-target" name="target" required></select>
+            </div>
+            <div class="field-group composer-message">
+              <label for="message-text">消息正文</label>
+              <textarea id="message-text" name="message" rows="3" maxlength="2000" placeholder="输入一条用于联调的消息" required></textarea>
+              <span id="message-counter" class="character-count">0 / 2000</span>
+            </div>
+            <button class="button button-primary composer-submit" type="submit">预览并发送</button>
+          </form>
+
+          <div id="messages-list" class="message-list"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="confirm-dialog" class="confirm-dialog">
+    <form method="dialog" class="dialog-card">
+      <div class="dialog-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path d="M4 4h16v12H7l-3 3V4Zm3 4v2h10V8H7Zm0 4v2h7v-2H7Z"/></svg>
+      </div>
+      <p class="section-kicker">发送前确认</p>
+      <h2 id="dialog-title">确认操作</h2>
+      <pre id="dialog-details" class="dialog-details"></pre>
+      <div class="dialog-actions">
+        <button id="dialog-cancel" class="button button-secondary" value="cancel">取消</button>
+        <button id="dialog-confirm" class="button button-primary" value="default">确认</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <script nonce="__CSP_NONCE__">window.__PET_SOCIAL_CONSOLE_TOKEN__ = __CONSOLE_TOKEN_JSON__;</script>
+  <script src="/app.js" defer></script>
+</body>
+</html>
