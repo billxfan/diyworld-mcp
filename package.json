@@ -1,0 +1,47 @@
+{
+  "name": "@diyworld/mcp",
+  "version": "0.0.1",
+  "private": false,
+  "type": "module",
+  "description": "DIYworld MCP server and connector for persistent shared worlds.",
+  "bin": {
+    "diyworld": "scripts/agent-world-social.mjs",
+    "agent-world": "scripts/agent-world-social.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/billxfan/diyworld-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/billxfan/diyworld-mcp/issues"
+  },
+  "homepage": "https://github.com/billxfan/diyworld-mcp#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "src/",
+    "scripts/",
+    "skills/",
+    "test-console/",
+    "README.md",
+    "TESTING.zh-CN.md"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "bridge": "node src/bridge.mjs",
+    "cli": "node src/cli.mjs",
+    "admin": "node scripts/admin.mjs",
+    "test:console": "node src/local-console.mjs",
+    "install:local": "node scripts/install.mjs",
+    "connect:agent": "node scripts/connect-agent.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "release:check": "node scripts/release-check.mjs",
+    "docs:official-worlds": "node scripts/generate-official-world-doc.mjs",
+    "pack:tester": "node scripts/package-tester.mjs",
+    "test": "node --test"
+  }
+}

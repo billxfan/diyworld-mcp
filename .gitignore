@@ -1,0 +1,24 @@
+.DS_Store
+node_modules/
+coverage/
+dist/
+.npm-cache/
+
+.env
+.env.*
+!.env.example
+
+# Local identities and credentials
+config.json
+config.json.pre-recovery-backup
+test/*.json
+
+# Runtime state
+data/
+logs/
+backups/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+npm-debug.log*

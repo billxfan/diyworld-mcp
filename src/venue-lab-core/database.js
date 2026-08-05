@@ -1,0 +1,1950 @@
+import { mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
+import {
+  OFFICIAL_WORLD_VERSION,
+  OFFICIAL_WORLDS as OFFICIAL_WORLD_CATALOG,
+} from "./official-worlds.js";
+
+export { OFFICIAL_WORLD_VERSION };
+
+export const WORLD_HOST_CAPABILITIES = [
+  "guide",
+  "inhabit",
+  "facilitate",
+  "coordinate",
+  "judge",
+  "advance",
+  "remember",
+  "recap",
+];
+
+export const WORLD_HOST_ROLES = ["host", "npc", "narrator", "steward"];
+
+export const DEFAULT_WORLD_PARTICIPATION_POLICY = {
+  mode: "hybrid",
+  solo_enabled: true,
+  multiplayer_enabled: true,
+  multiplayer_transition: "automatic",
+};
+
+export const DEFAULT_WORLD_EVOLUTION_POLICY = {
+  persistence: "persistent",
+  mode: "event_driven",
+  sources: ["member_input", "host_outcome", "time_trigger"],
+  idle_behavior: "pause",
+};
+
+export const OFFICIAL_WORLDS = OFFICIAL_WORLD_CATALOG;
+
+export const PLATFORM_WORLD_BUILDER_ID = "platform-world-builder";
+
+export const WORLD_AGENT_TEMPLATES = [
+  {
+    id: "general-referee",
+    name: "通用世界主持",
+    description: "适合多数文字互动、轻剧情与规则驱动世界。",
+    worldDefaults: {
+      visibility: "public",
+      joinPolicy: "open",
+      friendPolicy: "enabled",
+      resolutionMode: "direct",
+      entryPrompt: "",
+      hostPrompt: "",
+      initialWorldState: {},
+      initialMemberState: {},
+    },
+    refereeDefaults: {
+      name: "世界主持",
+      agentKind: "host",
+      worldRole: "host",
+      participationPolicy: DEFAULT_WORLD_PARTICIPATION_POLICY,
+      evolutionPolicy: DEFAULT_WORLD_EVOLUTION_POLICY,
+      capabilities: WORLD_HOST_CAPABILITIES,
+      personaText:
+        "保持中立、可解释和一致，帮助成员理解世界、开始参与，并依据当前世界规则裁决。",
+      speakingStyle:
+        "简洁、清晰，先说明当前情境，再给出结果、依据和可选下一步。",
+      judgementPolicy: {
+        rule_priority: ["platform_safety", "world_rules", "world_definition"],
+        invalid_input: "reject_or_clarify",
+        state_writes: "referee_only",
+        state_patch_policy: "host_derived",
+      },
+      memoryPolicy: {
+        scope: "world",
+        retain_events: true,
+        cross_world_memory: false,
+      },
+      outputSchema: {
+        required: ["decision", "reason_text", "outcome_text"],
+        decisions: ["accepted", "rejected", "clarification", "escalated"],
+      },
+      modelConfig: { mode: "platform_default" },
+      toolAllowlist: [],
+      onboardingPolicy: {
+        welcome_text: "",
+        setup_prompt: "你希望先如何参与这个世界？",
+        starter_choices: [
+          {
+            id: "observe",
+            label: "先了解当前情况",
+            input_type: "choice",
+            event_type: "host.onboarding.intent_selected",
+            body_text: "我想先了解当前情况。",
+          },
+          {
+            id: "greet",
+            label: "向在场成员打招呼",
+            input_type: "speech",
+            event_type: "speech",
+            body_text: "大家好，我刚来到这里。",
+          },
+          {
+            id: "contribute",
+            label: "看看有什么可以参与",
+            input_type: "choice",
+            event_type: "host.onboarding.intent_selected",
+            body_text: "我想看看现在有什么可以参与。",
+          },
+        ],
+        free_input_prompt: "也可以直接说你想做什么。",
+      },
+      facilitationPolicy: {
+        objective_text: "找到一个适合自己的参与方式。",
+        next_actions: [
+          "观察最近发生的事情",
+          "回应一位成员",
+          "提出一个与当前世界有关的行动",
+        ],
+      },
+      recapPolicy: { enabled: true, max_events: 3 },
+      proactivity: "balanced",
+    },
+  },
+  {
+    id: "persistent-sandbox",
+    name: "持久共建世界",
+    description: "适合类似沙盒的长期建设、资源和共同状态推进。",
+    worldDefaults: {
+      visibility: "public",
+      joinPolicy: "open",
+      friendPolicy: "enabled",
+      resolutionMode: "direct",
+      entryPrompt: "请先观察当前世界状态，再说明你希望采取的行动。",
+      hostPrompt: "裁决时明确资源、位置、关系或公共状态发生了什么变化。",
+      initialWorldState: { phase: "initial", shared_resources: {} },
+      initialMemberState: { inventory: {}, location: "entry" },
+    },
+    refereeDefaults: {
+      name: "共建主持",
+      agentKind: "host",
+      worldRole: "steward",
+      participationPolicy: DEFAULT_WORLD_PARTICIPATION_POLICY,
+      evolutionPolicy: DEFAULT_WORLD_EVOLUTION_POLICY,
+      capabilities: WORLD_HOST_CAPABILITIES,
+      personaText:
+        "维护持久世界的一致性、资源约束和成员之间的公平，并帮助新成员找到可贡献的事情。",
+      speakingStyle: "像可靠的社区主持人，描述进展并列出关键状态变化。",
+      judgementPolicy: {
+        rule_priority: ["platform_safety", "world_rules", "state_consistency"],
+        invalid_input: "reject_or_clarify",
+        conflicts: "deterministic_then_escalate",
+        state_writes: "referee_only",
+        state_patch_policy: "host_derived",
+      },
+      memoryPolicy: {
+        scope: "world",
+        retain_events: true,
+        retain_state_history: true,
+        cross_world_memory: false,
+      },
+      outputSchema: {
+        required: ["decision", "reason_text", "outcome_text"],
+        decisions: ["accepted", "rejected", "clarification", "escalated"],
+      },
+      modelConfig: { mode: "platform_default" },
+      toolAllowlist: [],
+      onboardingPolicy: {
+        welcome_text: "这里的建设会持续保留，你的贡献也会成为世界的一部分。",
+        setup_prompt: "你想从哪种方式开始参与？",
+        starter_choices: [
+          {
+            id: "inspect",
+            label: "查看当前建设",
+            input_type: "choice",
+            event_type: "host.onboarding.intent_selected",
+            body_text: "我先查看当前建设和待处理事项。",
+          },
+          {
+            id: "small-task",
+            label: "领取一件小任务",
+            input_type: "choice",
+            event_type: "host.onboarding.intent_selected",
+            body_text: "请给我一件现在就能完成的小任务。",
+          },
+          {
+            id: "proposal",
+            label: "提出一个建设想法",
+            input_type: "action",
+            event_type: "proposal",
+            body_text: "我想提出一个新的建设想法。",
+          },
+        ],
+        free_input_prompt: "也可以直接说明你希望带来什么变化。",
+      },
+      facilitationPolicy: {
+        objective_text: "完成一件能被其他成员看见的小贡献。",
+        next_actions: [
+          "查看待处理事项",
+          "完成一项小建设",
+          "回应其他成员的提案",
+        ],
+      },
+      recapPolicy: { enabled: true, max_events: 5 },
+      proactivity: "balanced",
+    },
+  },
+  {
+    id: "story-host",
+    name: "剧情主持世界",
+    description: "适合持续故事、角色扮演、选择和冲突判定。",
+    worldDefaults: {
+      visibility: "public",
+      joinPolicy: "open",
+      friendPolicy: "enabled",
+      resolutionMode: "direct",
+      entryPrompt: "请描述角色身份、当前目标或选择一个入场选项。",
+      hostPrompt: "推进剧情但不替成员决定；冲突结果必须能追溯到当前规则与状态。",
+      initialWorldState: { chapter: 1, scene: "opening" },
+      initialMemberState: { role: "", traits: [], status: {} },
+    },
+    refereeDefaults: {
+      name: "剧情主持",
+      agentKind: "host",
+      worldRole: "narrator",
+      participationPolicy: DEFAULT_WORLD_PARTICIPATION_POLICY,
+      evolutionPolicy: DEFAULT_WORLD_EVOLUTION_POLICY,
+      capabilities: WORLD_HOST_CAPABILITIES,
+      personaText:
+        "兼顾叙事张力与规则公平，帮助成员进入情境，但不替成员决定角色意志。",
+      speakingStyle: "有画面感，但裁决结论和可选下一步必须明确。",
+      judgementPolicy: {
+        rule_priority: ["platform_safety", "world_rules", "character_agency"],
+        invalid_input: "clarify",
+        conflicts: "rule_based",
+        state_writes: "referee_only",
+        state_patch_policy: "host_derived",
+      },
+      memoryPolicy: {
+        scope: "world",
+        retain_events: true,
+        retain_character_continuity: true,
+        cross_world_memory: false,
+      },
+      outputSchema: {
+        required: ["decision", "reason_text", "outcome_text"],
+        decisions: ["accepted", "rejected", "clarification", "escalated"],
+      },
+      modelConfig: { mode: "platform_default" },
+      toolAllowlist: [],
+      onboardingPolicy: {
+        welcome_text: "欢迎进入这个持续发展的故事空间。",
+        setup_prompt: "请选择一个进入当前情境的方式。",
+        starter_choices: [
+          {
+            id: "participant",
+            label: "以参与者身份加入",
+            input_type: "choice",
+            event_type: "host.onboarding.role_selected",
+            body_text: "我以参与者身份加入。",
+            data: { role: "参与者" },
+          },
+          {
+            id: "visitor",
+            label: "先作为访客观察",
+            input_type: "choice",
+            event_type: "host.onboarding.role_selected",
+            body_text: "我先作为访客进入。",
+            data: { role: "访客" },
+          },
+          {
+            id: "custom",
+            label: "自定义身份",
+            input_type: "choice",
+            event_type: "host.onboarding.custom_role",
+            body_text: "我想自定义自己的身份。",
+          },
+        ],
+        free_input_prompt: "也可以直接描述你的身份和来到这里的原因。",
+      },
+      facilitationPolicy: {
+        objective_text: "建立自己的身份，并完成第一次有意义的互动。",
+        next_actions: [
+          "回应当前场景",
+          "与一位角色交流",
+          "提出符合情境的行动",
+        ],
+      },
+      recapPolicy: { enabled: true, max_events: 4 },
+      proactivity: "balanced",
+    },
+  },
+];
+
+function ensureParentDirectory(path) {
+  if (path === ":memory:") return;
+  mkdirSync(dirname(resolve(path)), { recursive: true });
+}
+
+function ensureColumn(db, table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!columns.some((item) => item.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+export function openDatabase(path = ":memory:") {
+  ensureParentDirectory(path);
+  const db = new DatabaseSync(path);
+
+  db.exec("PRAGMA foreign_keys = ON");
+  db.exec("PRAGMA busy_timeout = 5000");
+  if (path !== ":memory:") {
+    db.exec("PRAGMA journal_mode = WAL");
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS pets (
+      id TEXT PRIMARY KEY,
+      account_key TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+      bio TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS spaces (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL CHECK (kind IN ('official', 'user')),
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      tags_json TEXT NOT NULL DEFAULT '[]',
+      visibility TEXT NOT NULL
+        CHECK (visibility IN ('public', 'unlisted', 'hidden')),
+      join_policy TEXT NOT NULL
+        CHECK (join_policy IN ('open', 'approval', 'invite_only')),
+      friend_policy TEXT NOT NULL
+        CHECK (friend_policy IN ('enabled', 'disabled')),
+      governance TEXT NOT NULL
+        CHECK (governance IN ('immutable', 'owner', 'stewards', 'community')),
+      owner_pet_id TEXT REFERENCES pets(id),
+      profile_version INTEGER NOT NULL DEFAULT 1,
+      current_spec_version INTEGER NOT NULL DEFAULT 1,
+      current_rule_version INTEGER NOT NULL DEFAULT 1,
+      publication_status TEXT NOT NULL DEFAULT 'published'
+        CHECK (publication_status IN ('draft', 'published', 'closed')),
+      definition_text TEXT NOT NULL DEFAULT '',
+      published_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS space_rule_versions (
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      version INTEGER NOT NULL,
+      rules_text TEXT NOT NULL,
+      visibility TEXT NOT NULL,
+      join_policy TEXT NOT NULL,
+      friend_policy TEXT NOT NULL,
+      governance TEXT NOT NULL,
+      definition_text TEXT NOT NULL DEFAULT '',
+      created_by_pet_id TEXT REFERENCES pets(id),
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (space_id, version)
+    );
+
+    CREATE TABLE IF NOT EXISTS world_spec_versions (
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      version INTEGER NOT NULL,
+      definition_text TEXT NOT NULL DEFAULT '',
+      entry_prompt TEXT NOT NULL DEFAULT '',
+      host_prompt TEXT NOT NULL DEFAULT '',
+      resolution_mode TEXT NOT NULL DEFAULT 'direct'
+        CHECK (resolution_mode IN ('direct', 'managed')),
+      visibility TEXT NOT NULL,
+      join_policy TEXT NOT NULL,
+      friend_policy TEXT NOT NULL,
+      created_by_pet_id TEXT REFERENCES pets(id),
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (space_id, version)
+    );
+
+    CREATE TABLE IF NOT EXISTS space_stewards (
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (space_id, pet_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS space_memberships (
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      status TEXT NOT NULL
+        CHECK (status IN ('pending', 'active', 'rejected', 'withdrawn')),
+      accepted_rule_version INTEGER,
+      application_text TEXT NOT NULL DEFAULT '',
+      delegation_mode TEXT NOT NULL DEFAULT 'manual'
+        CHECK (delegation_mode IN ('manual', 'paused')),
+      last_seen_event_sequence INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (space_id, pet_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS presence (
+      pet_id TEXT PRIMARY KEY REFERENCES pets(id) ON DELETE CASCADE,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      entered_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS space_shares (
+      token TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      created_by_pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      expires_at TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS space_invitations (
+      id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      inviter_pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      invitee_pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      status TEXT NOT NULL
+        CHECK (status IN ('pending', 'accepted', 'declined', 'revoked')),
+      bypass_approval INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS friend_requests (
+      id TEXT PRIMARY KEY,
+      sender_pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      recipient_pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      origin_space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      note TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL
+        CHECK (status IN ('pending', 'accepted', 'rejected', 'cancelled')),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS friendships (
+      pet_a_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      pet_b_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (pet_a_id, pet_b_id),
+      CHECK (pet_a_id < pet_b_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS blocks (
+      blocker_pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      blocked_pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (blocker_pet_id, blocked_pet_id),
+      CHECK (blocker_pet_id <> blocked_pet_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      sender_pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      recipient_pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      body TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      read_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS world_states (
+      space_id TEXT PRIMARY KEY REFERENCES spaces(id) ON DELETE CASCADE,
+      version INTEGER NOT NULL DEFAULT 1,
+      state_json TEXT NOT NULL DEFAULT '{}',
+      updated_by_pet_id TEXT REFERENCES pets(id),
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS world_member_states (
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      version INTEGER NOT NULL DEFAULT 1,
+      state_json TEXT NOT NULL DEFAULT '{}',
+      updated_by_pet_id TEXT REFERENCES pets(id),
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (space_id, pet_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS world_events (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      id TEXT NOT NULL UNIQUE,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      actor_type TEXT NOT NULL
+        CHECK (actor_type IN ('pet', 'world', 'system')),
+      actor_pet_id TEXT REFERENCES pets(id),
+      event_class TEXT NOT NULL
+        CHECK (event_class IN ('intent', 'outcome', 'system')),
+      event_type TEXT NOT NULL,
+      body_text TEXT NOT NULL DEFAULT '',
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      causation_event_id TEXT REFERENCES world_events(id),
+      correlation_id TEXT,
+      visibility TEXT NOT NULL DEFAULT 'world'
+        CHECK (visibility IN ('world', 'actor', 'managers')),
+      audience_pet_id TEXT REFERENCES pets(id),
+      spec_version INTEGER NOT NULL,
+      idempotency_key TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS world_triggers (
+      id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      created_by_pet_id TEXT NOT NULL REFERENCES pets(id),
+      trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('at', 'event')),
+      trigger_at TEXT,
+      event_type TEXT,
+      instruction_text TEXT NOT NULL,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      visibility TEXT NOT NULL DEFAULT 'world'
+        CHECK (visibility IN ('world', 'actor', 'managers')),
+      status TEXT NOT NULL DEFAULT 'scheduled'
+        CHECK (status IN ('scheduled', 'fired', 'cancelled')),
+      spec_version INTEGER NOT NULL,
+      fired_event_id TEXT REFERENCES world_events(id),
+      created_at TEXT NOT NULL,
+      fired_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      actor_pet_id TEXT REFERENCES pets(id),
+      action TEXT NOT NULL,
+      target_type TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_spaces_visibility
+      ON spaces(visibility, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_memberships_pet_status
+      ON space_memberships(pet_id, status);
+    CREATE INDEX IF NOT EXISTS idx_presence_space
+      ON presence(space_id, entered_at);
+    CREATE INDEX IF NOT EXISTS idx_friend_requests_recipient_status
+      ON friend_requests(recipient_pet_id, status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_messages_recipient_read
+      ON messages(recipient_pet_id, read_at, created_at);
+    CREATE INDEX IF NOT EXISTS idx_invitations_invitee_status
+      ON space_invitations(invitee_pet_id, status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_world_events_space_sequence
+      ON world_events(space_id, sequence);
+    CREATE INDEX IF NOT EXISTS idx_world_events_causation
+      ON world_events(causation_event_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_world_outcome_once
+      ON world_events(causation_event_id)
+      WHERE event_class = 'outcome' AND causation_event_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_world_events_idempotency
+      ON world_events(space_id, actor_pet_id, idempotency_key)
+      WHERE actor_pet_id IS NOT NULL AND idempotency_key IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_world_triggers_due
+      ON world_triggers(space_id, status, trigger_kind, trigger_at);
+  `);
+
+  // Existing local venue-lab databases predate World v0. These additive
+  // migrations keep their social history while upgrading them in place.
+  ensureColumn(
+    db,
+    "spaces",
+    "publication_status",
+    "TEXT NOT NULL DEFAULT 'published'",
+  );
+  ensureColumn(db, "spaces", "definition_text", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "spaces", "published_at", "TEXT");
+  ensureColumn(db, "spaces", "profile_version", "INTEGER NOT NULL DEFAULT 1");
+  ensureColumn(
+    db,
+    "spaces",
+    "current_spec_version",
+    "INTEGER NOT NULL DEFAULT 1",
+  );
+  ensureColumn(
+    db,
+    "space_rule_versions",
+    "definition_text",
+    "TEXT NOT NULL DEFAULT ''",
+  );
+  ensureColumn(
+    db,
+    "space_memberships",
+    "delegation_mode",
+    "TEXT NOT NULL DEFAULT 'manual'",
+  );
+  ensureColumn(
+    db,
+    "space_memberships",
+    "last_seen_event_sequence",
+    "INTEGER NOT NULL DEFAULT 0",
+  );
+  db.prepare(`
+    UPDATE space_memberships
+    SET delegation_mode = 'manual'
+    WHERE delegation_mode = 'autonomous'
+  `).run();
+
+  migrateWorldRuntime(db);
+  seedOfficialWorlds(db);
+  return db;
+}
+
+export function migrateWorldRuntime(db) {
+  const timestamp = new Date().toISOString();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS platform_agents (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL UNIQUE CHECK (kind = 'world_builder'),
+      name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'paused')),
+      policy_version INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS world_agent_templates (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      version INTEGER NOT NULL DEFAULT 1,
+      status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'retired')),
+      world_defaults_json TEXT NOT NULL DEFAULT '{}',
+      referee_defaults_json TEXT NOT NULL DEFAULT '{}',
+      created_by_agent_id TEXT NOT NULL REFERENCES platform_agents(id),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS world_agents (
+      id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL UNIQUE REFERENCES spaces(id) ON DELETE CASCADE,
+      role TEXT NOT NULL DEFAULT 'referee'
+        CHECK (role = 'referee'),
+      status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'paused')),
+      policy_version INTEGER NOT NULL DEFAULT 1,
+      created_by_pet_id TEXT REFERENCES pets(id),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS world_build_sessions (
+      id TEXT PRIMARY KEY,
+      creator_pet_id TEXT REFERENCES pets(id) ON DELETE CASCADE,
+      principal_user_id TEXT,
+      platform_agent_id TEXT NOT NULL REFERENCES platform_agents(id),
+      platform_agent_policy_version INTEGER NOT NULL DEFAULT 1,
+      template_id TEXT NOT NULL REFERENCES world_agent_templates(id),
+      status TEXT NOT NULL DEFAULT 'draft'
+        CHECK (status IN ('draft', 'validated', 'materialized', 'cancelled')),
+      origin_type TEXT NOT NULL DEFAULT 'builder'
+        CHECK (origin_type IN ('builder', 'legacy', 'migration', 'official')),
+      version INTEGER NOT NULL DEFAULT 1,
+      brief_text TEXT NOT NULL DEFAULT '',
+      artifact_json TEXT NOT NULL DEFAULT '{}',
+      validation_json TEXT NOT NULL DEFAULT '{}',
+      world_id TEXT UNIQUE REFERENCES spaces(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      confirmed_at TEXT,
+      materialized_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS world_build_artifacts (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES world_build_sessions(id)
+        ON DELETE CASCADE,
+      version INTEGER NOT NULL,
+      artifact_json TEXT NOT NULL,
+      validation_json TEXT NOT NULL,
+      created_by_platform_agent_id TEXT NOT NULL REFERENCES platform_agents(id),
+      created_by_platform_agent_policy_version INTEGER NOT NULL DEFAULT 1,
+      creator_confirmed_at TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE (session_id, version)
+    );
+
+    CREATE TABLE IF NOT EXISTS world_agent_versions (
+      world_agent_id TEXT NOT NULL REFERENCES world_agents(id) ON DELETE CASCADE,
+      version INTEGER NOT NULL,
+      display_name TEXT NOT NULL,
+      world_role TEXT NOT NULL DEFAULT 'host',
+      persona_text TEXT NOT NULL,
+      speaking_style TEXT NOT NULL DEFAULT '',
+      judgement_policy_json TEXT NOT NULL DEFAULT '{}',
+      memory_policy_json TEXT NOT NULL DEFAULT '{}',
+      output_schema_json TEXT NOT NULL DEFAULT '{}',
+      model_config_json TEXT NOT NULL DEFAULT '{}',
+      tool_allowlist_json TEXT NOT NULL DEFAULT '[]',
+      source_build_session_id TEXT REFERENCES world_build_sessions(id)
+        ON DELETE SET NULL,
+      created_by_agent_id TEXT NOT NULL REFERENCES platform_agents(id),
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (world_agent_id, version)
+    );
+
+    CREATE TABLE IF NOT EXISTS world_interactions (
+      id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      world_agent_id TEXT NOT NULL REFERENCES world_agents(id) ON DELETE CASCADE,
+      prompt_event_id TEXT NOT NULL UNIQUE REFERENCES world_events(id),
+      mode TEXT NOT NULL CHECK (mode IN ('windowed', 'quorum')),
+      status TEXT NOT NULL DEFAULT 'open'
+        CHECK (status IN ('open', 'ready', 'resolved', 'cancelled')),
+      base_world_state_version INTEGER NOT NULL,
+      quorum INTEGER,
+      late_input_policy TEXT NOT NULL DEFAULT 'follow_up'
+        CHECK (late_input_policy IN ('follow_up', 'expire')),
+      closes_at TEXT NOT NULL,
+      created_by_pet_id TEXT NOT NULL REFERENCES pets(id),
+      created_at TEXT NOT NULL,
+      ready_at TEXT,
+      resolved_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS world_interaction_resolutions (
+      id TEXT PRIMARY KEY,
+      interaction_id TEXT NOT NULL UNIQUE
+        REFERENCES world_interactions(id) ON DELETE CASCADE,
+      outcome_event_id TEXT NOT NULL UNIQUE REFERENCES world_events(id),
+      decision TEXT NOT NULL
+        CHECK (decision IN ('accepted', 'rejected', 'clarification')),
+      resolution_disposition TEXT NOT NULL,
+      result_json TEXT NOT NULL DEFAULT '{}',
+      world_state_patch_json TEXT,
+      world_state_before_version INTEGER NOT NULL,
+      world_state_after_version INTEGER NOT NULL,
+      resolved_by_pet_id TEXT NOT NULL REFERENCES pets(id),
+      resolution_source TEXT NOT NULL DEFAULT 'creator_review'
+        CHECK (resolution_source IN ('creator_review', 'platform')),
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS world_inputs (
+      id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      actor_pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      principal_user_id TEXT,
+      principal_type TEXT NOT NULL DEFAULT 'user'
+        CHECK (principal_type IN ('user', 'delegation', 'system')),
+      input_type TEXT NOT NULL
+        CHECK (input_type IN ('speech', 'action', 'choice', 'system')),
+      event_type TEXT NOT NULL,
+      body_text TEXT NOT NULL DEFAULT '',
+      data_json TEXT NOT NULL DEFAULT '{}',
+      reply_to_event_id TEXT REFERENCES world_events(id),
+      correlation_id TEXT,
+      visibility TEXT NOT NULL DEFAULT 'world'
+        CHECK (visibility IN ('world', 'actor', 'managers')),
+      rule_version INTEGER NOT NULL,
+      spec_version INTEGER NOT NULL,
+      world_state_version INTEGER NOT NULL,
+      member_state_version INTEGER NOT NULL,
+      received_world_state_version INTEGER NOT NULL,
+      received_member_state_version INTEGER NOT NULL,
+      context_version_source TEXT NOT NULL DEFAULT 'server_fallback',
+      resolution_disposition TEXT,
+      interaction_id TEXT REFERENCES world_interactions(id) ON DELETE SET NULL,
+      idempotency_key TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN (
+          'pending', 'accepted', 'rejected', 'clarification', 'escalated'
+        )),
+      intent_event_id TEXT NOT NULL UNIQUE REFERENCES world_events(id),
+      created_at TEXT NOT NULL,
+      resolved_at TEXT,
+      UNIQUE (space_id, actor_pet_id, idempotency_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS world_judgements (
+      id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      input_id TEXT NOT NULL UNIQUE REFERENCES world_inputs(id) ON DELETE CASCADE,
+      world_agent_id TEXT NOT NULL REFERENCES world_agents(id),
+      decision TEXT NOT NULL
+        CHECK (decision IN (
+          'accepted', 'rejected', 'clarification', 'escalated'
+        )),
+      decision_source TEXT NOT NULL
+        CHECK (decision_source IN (
+          'automatic', 'creator_review', 'platform'
+        )),
+      reason_text TEXT NOT NULL DEFAULT '',
+      outcome_text TEXT NOT NULL DEFAULT '',
+      result_json TEXT NOT NULL DEFAULT '{}',
+      world_state_patch_json TEXT,
+      member_state_patch_json TEXT,
+      target_pet_id TEXT REFERENCES pets(id),
+      rule_version INTEGER NOT NULL,
+      spec_version INTEGER NOT NULL,
+      world_state_before_version INTEGER NOT NULL,
+      world_state_after_version INTEGER NOT NULL,
+      member_state_before_version INTEGER,
+      member_state_after_version INTEGER,
+      resolution_disposition TEXT NOT NULL DEFAULT 'apply',
+      reviewed_by_pet_id TEXT REFERENCES pets(id),
+      outcome_event_id TEXT NOT NULL UNIQUE REFERENCES world_events(id),
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS world_sessions (
+      id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      principal_user_id TEXT,
+      client_session_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'closed')),
+      created_at TEXT NOT NULL,
+      last_active_at TEXT NOT NULL,
+      closed_at TEXT,
+      UNIQUE (pet_id, client_session_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS world_host_runtimes (
+      world_agent_id TEXT PRIMARY KEY
+        REFERENCES world_agents(id) ON DELETE CASCADE,
+      space_id TEXT NOT NULL UNIQUE REFERENCES spaces(id) ON DELETE CASCADE,
+      execution_policy TEXT NOT NULL
+        DEFAULT 'platform_on_demand_with_creator_takeover'
+        CHECK (
+          execution_policy = 'platform_on_demand_with_creator_takeover'
+        ),
+      status TEXT NOT NULL DEFAULT 'idle'
+        CHECK (status IN ('idle', 'active')),
+      active_executor TEXT NOT NULL DEFAULT 'platform'
+        CHECK (active_executor IN ('platform', 'creator_codex')),
+      claimed_by_pet_id TEXT REFERENCES pets(id) ON DELETE SET NULL,
+      claimed_principal_user_id TEXT,
+      claim_session_id TEXT,
+      lease_expires_at TEXT,
+      runtime_version INTEGER NOT NULL DEFAULT 1,
+      activation_count INTEGER NOT NULL DEFAULT 0,
+      activated_at TEXT,
+      last_active_at TEXT,
+      deactivated_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS world_host_executors (
+      world_agent_id TEXT PRIMARY KEY
+        REFERENCES world_agents(id) ON DELETE CASCADE,
+      space_id TEXT NOT NULL UNIQUE REFERENCES spaces(id) ON DELETE CASCADE,
+      provider TEXT NOT NULL DEFAULT 'local_codex'
+        CHECK (provider = 'local_codex'),
+      codex_thread_id TEXT UNIQUE,
+      status TEXT NOT NULL DEFAULT 'unbound'
+        CHECK (status IN ('unbound', 'idle', 'queued', 'running', 'failed')),
+      context_version INTEGER NOT NULL DEFAULT 1,
+      last_event_sequence INTEGER NOT NULL DEFAULT 0,
+      last_input_id TEXT REFERENCES world_inputs(id) ON DELETE SET NULL,
+      last_turn_id TEXT,
+      last_error TEXT,
+      last_started_at TEXT,
+      last_completed_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS world_member_journeys (
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      stage TEXT NOT NULL DEFAULT 'new'
+        CHECK (stage IN ('new', 'setup', 'active', 'returning')),
+      visit_count INTEGER NOT NULL DEFAULT 0,
+      current_role TEXT NOT NULL DEFAULT '',
+      participation_intent TEXT NOT NULL DEFAULT '',
+      multiplayer_consent TEXT NOT NULL DEFAULT 'pending'
+        CHECK (multiplayer_consent IN ('pending', 'accepted', 'declined')),
+      context_summary TEXT NOT NULL DEFAULT '',
+      open_loops_json TEXT NOT NULL DEFAULT '[]',
+      suggested_actions_json TEXT NOT NULL DEFAULT '[]',
+      first_entered_at TEXT,
+      onboarding_completed_at TEXT,
+      last_entered_at TEXT,
+      last_left_at TEXT,
+      last_departure_sequence INTEGER NOT NULL DEFAULT 0,
+      last_meaningful_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (space_id, pet_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS world_host_turns (
+      id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      world_agent_id TEXT NOT NULL REFERENCES world_agents(id)
+        ON DELETE CASCADE,
+      turn_kind TEXT NOT NULL
+        CHECK (turn_kind IN (
+          'welcome', 'setup', 'progress', 'recap', 'waiting', 'clarification'
+        )),
+      stage TEXT NOT NULL
+        CHECK (stage IN ('new', 'setup', 'active', 'returning')),
+      message_text TEXT NOT NULL,
+      objective_text TEXT NOT NULL DEFAULT '',
+      context_summary TEXT NOT NULL DEFAULT '',
+      choices_json TEXT NOT NULL DEFAULT '[]',
+      free_input_prompt TEXT NOT NULL DEFAULT '',
+      causation_input_id TEXT REFERENCES world_inputs(id)
+        ON DELETE SET NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_world_inputs_space_status
+      ON world_inputs(space_id, status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_world_inputs_actor
+      ON world_inputs(actor_pet_id, created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_world_interaction_active
+      ON world_interactions(space_id)
+      WHERE status IN ('open', 'ready');
+    CREATE INDEX IF NOT EXISTS idx_world_interaction_due
+      ON world_interactions(space_id, status, closes_at);
+    CREATE INDEX IF NOT EXISTS idx_world_judgements_agent
+      ON world_judgements(world_agent_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_world_sessions_space_status
+      ON world_sessions(space_id, status, last_active_at);
+    CREATE INDEX IF NOT EXISTS idx_world_host_runtimes_status
+      ON world_host_runtimes(status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_world_host_runtimes_claim
+      ON world_host_runtimes(claimed_by_pet_id, lease_expires_at);
+    CREATE INDEX IF NOT EXISTS idx_world_host_executors_status
+      ON world_host_executors(status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_world_build_sessions_creator_status
+      ON world_build_sessions(creator_pet_id, status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_world_agent_versions_source
+      ON world_agent_versions(source_build_session_id);
+    CREATE INDEX IF NOT EXISTS idx_world_member_journeys_stage
+      ON world_member_journeys(space_id, stage, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_world_host_turns_member
+      ON world_host_turns(space_id, pet_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_world_host_turns_input
+      ON world_host_turns(causation_input_id, created_at);
+  `);
+  ensureColumn(
+    db,
+    "world_build_sessions",
+    "platform_agent_policy_version",
+    "INTEGER NOT NULL DEFAULT 1",
+  );
+  ensureColumn(
+    db,
+    "world_build_artifacts",
+    "created_by_platform_agent_policy_version",
+    "INTEGER NOT NULL DEFAULT 1",
+  );
+  ensureColumn(
+    db,
+    "world_agents",
+    "created_by_agent_id",
+    "TEXT REFERENCES platform_agents(id)",
+  );
+  ensureColumn(
+    db,
+    "world_agents",
+    "current_version",
+    "INTEGER NOT NULL DEFAULT 1",
+  );
+  ensureColumn(
+    db,
+    "world_agents",
+    "display_name",
+    "TEXT NOT NULL DEFAULT '世界主持'",
+  );
+  ensureColumn(
+    db,
+    "world_agents",
+    "agent_kind",
+    "TEXT NOT NULL DEFAULT 'host'",
+  );
+  ensureColumn(
+    db,
+    "world_agent_versions",
+    "world_role",
+    "TEXT NOT NULL DEFAULT 'host'",
+  );
+  ensureColumn(
+    db,
+    "world_agent_versions",
+    "onboarding_policy_json",
+    "TEXT NOT NULL DEFAULT '{}'",
+  );
+  ensureColumn(
+    db,
+    "world_agent_versions",
+    "facilitation_policy_json",
+    "TEXT NOT NULL DEFAULT '{}'",
+  );
+  ensureColumn(
+    db,
+    "world_agent_versions",
+    "recap_policy_json",
+    "TEXT NOT NULL DEFAULT '{}'",
+  );
+  ensureColumn(
+    db,
+    "world_agent_versions",
+    "participation_policy_json",
+    "TEXT NOT NULL DEFAULT '{}'",
+  );
+  ensureColumn(
+    db,
+    "world_agent_versions",
+    "evolution_policy_json",
+    "TEXT NOT NULL DEFAULT '{}'",
+  );
+  ensureColumn(
+    db,
+    "world_agent_versions",
+    "proactivity",
+    "TEXT NOT NULL DEFAULT 'balanced'",
+  );
+  ensureColumn(
+    db,
+    "world_agent_versions",
+    "capabilities_json",
+    `TEXT NOT NULL DEFAULT '["guide","facilitate","judge","advance","recap"]'`,
+  );
+  ensureColumn(
+    db,
+    "world_states",
+    "updated_by_world_agent_id",
+    "TEXT",
+  );
+  ensureColumn(
+    db,
+    "world_member_states",
+    "updated_by_world_agent_id",
+    "TEXT",
+  );
+  ensureColumn(
+    db,
+    "world_judgements",
+    "result_json",
+    "TEXT NOT NULL DEFAULT '{}'",
+  );
+  ensureColumn(
+    db,
+    "world_inputs",
+    "received_world_state_version",
+    "INTEGER NOT NULL DEFAULT 1",
+  );
+  ensureColumn(
+    db,
+    "world_inputs",
+    "received_member_state_version",
+    "INTEGER NOT NULL DEFAULT 1",
+  );
+  ensureColumn(
+    db,
+    "world_inputs",
+    "context_version_source",
+    "TEXT NOT NULL DEFAULT 'server_fallback'",
+  );
+  ensureColumn(db, "world_inputs", "resolution_disposition", "TEXT");
+  ensureColumn(
+    db,
+    "world_inputs",
+    "interaction_id",
+    "TEXT REFERENCES world_interactions(id) ON DELETE SET NULL",
+  );
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_world_interaction_one_response
+      ON world_inputs(interaction_id, actor_pet_id)
+      WHERE interaction_id IS NOT NULL;
+  `);
+  ensureColumn(
+    db,
+    "world_judgements",
+    "resolution_disposition",
+    "TEXT NOT NULL DEFAULT 'apply'",
+  );
+  ensureColumn(
+    db,
+    "world_interaction_resolutions",
+    "resolution_source",
+    "TEXT NOT NULL DEFAULT 'creator_review'",
+  );
+  db.exec(`
+    UPDATE world_inputs
+    SET received_world_state_version = world_state_version,
+      received_member_state_version = member_state_version
+    WHERE context_version_source = 'server_fallback'
+      AND resolution_disposition IS NULL;
+  `);
+  ensureColumn(
+    db,
+    "world_member_journeys",
+    "multiplayer_consent",
+    "TEXT NOT NULL DEFAULT 'pending'",
+  );
+  ensureColumn(db, "world_member_journeys", "last_left_at", "TEXT");
+  ensureColumn(
+    db,
+    "world_member_journeys",
+    "last_departure_sequence",
+    "INTEGER NOT NULL DEFAULT 0",
+  );
+  ensureColumn(
+    db,
+    "audit_log",
+    "principal_user_id",
+    "TEXT",
+  );
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_world_state_requires_agent
+    BEFORE UPDATE OF version, state_json ON world_states
+    WHEN NEW.version <> OLD.version OR NEW.state_json <> OLD.state_json
+    BEGIN
+      SELECT CASE
+        WHEN NEW.updated_by_world_agent_id IS NULL
+          OR NOT EXISTS (
+            SELECT 1 FROM world_agents agent
+            WHERE agent.id = NEW.updated_by_world_agent_id
+              AND agent.space_id = NEW.space_id
+              AND agent.status = 'active'
+          )
+        THEN RAISE(ABORT, 'WORLD_AGENT_REQUIRED')
+      END;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_world_member_state_requires_agent
+    BEFORE UPDATE OF version, state_json ON world_member_states
+    WHEN NEW.version <> OLD.version OR NEW.state_json <> OLD.state_json
+    BEGIN
+      SELECT CASE
+        WHEN NEW.updated_by_world_agent_id IS NULL
+          OR NOT EXISTS (
+            SELECT 1 FROM world_agents agent
+            WHERE agent.id = NEW.updated_by_world_agent_id
+              AND agent.space_id = NEW.space_id
+              AND agent.status = 'active'
+          )
+        THEN RAISE(ABORT, 'WORLD_AGENT_REQUIRED')
+      END;
+    END;
+  `);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare(`
+      INSERT OR IGNORE INTO platform_agents (
+        id, kind, name, status, policy_version, created_at, updated_at
+      ) VALUES (?, 'world_builder', '创世 Agent', 'active', 1, ?, ?)
+    `).run(PLATFORM_WORLD_BUILDER_ID, timestamp, timestamp);
+    const insertTemplate = db.prepare(`
+      INSERT INTO world_agent_templates (
+        id, name, description, version, status, world_defaults_json,
+        referee_defaults_json, created_by_agent_id, created_at, updated_at
+      ) VALUES (?, ?, ?, 3, 'active', ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        description = excluded.description,
+        version = excluded.version,
+        status = excluded.status,
+        world_defaults_json = excluded.world_defaults_json,
+        referee_defaults_json = excluded.referee_defaults_json,
+        updated_at = excluded.updated_at
+      WHERE world_agent_templates.name IS NOT excluded.name
+        OR world_agent_templates.description IS NOT excluded.description
+        OR world_agent_templates.version IS NOT excluded.version
+        OR world_agent_templates.status IS NOT excluded.status
+        OR world_agent_templates.world_defaults_json IS NOT excluded.world_defaults_json
+        OR world_agent_templates.referee_defaults_json IS NOT excluded.referee_defaults_json
+    `);
+    for (const template of WORLD_AGENT_TEMPLATES) {
+      insertTemplate.run(
+        template.id,
+        template.name,
+        template.description,
+        JSON.stringify(template.worldDefaults),
+        JSON.stringify(template.refereeDefaults),
+        PLATFORM_WORLD_BUILDER_ID,
+        timestamp,
+        timestamp,
+      );
+    }
+    db.prepare(`
+      INSERT OR IGNORE INTO world_agents (
+        id, space_id, role, status, policy_version, created_by_pet_id,
+        created_by_agent_id, current_version, display_name, created_at, updated_at
+      )
+      SELECT
+        'world-agent:' || s.id, s.id, 'referee', 'active', 1,
+        s.owner_pet_id, ?, 1, '世界主持', ?, ?
+      FROM spaces s
+    `).run(PLATFORM_WORLD_BUILDER_ID, timestamp, timestamp);
+    db.prepare(`
+      UPDATE world_agents
+      SET created_by_agent_id = COALESCE(created_by_agent_id, ?),
+        current_version = COALESCE(current_version, 1),
+        display_name = CASE
+          WHEN display_name IS NULL OR display_name = ''
+            OR display_name IN ('世界裁判', '官方世界裁判')
+          THEN '世界主持'
+          ELSE display_name
+        END,
+        agent_kind = 'host'
+    `).run(PLATFORM_WORLD_BUILDER_ID);
+    db.prepare(`
+      INSERT OR IGNORE INTO world_host_runtimes (
+        world_agent_id, space_id, execution_policy, status, active_executor,
+        runtime_version, activation_count, created_at, updated_at
+      )
+      SELECT
+        id, space_id, 'platform_on_demand_with_creator_takeover', 'idle',
+        'platform', 1, 0, ?, ?
+      FROM world_agents
+    `).run(timestamp, timestamp);
+    db.prepare(`
+      INSERT OR IGNORE INTO world_sessions (
+        id, space_id, pet_id, principal_user_id, client_session_id,
+        status, created_at, last_active_at
+      )
+      SELECT
+        'legacy-presence:' || p.pet_id, p.space_id, p.pet_id, NULL,
+        'legacy-presence', 'active', p.entered_at, p.entered_at
+      FROM presence p
+    `).run();
+    db.prepare(`
+      INSERT OR IGNORE INTO world_spec_versions (
+        space_id, version, definition_text, entry_prompt, host_prompt,
+        resolution_mode, visibility, join_policy, friend_policy,
+        created_by_pet_id, created_at
+      )
+      SELECT
+        s.id, s.current_rule_version, s.definition_text, '', '', 'direct',
+        s.visibility, s.join_policy, s.friend_policy, s.owner_pet_id, s.created_at
+      FROM spaces s
+    `).run();
+    db.prepare(`
+      UPDATE spaces
+      SET current_spec_version = current_rule_version
+      WHERE NOT EXISTS (
+        SELECT 1 FROM world_spec_versions w
+        WHERE w.space_id = spaces.id
+          AND w.version = spaces.current_spec_version
+      )
+    `).run();
+    db.prepare(`
+      INSERT OR IGNORE INTO world_states (
+        space_id, version, state_json, updated_by_pet_id, updated_at
+      )
+      SELECT id, 1, '{}', owner_pet_id, ? FROM spaces
+    `).run(timestamp);
+    db.prepare(`
+      INSERT OR IGNORE INTO world_member_states (
+        space_id, pet_id, version, state_json, updated_by_pet_id, updated_at
+      )
+      SELECT space_id, pet_id, 1, '{}', pet_id, ?
+      FROM space_memberships
+      WHERE status = 'active'
+    `).run(timestamp);
+    backfillWorldBuilderRecords(db, timestamp);
+    const generalHost = WORLD_AGENT_TEMPLATES[0].refereeDefaults;
+    db.prepare(`
+      UPDATE world_agent_versions
+      SET display_name = CASE
+          WHEN display_name IN ('世界裁判', '官方世界裁判')
+          THEN '世界主持'
+          ELSE display_name END,
+        world_role = COALESCE(NULLIF(world_role, ''), ?),
+        onboarding_policy_json = CASE
+          WHEN onboarding_policy_json = '{}'
+          THEN ? ELSE onboarding_policy_json END,
+        facilitation_policy_json = CASE
+          WHEN facilitation_policy_json = '{}'
+          THEN ? ELSE facilitation_policy_json END,
+        recap_policy_json = CASE
+          WHEN recap_policy_json = '{}'
+          THEN ? ELSE recap_policy_json END,
+        participation_policy_json = CASE
+          WHEN participation_policy_json = '{}'
+          THEN ? ELSE participation_policy_json END,
+        evolution_policy_json = CASE
+          WHEN evolution_policy_json = '{}'
+          THEN ? ELSE evolution_policy_json END,
+        proactivity = COALESCE(NULLIF(proactivity, ''), ?),
+        capabilities_json = CASE
+          WHEN capabilities_json = '[]' OR capabilities_json = '{}'
+          THEN ? ELSE capabilities_json END
+    `).run(
+      generalHost.worldRole,
+      JSON.stringify(generalHost.onboardingPolicy),
+      JSON.stringify(generalHost.facilitationPolicy),
+      JSON.stringify(generalHost.recapPolicy),
+      JSON.stringify(generalHost.participationPolicy),
+      JSON.stringify(generalHost.evolutionPolicy),
+      generalHost.proactivity,
+      JSON.stringify(WORLD_HOST_CAPABILITIES),
+    );
+    db.prepare(`
+      INSERT OR IGNORE INTO world_member_journeys (
+        space_id, pet_id, stage, visit_count, current_role,
+        participation_intent, context_summary, open_loops_json,
+        suggested_actions_json, first_entered_at, onboarding_completed_at,
+        last_entered_at, last_meaningful_at, created_at, updated_at
+      )
+      SELECT
+        membership.space_id,
+        membership.pet_id,
+        CASE WHEN COUNT(session.id) > 0 THEN 'active' ELSE 'new' END,
+        COUNT(session.id),
+        '',
+        '',
+        '',
+        '[]',
+        '[]',
+        MIN(session.created_at),
+        CASE WHEN COUNT(session.id) > 0 THEN MIN(session.created_at) ELSE NULL END,
+        MAX(session.last_active_at),
+        NULL,
+        membership.created_at,
+        ?
+      FROM space_memberships membership
+      LEFT JOIN world_sessions session
+        ON session.space_id = membership.space_id
+        AND session.pet_id = membership.pet_id
+      WHERE membership.status = 'active'
+      GROUP BY membership.space_id, membership.pet_id
+    `).run(timestamp);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function officialTemplate(world) {
+  const templateId = world.templateId ?? "general-referee";
+  return (
+    WORLD_AGENT_TEMPLATES.find((template) => template.id === templateId) ??
+    WORLD_AGENT_TEMPLATES[0]
+  );
+}
+
+function officialHost(world) {
+  return {
+    ...officialTemplate(world).refereeDefaults,
+    ...(world.host ?? {}),
+  };
+}
+
+function officialBuildArtifact(world) {
+  return {
+    world: {
+      name: world.name,
+      description: world.description,
+      tags: world.tags,
+      visibility: "public",
+      joinPolicy: "open",
+      friendPolicy: "enabled",
+      rulesText: world.rules,
+      definitionText: world.definition,
+      entryPrompt: world.entryPrompt ?? "",
+      hostPrompt: world.hostPrompt ?? world.definition,
+      resolutionMode: "direct",
+      initialWorldState: world.initialState ?? {},
+      initialMemberState: world.initialMemberState ?? {},
+    },
+    host: officialHost(world),
+  };
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return value.map(stableJson);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, stableJson(value[key])]),
+  );
+}
+
+function mergeInitialState(defaults, current) {
+  if (
+    !defaults ||
+    typeof defaults !== "object" ||
+    Array.isArray(defaults) ||
+    !current ||
+    typeof current !== "object" ||
+    Array.isArray(current)
+  ) {
+    return current === undefined ? defaults : current;
+  }
+  const merged = { ...defaults };
+  for (const [key, value] of Object.entries(current)) {
+    merged[key] =
+      key in defaults ? mergeInitialState(defaults[key], value) : value;
+  }
+  return merged;
+}
+
+function sameJson(left, right) {
+  try {
+    return JSON.stringify(stableJson(JSON.parse(left))) ===
+      JSON.stringify(stableJson(right));
+  } catch {
+    return false;
+  }
+}
+
+function officialHostVersionMatches(row, host) {
+  if (!row) return false;
+  return (
+    row.display_name === host.name &&
+    row.world_role === host.worldRole &&
+    row.persona_text === host.personaText &&
+    row.speaking_style === host.speakingStyle &&
+    sameJson(row.judgement_policy_json, host.judgementPolicy) &&
+    sameJson(row.memory_policy_json, host.memoryPolicy) &&
+    sameJson(row.output_schema_json, host.outputSchema) &&
+    sameJson(row.model_config_json, host.modelConfig) &&
+    sameJson(row.tool_allowlist_json, host.toolAllowlist) &&
+    sameJson(row.onboarding_policy_json, host.onboardingPolicy) &&
+    sameJson(row.facilitation_policy_json, host.facilitationPolicy) &&
+    sameJson(row.recap_policy_json, host.recapPolicy) &&
+    sameJson(row.participation_policy_json, host.participationPolicy) &&
+    sameJson(row.evolution_policy_json, host.evolutionPolicy) &&
+    row.proactivity === host.proactivity &&
+    sameJson(row.capabilities_json, host.capabilities)
+  );
+}
+
+export function seedOfficialWorlds(db) {
+  const now = new Date().toISOString();
+  const insertSpace = db.prepare(`
+    INSERT OR IGNORE INTO spaces (
+      id, kind, name, description, tags_json, visibility, join_policy,
+      friend_policy, governance, owner_pet_id, profile_version,
+      current_spec_version, current_rule_version, publication_status,
+      definition_text, published_at, created_at, updated_at
+    ) VALUES (?, 'official', ?, ?, ?, 'public', 'open', 'enabled',
+      'immutable', NULL, 1, ?, ?, 'published', ?, ?, ?, ?)
+  `);
+  const insertRules = db.prepare(`
+    INSERT OR IGNORE INTO space_rule_versions (
+      space_id, version, rules_text, visibility, join_policy, friend_policy,
+      governance, definition_text, created_by_pet_id, created_at
+    ) VALUES (?, ?, ?, 'public', 'open', 'enabled', 'immutable', ?, NULL, ?)
+  `);
+  const refreshOfficial = db.prepare(`
+    UPDATE spaces
+    SET name = ?, description = ?, tags_json = ?, definition_text = ?,
+      current_spec_version = ?, current_rule_version = ?,
+      publication_status = 'published', published_at = COALESCE(published_at, ?),
+      updated_at = ?
+    WHERE id = ? AND kind = 'official'
+  `);
+  const insertSpec = db.prepare(`
+    INSERT OR IGNORE INTO world_spec_versions (
+      space_id, version, definition_text, entry_prompt, host_prompt,
+      resolution_mode, visibility, join_policy, friend_policy,
+      created_by_pet_id, created_at
+    ) VALUES (?, ?, ?, ?, ?, 'direct', 'public', 'open', 'enabled', NULL, ?)
+  `);
+  const insertState = db.prepare(`
+    INSERT OR IGNORE INTO world_states (
+      space_id, version, state_json, updated_by_pet_id, updated_at
+    ) VALUES (?, 1, ?, NULL, ?)
+  `);
+  const insertAgent = db.prepare(`
+    INSERT OR IGNORE INTO world_agents (
+      id, space_id, role, status, policy_version, created_by_pet_id,
+      created_by_agent_id, current_version, display_name, created_at, updated_at
+    ) VALUES (?, ?, 'referee', 'active', 1, NULL, ?, 1, '官方世界主持', ?, ?)
+  `);
+  const insertRuntime = db.prepare(`
+    INSERT OR IGNORE INTO world_host_runtimes (
+      world_agent_id, space_id, execution_policy, status, active_executor,
+      runtime_version, activation_count, created_at, updated_at
+    ) VALUES (?, ?, 'platform_on_demand_with_creator_takeover', 'idle',
+      'platform', 1, 0, ?, ?)
+  `);
+  const insertAgentVersion = db.prepare(`
+    INSERT INTO world_agent_versions (
+      world_agent_id, version, display_name, world_role, persona_text,
+      speaking_style, judgement_policy_json, memory_policy_json,
+      output_schema_json, model_config_json, tool_allowlist_json,
+      onboarding_policy_json, facilitation_policy_json, recap_policy_json,
+      participation_policy_json, evolution_policy_json, proactivity,
+      capabilities_json, source_build_session_id, created_by_agent_id,
+      created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const activeOfficialWorldIds = new Set(
+      OFFICIAL_WORLDS.map((world) => world.id),
+    );
+    const retiredOfficialWorldIds = db
+      .prepare("SELECT id FROM spaces WHERE kind = 'official'")
+      .all()
+      .map((row) => row.id)
+      .filter((id) => !activeOfficialWorldIds.has(id));
+    const deleteBuild = db.prepare(
+      "DELETE FROM world_build_sessions WHERE world_id = ?",
+    );
+    const deleteOfficialWorld = db.prepare(
+      "DELETE FROM spaces WHERE id = ? AND kind = 'official'",
+    );
+    for (const worldId of retiredOfficialWorldIds) {
+      deleteBuild.run(worldId);
+      deleteOfficialWorld.run(worldId);
+    }
+
+    const upgradedOfficialWorldIds = [];
+    for (const world of OFFICIAL_WORLDS) {
+      const existing = db
+        .prepare(`
+          SELECT name, description, tags_json, definition_text,
+            current_rule_version, current_spec_version,
+            publication_status, published_at
+          FROM spaces WHERE id = ? AND kind = 'official'
+        `)
+        .get(world.id);
+      if (
+        existing &&
+        (Number(existing.current_rule_version) !== world.version ||
+          Number(existing.current_spec_version) !== world.version)
+      ) {
+        upgradedOfficialWorldIds.push(world.id);
+      }
+      insertSpace.run(
+        world.id,
+        world.name,
+        world.description,
+        JSON.stringify(world.tags),
+        world.version,
+        world.version,
+        world.definition,
+        now,
+        now,
+        now,
+      );
+      insertRules.run(
+        world.id,
+        world.version,
+        world.rules,
+        world.definition,
+        now,
+      );
+      insertSpec.run(
+        world.id,
+        world.version,
+        world.definition,
+        world.entryPrompt ?? "",
+        world.hostPrompt ?? world.definition,
+        now,
+      );
+      const storedRule = db
+        .prepare(`
+          SELECT rules_text, definition_text
+          FROM space_rule_versions
+          WHERE space_id = ? AND version = ?
+        `)
+        .get(world.id, world.version);
+      if (
+        storedRule.rules_text !== world.rules ||
+        storedRule.definition_text !== world.definition
+      ) {
+        throw new Error(
+          `OFFICIAL_WORLD_VERSION_BUMP_REQUIRED: ${world.id} rule version ${world.version} already contains different content.`,
+        );
+      }
+      const storedSpec = db
+        .prepare(`
+          SELECT definition_text, entry_prompt, host_prompt, resolution_mode
+          FROM world_spec_versions
+          WHERE space_id = ? AND version = ?
+        `)
+        .get(world.id, world.version);
+      if (
+        storedSpec.definition_text !== world.definition ||
+        storedSpec.entry_prompt !== (world.entryPrompt ?? "") ||
+        storedSpec.host_prompt !== (world.hostPrompt ?? world.definition) ||
+        storedSpec.resolution_mode !== "direct"
+      ) {
+        throw new Error(
+          `OFFICIAL_WORLD_VERSION_BUMP_REQUIRED: ${world.id} spec version ${world.version} already contains different content.`,
+        );
+      }
+      insertState.run(world.id, JSON.stringify(world.initialState ?? {}), now);
+      insertAgent.run(
+        `world-agent:${world.id}`,
+        world.id,
+        PLATFORM_WORLD_BUILDER_ID,
+        now,
+        now,
+      );
+      const storedWorldState = db
+        .prepare("SELECT * FROM world_states WHERE space_id = ?")
+        .get(world.id);
+      const mergedWorldState = mergeInitialState(
+        world.initialState ?? {},
+        JSON.parse(storedWorldState.state_json || "{}"),
+      );
+      if (
+        JSON.stringify(stableJson(JSON.parse(storedWorldState.state_json))) !==
+        JSON.stringify(stableJson(mergedWorldState))
+      ) {
+        db.prepare(`
+          UPDATE world_states
+          SET version = version + 1, state_json = ?,
+            updated_by_world_agent_id = ?, updated_at = ?
+          WHERE space_id = ?
+        `).run(
+          JSON.stringify(mergedWorldState),
+          `world-agent:${world.id}`,
+          now,
+          world.id,
+        );
+      }
+      insertRuntime.run(
+        `world-agent:${world.id}`,
+        world.id,
+        now,
+        now,
+      );
+      const desiredTags = JSON.stringify(world.tags);
+      if (
+        !existing ||
+        existing.name !== world.name ||
+        existing.description !== world.description ||
+        existing.tags_json !== desiredTags ||
+        existing.definition_text !== world.definition ||
+        Number(existing.current_spec_version) !== world.version ||
+        Number(existing.current_rule_version) !== world.version ||
+        existing.publication_status !== "published" ||
+        existing.published_at == null
+      ) {
+        refreshOfficial.run(
+          world.name,
+          world.description,
+          desiredTags,
+          world.definition,
+          world.version,
+          world.version,
+          now,
+          now,
+          world.id,
+        );
+      }
+    }
+    backfillWorldBuilderRecords(db, now, "official");
+    for (const world of OFFICIAL_WORLDS) {
+      const agentId = `world-agent:${world.id}`;
+      const host = officialHost(world);
+      const desiredArtifact = officialBuildArtifact(world);
+      const desiredArtifactJson = JSON.stringify(desiredArtifact);
+      const validationJson = JSON.stringify({
+        valid: true,
+        readiness: "ready",
+        errors: [],
+        warnings: [],
+        missing_fields: [],
+        questions: [],
+        experience_checks: [],
+      });
+      const build = db
+        .prepare("SELECT * FROM world_build_sessions WHERE world_id = ?")
+        .get(world.id);
+      const template = officialTemplate(world);
+      if (!sameJson(build.artifact_json, desiredArtifact)) {
+        const nextBuildVersion = Number(build.version) + 1;
+        db.prepare(`
+          INSERT INTO world_build_artifacts (
+            id, session_id, version, artifact_json, validation_json,
+            created_by_platform_agent_id,
+            created_by_platform_agent_policy_version, creator_confirmed_at,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          `${build.id}:${nextBuildVersion}`,
+          build.id,
+          nextBuildVersion,
+          desiredArtifactJson,
+          validationJson,
+          PLATFORM_WORLD_BUILDER_ID,
+          Number(build.platform_agent_policy_version ?? 1),
+          now,
+          now,
+        );
+        db.prepare(`
+          UPDATE world_build_sessions
+          SET template_id = ?, origin_type = 'official', version = ?,
+            artifact_json = ?, validation_json = ?, updated_at = ?
+          WHERE id = ? AND version = ?
+        `).run(
+          template.id,
+          nextBuildVersion,
+          desiredArtifactJson,
+          validationJson,
+          now,
+          build.id,
+          build.version,
+        );
+      } else if (
+        build.template_id !== template.id ||
+        build.origin_type !== "official"
+      ) {
+        db.prepare(`
+          UPDATE world_build_sessions
+          SET template_id = ?, origin_type = 'official', updated_at = ?
+          WHERE id = ?
+        `).run(template.id, now, build.id);
+      }
+
+      const agent = db
+        .prepare("SELECT * FROM world_agents WHERE id = ? AND space_id = ?")
+        .get(agentId, world.id);
+      const currentHostVersion = db
+        .prepare(`
+          SELECT * FROM world_agent_versions
+          WHERE world_agent_id = ? AND version = ?
+        `)
+        .get(agentId, agent.current_version);
+      let currentVersion = Number(agent.current_version);
+      if (!officialHostVersionMatches(currentHostVersion, host)) {
+        currentVersion += 1;
+        insertAgentVersion.run(
+          agentId,
+          currentVersion,
+          host.name,
+          host.worldRole,
+          host.personaText,
+          host.speakingStyle,
+          JSON.stringify(host.judgementPolicy),
+          JSON.stringify(host.memoryPolicy),
+          JSON.stringify(host.outputSchema),
+          JSON.stringify(host.modelConfig),
+          JSON.stringify(host.toolAllowlist),
+          JSON.stringify(host.onboardingPolicy),
+          JSON.stringify(host.facilitationPolicy),
+          JSON.stringify(host.recapPolicy),
+          JSON.stringify(host.participationPolicy),
+          JSON.stringify(host.evolutionPolicy),
+          host.proactivity,
+          JSON.stringify(host.capabilities),
+          build.id,
+          PLATFORM_WORLD_BUILDER_ID,
+          now,
+        );
+      }
+      if (
+        agent.display_name !== host.name ||
+        agent.agent_kind !== "host" ||
+        agent.role !== "referee" ||
+        agent.status !== "active" ||
+        Number(agent.current_version) !== currentVersion ||
+        Number(agent.policy_version) !== currentVersion
+      ) {
+        db.prepare(`
+          UPDATE world_agents
+          SET display_name = ?, agent_kind = 'host', role = 'referee',
+            status = 'active', current_version = ?, policy_version = ?,
+            updated_at = ?
+          WHERE id = ? AND space_id = ?
+        `).run(host.name, currentVersion, currentVersion, now, agentId, world.id);
+      }
+    }
+    for (const worldId of upgradedOfficialWorldIds) {
+      db.prepare(`
+        UPDATE world_sessions
+        SET status = 'closed', last_active_at = ?, closed_at = ?
+        WHERE space_id = ? AND status = 'active'
+      `).run(now, now, worldId);
+      db.prepare("DELETE FROM presence WHERE space_id = ?").run(worldId);
+      db.prepare(`
+        UPDATE world_host_runtimes
+        SET status = 'idle', active_executor = 'platform',
+          claimed_by_pet_id = NULL, claimed_principal_user_id = NULL,
+          claim_session_id = NULL, lease_expires_at = NULL,
+          runtime_version = runtime_version + 1,
+          last_active_at = ?, deactivated_at = ?, updated_at = ?
+        WHERE space_id = ?
+      `).run(now, now, now, worldId);
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function backfillWorldBuilderRecords(db, timestamp, originType = "migration") {
+  const builderPolicyVersion = Number(
+    db
+      .prepare("SELECT policy_version FROM platform_agents WHERE id = ?")
+      .get(PLATFORM_WORLD_BUILDER_ID)?.policy_version ?? 1,
+  );
+  const worlds = db.prepare(`
+    SELECT s.id, s.kind, s.owner_pet_id, s.name, s.description, s.tags_json,
+      s.visibility, s.join_policy, s.friend_policy, s.definition_text,
+      s.created_at, r.rules_text, ws.entry_prompt, ws.host_prompt,
+      ws.resolution_mode, wa.id AS world_agent_id, wa.display_name
+    FROM spaces s
+    JOIN space_rule_versions r
+      ON r.space_id = s.id AND r.version = s.current_rule_version
+    LEFT JOIN world_spec_versions ws
+      ON ws.space_id = s.id AND ws.version = s.current_spec_version
+    JOIN world_agents wa ON wa.space_id = s.id
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM world_build_sessions existing_build
+      WHERE existing_build.world_id = s.id
+    )
+  `).all();
+  const insertSession = db.prepare(`
+    INSERT OR IGNORE INTO world_build_sessions (
+      id, creator_pet_id, principal_user_id, platform_agent_id,
+      platform_agent_policy_version, template_id, status, origin_type, version,
+      brief_text, artifact_json,
+      validation_json, world_id, created_at, updated_at, confirmed_at,
+      materialized_at
+    ) VALUES (?, ?, NULL, ?, ?, ?, 'materialized', ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertArtifact = db.prepare(`
+    INSERT OR IGNORE INTO world_build_artifacts (
+      id, session_id, version, artifact_json, validation_json,
+      created_by_platform_agent_id,
+      created_by_platform_agent_policy_version, creator_confirmed_at, created_at
+    ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertAgentVersion = db.prepare(`
+    INSERT OR IGNORE INTO world_agent_versions (
+      world_agent_id, version, display_name, world_role, persona_text, speaking_style,
+      judgement_policy_json, memory_policy_json, output_schema_json,
+      model_config_json, tool_allowlist_json, onboarding_policy_json,
+      facilitation_policy_json, recap_policy_json, proactivity,
+      participation_policy_json, evolution_policy_json, capabilities_json,
+      source_build_session_id, created_by_agent_id, created_at
+    ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const world of worlds) {
+    const official = OFFICIAL_WORLDS.find((item) => item.id === world.id);
+    const templateId = official?.templateId ?? "general-referee";
+    const template =
+      WORLD_AGENT_TEMPLATES.find((item) => item.id === templateId) ??
+      WORLD_AGENT_TEMPLATES[0];
+    const sessionId = `world-build:${world.id}`;
+    const referee = official
+      ? { ...template.refereeDefaults, ...(official.host ?? {}) }
+      : {
+          ...template.refereeDefaults,
+          name: world.display_name || template.refereeDefaults.name,
+        };
+    const artifact = {
+      world: {
+        name: world.name,
+        description: world.description,
+        tags: JSON.parse(world.tags_json || "[]"),
+        visibility: world.visibility,
+        joinPolicy: world.join_policy,
+        friendPolicy: world.friend_policy,
+        rulesText: world.rules_text,
+        definitionText: world.definition_text,
+        entryPrompt: world.entry_prompt || "",
+        hostPrompt: world.host_prompt || "",
+        resolutionMode: world.resolution_mode || "direct",
+        initialWorldState: official?.initialState ?? {},
+        initialMemberState: official?.initialMemberState ?? {},
+      },
+      host: referee,
+    };
+    const artifactJson = JSON.stringify(artifact);
+    const validationJson = JSON.stringify({
+      valid: true,
+      readiness: "ready",
+      errors: [],
+      warnings: official
+        ? []
+        : ["由世界构建器为现有世界补齐导入来源。"],
+      missing_fields: [],
+      questions: [],
+      experience_checks: [],
+    });
+    insertSession.run(
+      sessionId,
+      world.owner_pet_id,
+      PLATFORM_WORLD_BUILDER_ID,
+      builderPolicyVersion,
+      templateId,
+      official ? "official" : originType,
+      world.description || world.definition_text || "",
+      artifactJson,
+      validationJson,
+      world.id,
+      world.created_at || timestamp,
+      timestamp,
+      world.created_at || timestamp,
+      world.created_at || timestamp,
+    );
+    insertArtifact.run(
+      `${sessionId}:1`,
+      sessionId,
+      artifactJson,
+      validationJson,
+      PLATFORM_WORLD_BUILDER_ID,
+      builderPolicyVersion,
+      world.created_at || timestamp,
+      world.created_at || timestamp,
+    );
+    insertAgentVersion.run(
+      world.world_agent_id,
+      referee.name,
+      referee.worldRole,
+      referee.personaText,
+      referee.speakingStyle,
+      JSON.stringify(referee.judgementPolicy),
+      JSON.stringify(referee.memoryPolicy),
+      JSON.stringify(referee.outputSchema),
+      JSON.stringify(referee.modelConfig),
+      JSON.stringify(referee.toolAllowlist),
+      JSON.stringify(referee.onboardingPolicy ?? {}),
+      JSON.stringify(referee.facilitationPolicy ?? {}),
+      JSON.stringify(referee.recapPolicy ?? {}),
+      referee.proactivity ?? "balanced",
+      JSON.stringify(referee.participationPolicy),
+      JSON.stringify(referee.evolutionPolicy),
+      JSON.stringify(referee.capabilities ?? WORLD_HOST_CAPABILITIES),
+      sessionId,
+      PLATFORM_WORLD_BUILDER_ID,
+      world.created_at || timestamp,
+    );
+  }
+}
+
+export function withTransaction(db, work) {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = work();
+    db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
