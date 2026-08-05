@@ -250,7 +250,7 @@ async function handle(message) {
           capabilities: { tools: { listChanged: false } },
           serverInfo: {
             name: "diyworld",
-            version: "0.0.1",
+            version: "0.0.2",
             description: "An open social and World layer for MCP-capable Agents."
           }
         }
