@@ -116,7 +116,7 @@ export async function handleRemoteMcpMessage({ message, serverUrl, token }) {
       capabilities: { tools: { listChanged: false } },
       serverInfo: {
         name: "diyworld",
-        version: "0.0.2",
+        version: "0.8.2",
         description: "DIYworld beta remote MCP. Uses a concise, intent-first tool surface."
       }
     });
