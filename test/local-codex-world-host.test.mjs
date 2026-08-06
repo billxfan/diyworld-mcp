@@ -136,6 +136,51 @@ test("each World binds one isolated local Codex Host thread", async () => {
   }
 });
 
+test("a normal World action waits briefly and returns its Host result", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-action-result-"));
+  const store = new PetSocialStore(join(directory, "social.sqlite"));
+  const codex = new FakeCodexWorldHosts();
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostCodexClient: codex,
+    worldHostRoot: join(directory, "hosts"),
+    worldHostActionWaitMs: 2_000,
+  });
+  const address = await app.listen();
+  try {
+    const registration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-action-result@example.test",
+      displayName: "行动结果测试者",
+      agentProvider: "other",
+    });
+    const client = new AgentWorldClient({
+      serverUrl: address.url,
+      token: registration.token,
+    });
+    const world = await createPublishedWorld(client, "结果直达世界", "DIRECT_RESULT");
+    await client.enterWorld(world.id, { clientSessionId: "direct-result-session" });
+    const observed = await client.observeWorld(world.id);
+    const result = await client.actInWorld(world.id, {
+      inputType: "action",
+      eventType: "action",
+      bodyText: "我整理广场上的公告栏。",
+      expectedWorldStateVersion: observed.world_state.version,
+      expectedMemberStateVersion: observed.member_state.version,
+      idempotencyKey: "direct-host-result",
+    });
+
+    assert.equal(result.status, "accepted");
+    assert.equal(result.judgement.decision, "accepted");
+    assert.match(result.outcome.body_text, /已处理该输入/u);
+    assert.equal(codex.turns.length, 1);
+  } finally {
+    await app.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("beta startup prewarms one isolated Host for every published World", async () => {
   const directory = mkdtempSync(join(tmpdir(), "agent-world-host-prewarm-"));
   const store = new PetSocialStore(join(directory, "social.sqlite"));

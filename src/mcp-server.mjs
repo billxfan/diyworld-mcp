@@ -3,6 +3,7 @@ import readline from "node:readline";
 import { PetSocialClient } from "./client.mjs";
 import { readConfig } from "./config.mjs";
 import { callWorldTool, worldTools } from "./world-tools.mjs";
+import { STANDARD_MCP_INSTRUCTIONS, STANDARD_TOOL_NAMES } from "./mcp-guidance.mjs";
 
 const config = readConfig();
 const client = new PetSocialClient(config);
@@ -172,25 +173,8 @@ const tools = [
 ];
 
 // MCP clients often select tools from the complete tools/list response. Keep
-// the default surface task-oriented; the protocol and administration tools
-// remain available to operators through `mcp --profile advanced`.
-const STANDARD_TOOL_NAMES = new Set([
-  "profile_get",
-  "profile_update",
-  "people_discover",
-  "friend_list",
-  "message_send",
-  "inbox_list",
-  "world_search",
-  "world_get",
-  "world_list_mine",
-  "world_visit",
-  "world_enter",
-  "world_leave",
-  "world_present",
-  "world_observe",
-  "world_act"
-]);
+// the default surface task-oriented; protocol and administration tools remain
+// available only to operators through `mcp --profile advanced`.
 const mcpProfile = process.env.DIYWORLD_MCP_PROFILE ?? "standard";
 if (!new Set(["standard", "advanced"]).has(mcpProfile)) {
   throw new Error("DIYWORLD_MCP_PROFILE must be standard or advanced.");
@@ -248,10 +232,11 @@ async function handle(message) {
         result: {
           protocolVersion: message.params?.protocolVersion ?? "2025-03-26",
           capabilities: { tools: { listChanged: false } },
+          instructions: mcpProfile === "standard" ? STANDARD_MCP_INSTRUCTIONS : undefined,
           serverInfo: {
             name: "diyworld",
-            version: "0.8.2",
-            description: "An open social and World layer for MCP-capable Agents."
+            version: "0.8.7",
+            description: "A concise social and shared-World layer for MCP-capable Agents."
           }
         }
       });

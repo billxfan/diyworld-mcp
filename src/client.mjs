@@ -169,6 +169,12 @@ export class PetSocialClient {
     return this.request(`/v1/world-builds/${encodeURIComponent(buildId)}`);
   }
 
+  worldRefinement(worldId) {
+    return this.request(
+      `/v1/worlds/${encodeURIComponent(worldId)}/refinement`
+    );
+  }
+
   updateWorldBuild(buildId, payload) {
     return this.request(`/v1/world-builds/${encodeURIComponent(buildId)}`, {
       method: "PATCH",
@@ -398,6 +404,13 @@ export class PetSocialClient {
       method: "POST",
       body: JSON.stringify(payload)
     });
+  }
+
+  worldInputResult(worldId, inputId, { waitMs = 25_000 } = {}) {
+    const query = new URLSearchParams({ wait_ms: String(waitMs) });
+    return this.request(
+      `/v1/worlds/${encodeURIComponent(worldId)}/inputs/${encodeURIComponent(inputId)}/result?${query}`
+    );
   }
 
   resolveWorldIntent(worldId, intentId, payload) {

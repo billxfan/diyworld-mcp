@@ -171,6 +171,15 @@ const tools = [
     ),
   },
   {
+    name: "world_builder_refinement",
+    description:
+      "汇总创建者世界中的真实运行信号，并生成必须由创建者确认的 Host/内容补丁建议；不会自动修改世界。",
+    inputSchema: objectSchema(
+      { world_id: text("创建者拥有的准确世界 ID。", 100) },
+      ["world_id"],
+    ),
+  },
+  {
     name: "world_host_get",
     description: "查看世界主持 Agent 的完整配置。",
     inputSchema: objectSchema(
@@ -540,7 +549,7 @@ const tools = [
   {
     name: "world_input_submit",
     description:
-      "基于刚刚观察到的世界版本提交发言、行动或选择；输入由 Host 结算，不能直接改写世界。",
+      "基于刚刚观察到的世界版本提交发言、行动或选择；输入由 Host 结算，不能直接改写世界。若 processing.final 为 false，必须自动调用 world_input_result 取得后续反馈。",
     inputSchema: objectSchema(
       {
         world_id: text("准确的世界 ID。", 100),
@@ -577,6 +586,18 @@ const tools = [
         "observed_member_state_version",
         "idempotency_key",
       ],
+    ),
+  },
+  {
+    name: "world_input_result",
+    description:
+      "读取已提交行动的 Host 处理状态或最终结果。不要把 pending 当作最终答复；独立行动应继续查询，集体行动先向用户反馈参与进度。",
+    inputSchema: objectSchema(
+      {
+        world_id: text("准确的世界 ID。", 100),
+        input_id: text("world_input_submit 返回的输入 ID。", 100),
+      },
+      ["world_id", "input_id"],
     ),
   },
   {
@@ -973,6 +994,8 @@ function callTool(name, args = {}) {
         expectedVersion: args.expected_version,
         confirmed: args.confirmed,
       });
+    case "world_builder_refinement":
+      return service.worldRefinementReport({ worldId: args.world_id });
     case "world_host_get":
       return service.getWorldHost({ worldId: args.world_id });
     case "world_host_update":
@@ -1161,6 +1184,11 @@ function callTool(name, args = {}) {
         observedMemberStateVersion: args.observed_member_state_version,
         idempotencyKey: args.idempotency_key,
         requireLive: true,
+      });
+    case "world_input_result":
+      return service.getWorldInputResult({
+        worldId: args.world_id,
+        inputId: args.input_id,
       });
     case "world_act":
       return service.actInWorld({

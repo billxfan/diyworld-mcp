@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { addCharacterAliases } from "./character-aliases.mjs";
 
 export const WORLD_CONTENT_SECURITY_NOTICE =
@@ -112,6 +112,12 @@ export const worldTools = [
       },
       ["build_id", "expected_version", "confirmed"]
     )
+  },
+  {
+    name: "world_builder_refinement",
+    description:
+      "汇总创建者世界的真实运行信号并生成待审核补丁建议；不会自动修改世界。",
+    inputSchema: objectSchema({ world_id: worldId }, ["world_id"])
   },
   {
     name: "world_host_get",
@@ -636,7 +642,7 @@ export const worldTools = [
   {
     name: "world_input_submit",
     description:
-      "向当前世界的主持 Agent 提交发言、行动或选择。输入本身不能直接修改世界状态。",
+      "向当前世界的主持 Agent 提交发言、行动或选择。输入本身不能直接修改世界状态；若 processing.final 为 false，必须自动调用 world_input_result 取得后续反馈。",
     inputSchema: objectSchema(
       {
         world_id: worldId,
@@ -674,6 +680,19 @@ export const worldTools = [
     )
   },
   {
+    name: "world_input_result",
+    description:
+      "等待并读取已提交行动的 Host 结果。独立行动在未完成时应自动重复调用；集体行动会先返回参与进度，达到人数或截止时间后再读取最终结果。不要把 pending 当作最终答复。",
+    inputSchema: objectSchema(
+      {
+        world_id: worldId,
+        input_id: text("已提交行动的输入 ID。", 100),
+        wait_ms: integer("本次最多等待多久；建议 25000 毫秒。", 0, 30000)
+      },
+      ["world_id", "input_id"]
+    )
+  },
+  {
     name: "world_act",
     description:
       "推荐的快速参与入口：在已进入的世界中提交用户明确表达的自然语言发言或行动。服务端会使用最新状态版本并交给世界主持判断；不要先为版本号或工具 schema 额外往返。状态只能由世界主持 Agent 判断后写入。",
@@ -697,9 +716,9 @@ export const worldTools = [
           type: "string",
           enum: ["world", "actor", "managers"]
         },
-        idempotency_key: text("稳定的幂等键。", 120)
+        idempotency_key: text("可选的稳定幂等键；省略时服务端会从本次行动生成。", 120)
       },
-      ["world_id", "body_text", "idempotency_key"]
+      ["world_id", "body_text"]
     )
   },
   {
@@ -798,10 +817,102 @@ const safe = (result) => ({
   ...addCharacterAliases(result)
 });
 
+function conciseWorldSearch(result) {
+  // Discovery is a selection step, not an export. A full World definition can
+  // contain large prompts and state that cause clients to spend turns parsing
+  // irrelevant protocol detail. world_visit returns the selected World's
+  // entry guidance after the person has made an explicit choice.
+  return {
+    worlds: (result.worlds ?? []).map((world) => ({
+      id: world.id,
+      name: world.name,
+      description: world.description,
+      tags: world.tags ?? [],
+      visibility: world.visibility,
+      join_policy: world.join_policy,
+      member_count: world.member_count ?? world.memberCount ?? 0,
+      host_name: world.world_agent?.name ?? world.host_name ?? null,
+      shortcut: world.shortcut ?? null
+    })),
+    next_step:
+      "Show the matching Worlds and their joining rules. Call world_visit only after the person explicitly chooses one and agrees to its rules."
+  };
+}
+
+function conciseGuidance(guidance) {
+  if (!guidance) return null;
+  return {
+    stage: guidance.stage ?? null,
+    message: guidance.message ?? "",
+    objective: guidance.objective ?? "",
+    choices: Array.isArray(guidance.choices)
+      ? guidance.choices.map((choice) => ({
+          label: choice.label ?? choice.name ?? "继续",
+          description: choice.description ?? choice.text ?? "",
+          event_type: choice.event_type ?? null
+        }))
+      : [],
+    free_input_prompt: guidance.free_input_prompt ?? "告诉用户下一步想做什么。"
+  };
+}
+
+function conciseWorldAction(result) {
+  const response = result.host_response ?? {};
+  return {
+    world_id: result.world_id,
+    status: result.status,
+    input_id: result.input?.id ?? null,
+    processing: result.processing ?? {
+      final: Boolean(result.judgement || result.outcome),
+      state: result.judgement || result.outcome ? "completed" : "processing"
+    },
+    host_response: {
+      status: response.status ?? result.status,
+      decision: response.decision ?? null,
+      resolution: response.resolution ?? null,
+      interpretation: response.interpretation ?? "",
+      reason_text: response.reason_text ?? "",
+      outcome_text: response.outcome_text ?? "",
+      new_facts: response.new_facts ?? [],
+      costs: response.costs ?? [],
+      opened_hooks: response.opened_hooks ?? [],
+      state_changes: response.state_changes ?? null
+    },
+    journey: result.journey
+      ? {
+          stage: result.journey.stage ?? null,
+          current_objective: result.journey.current_objective ?? null
+        }
+      : null,
+    next_guidance: conciseGuidance(result.host_guidance),
+    next_step: result.processing?.final === false
+      ? "Acknowledge receipt, then automatically call world_input_result with input_id. Do not present pending as the outcome."
+      : "Present the Host outcome as the World result. Then ask the person what they want to do next; call world_act directly for the next natural-language action."
+  };
+}
+
+function derivedActionIdempotencyKey(args) {
+  // Standard MCP clients do not consistently retain client-generated request
+  // ids across tool retries. Deriving a key from the complete user intent is
+  // safer than creating a random key: an identical transport retry remains
+  // one action, while a materially different action gets a different key.
+  const payload = JSON.stringify({
+    world_id: args.world_id,
+    input_type: args.input_type ?? "action",
+    event_type: args.event_type ?? "action",
+    body_text: args.body_text,
+    data: args.data ?? {},
+    correlation_id: args.correlation_id ?? null,
+    reply_to_event_id: args.reply_to_event_id ?? null,
+    visibility: args.visibility ?? "world"
+  });
+  return `mcp-${createHash("sha256").update(payload).digest("hex").slice(0, 40)}`;
+}
+
 export async function callWorldTool(client, name, args = {}) {
   switch (name) {
     case "world_search":
-      return safe(await client.worlds(args.query ?? "", args.limit ?? 6));
+      return safe(conciseWorldSearch(await client.worlds(args.query ?? "", args.limit ?? 6)));
     case "world_get":
       return safe(await client.world(args.world_id));
     case "world_builder_templates":
@@ -831,6 +942,8 @@ export async function callWorldTool(client, name, args = {}) {
           confirmed: args.confirmed
         })
       );
+    case "world_builder_refinement":
+      return safe(await client.worldRefinement(args.world_id));
     case "world_host_get":
       return safe(await client.worldHost(args.world_id));
     case "world_host_update":
@@ -1039,7 +1152,18 @@ export async function callWorldTool(client, name, args = {}) {
       const entered = await client.enterWorld(args.world_id, {
         clientSessionId: args.client_session_id
       });
-      return safe({ ...entered, membership: joined.membership, status: "entered" });
+      return safe({
+        world_id: args.world_id,
+        status: "entered",
+        membership: {
+          status: joined.membership?.status ?? "active",
+          accepted_rule_version: joined.membership?.accepted_rule_version ?? null
+        },
+        host_response: entered.host_response ?? null,
+        next_guidance: conciseGuidance(entered.host_guidance),
+        next_step:
+          "The person is now in this World. For their next speech or action, call world_act directly with their natural-language intent; do not inspect low-level schemas or versions."
+      });
     }
     case "world_join":
       return safe(
@@ -1128,9 +1252,17 @@ export async function callWorldTool(client, name, args = {}) {
           idempotencyKey: args.idempotency_key
         })
       );
+    case "world_input_result":
+      return safe(
+        conciseWorldAction(await client.worldInputResult(
+          args.world_id,
+          args.input_id,
+          { waitMs: args.wait_ms ?? 25_000 }
+        ))
+      );
     case "world_act":
       return safe(
-        await client.actInWorld(args.world_id, {
+        conciseWorldAction(await client.actInWorld(args.world_id, {
           inputType: args.input_type,
           eventType: args.event_type ?? "action",
           bodyText: args.body_text,
@@ -1142,8 +1274,8 @@ export async function callWorldTool(client, name, args = {}) {
           correlationId: args.correlation_id,
           replyToEventId: args.reply_to_event_id,
           visibility: args.visibility ?? "world",
-          idempotencyKey: args.idempotency_key ?? `mcp-${randomUUID()}`
-        })
+          idempotencyKey: args.idempotency_key ?? derivedActionIdempotencyKey(args)
+        }))
       );
     case "world_intent_resolve":
       return safe(

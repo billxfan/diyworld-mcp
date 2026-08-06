@@ -423,6 +423,10 @@ export function createPetSocialApp(options = {}) {
   const worldHostPrewarm = worldHostRunner?.start({
     prewarmPublishedWorlds: options.worldHostPrewarm === true,
   }) ?? Promise.resolve({ bound_world_ids: [], failed_world_ids: [] });
+  const worldHostActionWaitMs = Math.max(
+    1_000,
+    Math.min(Number(options.worldHostActionWaitMs) || 45_000, 120_000),
+  );
 
   async function handler(req, res) {
     try {
@@ -435,6 +439,12 @@ export function createPetSocialApp(options = {}) {
           service: "diyworld",
           product: "agent-world-social",
           registrationMode: inviteRequired ? "invite_only" : "open",
+          mcp: {
+            transport: "streamable-http",
+            endpoint: "/mcp",
+            ready: Boolean(selfUrl),
+            version: "0.8.7"
+          },
           now: clock()
         });
       }
@@ -609,6 +619,20 @@ export function createPetSocialApp(options = {}) {
         rateLimit(`world-build:${auth.pet_id}`, 30, 60 * 60 * 1000);
         const body = await readJson(req);
         return sendJson(res, 201, worldService(auth).startWorldBuild(body));
+      }
+
+      const worldRefinementParams = routeMatch(
+        pathname,
+        "/v1/worlds/:id/refinement"
+      );
+      if (req.method === "GET" && worldRefinementParams) {
+        return sendJson(
+          res,
+          200,
+          worldService(auth).worldRefinementReport({
+            worldId: worldRefinementParams.id
+          })
+        );
       }
 
       const worldBuildMaterializeParams = routeMatch(
@@ -1102,11 +1126,50 @@ export function createPetSocialApp(options = {}) {
 
       const worldActParams = routeMatch(pathname, "/v1/worlds/:id/intents");
       const worldInputParams = routeMatch(pathname, "/v1/worlds/:id/inputs");
+      const worldInputResultParams = routeMatch(
+        pathname,
+        "/v1/worlds/:id/inputs/:inputId/result"
+      );
+      if (req.method === "GET" && worldInputResultParams) {
+        rateLimit(`world-result:${auth.pet_id}`, 180, 60 * 1000);
+        const service = worldService(auth);
+        let result = service.getWorldInputResult({
+          worldId: worldInputResultParams.id,
+          inputId: worldInputResultParams.inputId
+        });
+        if (
+          result.processing.should_retry &&
+          result.processing.state !== "collecting" &&
+          result.processing.state !== "waiting_for_creator_host"
+        ) {
+          worldHostRunner?.enqueue(worldInputResultParams.id);
+        }
+        const waitMs = clampInteger(
+          url.searchParams.get("wait_ms"),
+          0,
+          30_000,
+          25_000
+        );
+        const waitUntil = Date.now() + waitMs;
+        while (
+          !result.processing.final &&
+          result.processing.state !== "collecting" &&
+          result.processing.state !== "waiting_for_creator_host" &&
+          Date.now() < waitUntil
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          result = service.getWorldInputResult({
+            worldId: worldInputResultParams.id,
+            inputId: worldInputResultParams.inputId
+          });
+        }
+        return sendJson(res, 200, result);
+      }
       const worldSubmitParams = worldInputParams ?? worldActParams;
       if (req.method === "POST" && worldSubmitParams) {
         rateLimit(`world-act:${auth.pet_id}`, 120, 60 * 1000);
         const body = await readJson(req);
-        const result = worldService(auth).actInWorld({
+        let result = worldService(auth).actInWorld({
           ...body,
           worldId: worldSubmitParams.id,
           requireLive: Boolean(worldInputParams)
@@ -1132,6 +1195,23 @@ export function createPetSocialApp(options = {}) {
             );
           } else {
             worldHostRunner?.enqueue(worldSubmitParams.id);
+            // Most actions finish inside this first bounded wait. Slower Host
+            // turns return an acknowledged processing state plus input ID, so
+            // the Agent can continue through world_input_result without losing
+            // the user's action. Collective inputs still follow quorum/deadline.
+            if (
+              worldActParams &&
+              result.status === "pending" &&
+              !result.input.interaction_id &&
+              worldHostRunner?.waitForInput
+            ) {
+              const committed = await worldHostRunner.waitForInput(result.input.id, {
+                timeoutMs: worldHostActionWaitMs,
+              });
+              if (committed) {
+                result = worldService(auth).worldIntentResult(result.input.id);
+              }
+            }
           }
           if (result.status === "ready_for_host" && result.input.interaction_id) {
             cancelInteractionDeadline(result.input.interaction_id);

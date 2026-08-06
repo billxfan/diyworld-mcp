@@ -424,6 +424,8 @@ test("the simple MCP flow publishes an open hidden World addressable by ID", asy
       query: created.world_id,
     });
     assert.equal(exact.worlds[0].id, created.world_id);
+    assert.equal("definition_text" in exact.worlds[0], false);
+    assert.match(exact.next_step, /world_visit/);
     const visited = await callWorldTool(visitor.client, "world_visit", {
       world_id: created.world_id,
       confirmed: true,
@@ -436,6 +438,10 @@ test("the simple MCP flow publishes an open hidden World addressable by ID", asy
       body_text: "我先在门口看看周围。"
     });
     assert.equal(action.status, "accepted");
+    assert.equal("input" in action, false);
+    assert.equal("world_state" in action, false);
+    assert.equal(action.host_response.decision, "accepted");
+    assert.match(action.next_step, /world_act/);
   } finally {
     await app.close();
     store.close();
@@ -454,12 +460,12 @@ test("shared MCP creates a world and Host through the World Builder Agent", asyn
     );
     assert.equal(templates.platform_agent.id, "platform-world-builder");
     assert.ok(
-      templates.templates.some((item) => item.id === "story-host")
+      templates.templates.some((item) => item.id === "quest-director")
     );
 
     const started = await callWorldTool(owner.client, "world_builder_start", {
       brief_text: "宠物们在浮空列车上共同推进一段连续冒险。",
-      template_id: "story-host"
+      template_id: "quest-director"
     });
     assert.equal(started.status, "draft");
     const artifact = started.artifact;

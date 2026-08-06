@@ -10,6 +10,11 @@ import {
   WORLD_HOST_ROLES,
   withTransaction,
 } from "./database.js";
+import {
+  buildDirectorTurnPlan,
+  compileWorldPackage,
+  simulateWorldPackage,
+} from "./world-agent-system.js";
 
 const SPACE_VISIBILITIES = new Set(["public", "unlisted", "hidden"]);
 const JOIN_POLICIES = new Set(["open", "approval", "invite_only"]);
@@ -1029,18 +1034,29 @@ export class SocialService {
   selectWorldAgentTemplateId(briefText) {
     const brief = String(briefText ?? "").toLocaleLowerCase();
     if (
-      /剧情|故事|角色扮演|冒险|悬疑|谜题|酒馆|地下城|rpg|story|mystery/u.test(
-        brief,
-      )
+      /后室|阈限|异常空间|无限走廊|迷失空间|backrooms|liminal|anomalous space/u.test(brief)
     ) {
-      return "story-host";
+      return "anomaly-director";
     }
     if (
-      /共建|建设|经营|花园|资源|城市|社区|沙盒|长期|持续|养成|sandbox|persistent/u.test(
-        brief,
-      )
+      /悬疑|推理|谜题|案件|调查|线索|证据|mystery|detective/u.test(brief)
     ) {
-      return "persistent-sandbox";
+      return "mystery-director";
+    }
+    if (
+      /生存|经营|资源|生产|建设|基地|避难所|殖民|农场|survival|management|colony/u.test(brief)
+    ) {
+      return "survival-director";
+    }
+    if (
+      /任务|冒险|探索|地下城|公会|战斗|成长|rpg|quest|adventure|dungeon/u.test(brief)
+    ) {
+      return "quest-director";
+    }
+    if (
+      /社交|小镇|社区|邻里|广场|学校|公寓|交友|social|town|community/u.test(brief)
+    ) {
+      return "social-director";
     }
     return "general-referee";
   }
@@ -1062,6 +1078,9 @@ export class SocialService {
       fail("WORLD_BUILDER_UNAVAILABLE", "The World Builder Agent is unavailable.");
     }
     const builderPolicyVersion = Number(platformAgent.policy_version);
+    const templateHost = parseJsonObject(template.referee_defaults_json);
+    const family =
+      templateHost.judgementPolicy?.world_mechanics?.family ?? "general";
     const baseArtifact = {
       world: {
         name: "",
@@ -1071,7 +1090,7 @@ export class SocialService {
         rulesText: "",
         definitionText: normalizedBrief,
       },
-      host: parseJsonObject(template.referee_defaults_json),
+      host: templateHost,
     };
     const suppliedArtifact =
       artifact === undefined
@@ -1081,7 +1100,13 @@ export class SocialService {
       suppliedArtifact.host = suppliedArtifact.referee;
       delete suppliedArtifact.referee;
     }
-    const nextArtifact = mergePatch(baseArtifact, suppliedArtifact);
+    const nextArtifact = compileWorldPackage({
+      briefText: normalizedBrief,
+      templateId: template.id,
+      family,
+      baseArtifact,
+      suppliedArtifact,
+    });
     const validation = {
       ...this.validateWorldBuildArtifact(nextArtifact),
       template_selection: {
@@ -1150,6 +1175,108 @@ export class SocialService {
     return buildSessionView(row);
   }
 
+  worldRefinementReport({ worldId }) {
+    const actor = this.requirePet();
+    const world = this.requireSpace(worldId);
+    this.requireManager(world, actor.id);
+    const host = hostConfigView(this.currentWorldHostConfig(world.id));
+    const mechanics = host.judgement_policy?.world_mechanics ?? {};
+    const signalRows = this.db
+      .prepare(`
+        SELECT signal_kind, COUNT(*) AS occurrences, SUM(weight) AS score,
+          MAX(created_at) AS latest_at
+        FROM world_runtime_signals
+        WHERE space_id = ?
+        GROUP BY signal_kind
+        ORDER BY score DESC, signal_kind ASC
+      `)
+      .all(world.id)
+      .map((row) => ({
+        kind: row.signal_kind,
+        occurrences: Number(row.occurrences),
+        score: Number(row.score),
+        latest_at: row.latest_at,
+      }));
+    const recentDirectorTurns = this.db
+      .prepare(`
+        SELECT selected_beat_id, COUNT(*) AS uses
+        FROM (
+          SELECT selected_beat_id
+          FROM world_director_turns
+          WHERE space_id = ? AND selected_beat_id IS NOT NULL
+          ORDER BY created_at DESC
+          LIMIT 12
+        )
+        GROUP BY selected_beat_id
+        ORDER BY uses DESC, selected_beat_id ASC
+      `)
+      .all(world.id)
+      .map((row) => ({ beat_id: row.selected_beat_id, uses: Number(row.uses) }));
+    const repeatedBeat = recentDirectorTurns.find((item) => item.uses >= 3);
+    const score = (kind) =>
+      signalRows.find((signal) => signal.kind === kind)?.score ?? 0;
+    const proposals = [];
+    if (score("action_friction") >= 2) {
+      proposals.push({
+        id: "clarify-action-contract",
+        reason: "玩家多次需要澄清或行动被拒绝。",
+        target_path: "host.judgementPolicy.world_mechanics.beat_library",
+        operation: "append",
+        value: {
+          id: "friction-recovery",
+          trigger: "repeated_clarification",
+          scene: "Host 复述可执行边界，并把原意缩小为一个仍有价值的本轮行动。",
+          choices: ["按缩小目标继续", "补充缺失条件", "选择同价值旁路"],
+          outcome: ["clarified_intent", "thread_progress"],
+          hook: "保留玩家原目标作为后续线程",
+        },
+      });
+    }
+    if (score("missing_followup") >= 2) {
+      proposals.push({
+        id: "require-public-followup",
+        reason: "多次有效行动没有产生可续接钩子。",
+        target_path: "host.facilitationPolicy.content_loop.min_public_followups",
+        operation: "replace",
+        value: Math.max(1, Number(host.facilitation_policy?.content_loop?.min_public_followups ?? 1)),
+      });
+    }
+    if (score("scene_repetition") >= 2 || repeatedBeat) {
+      proposals.push({
+        id: "expand-beat-variation",
+        reason: repeatedBeat
+          ? `最近导演回合重复使用 Beat“${repeatedBeat.beat_id}”${repeatedBeat.uses} 次。`
+          : "运行记录显示场景或冲突模式重复。",
+        target_path: "host.judgementPolicy.world_mechanics.event_generator.rules",
+        operation: "append",
+        value: "连续两次不得复用相同地点、阻力、在场角色与结果组合。",
+      });
+    }
+    if (score("stale_or_expired") >= 2) {
+      proposals.push({
+        id: "add-asynchronous-side-door",
+        reason: "多人异步输入多次因状态变化失效。",
+        target_path: "host.judgementPolicy.population_policy.late_join",
+        operation: "review",
+        value: "为依赖旧状态的玩家保留原意，改接当前线程的旁路目标。",
+      });
+    }
+    return {
+      world_id: world.id,
+      world_name: world.name,
+      family: mechanics.family ?? "general",
+      signals: signalRows,
+      director_usage: recentDirectorTurns,
+      proposals,
+      creator_confirmation_required: true,
+      auto_apply: false,
+      next_cycle:
+        proposals.length > 0
+          ? "creator_reviews_patch_then_versions_world_and_host"
+          : "continue_observing_real_play",
+    };
+  }
+
   updateWorldBuild({
     buildId,
     expectedVersion,
@@ -1177,10 +1304,20 @@ export class SocialService {
       briefText === undefined
         ? current.brief_text
         : text(briefText, "world brief", { max: 4000 });
-    const nextArtifact =
-      artifact === undefined
-        ? parseJsonObject(current.artifact_json)
-        : jsonObject(artifact, "world build artifact", { max: 64_000 });
+    const template = this.requireWorldAgentTemplate(current.template_id);
+    const templateHost = parseJsonObject(template.referee_defaults_json);
+    const family =
+      templateHost.judgementPolicy?.world_mechanics?.family ?? "general";
+    const rawArtifact = artifact === undefined
+      ? parseJsonObject(current.artifact_json)
+      : jsonObject(artifact, "world build artifact", { max: 64_000 });
+    const nextArtifact = compileWorldPackage({
+      briefText: nextBrief,
+      templateId: template.id,
+      family,
+      baseArtifact: rawArtifact,
+      suppliedArtifact: artifact === undefined ? {} : rawArtifact,
+    });
     const validation = this.validateWorldBuildArtifact(nextArtifact);
     const nextVersion = Number(current.version) + 1;
     const timestamp = now();
@@ -1328,7 +1465,13 @@ export class SocialService {
     const id = randomUUID();
     const buildId = `world-build:${id}`;
     const timestamp = now();
-    const artifact = { world: normalized, host: referee };
+    const artifact = compileWorldPackage({
+      briefText: normalized.description || normalized.definitionText,
+      templateId: template.id,
+      family: "general",
+      baseArtifact: { world: normalized, host: referee },
+      source: "legacy",
+    });
     const validation = this.validateWorldBuildArtifact(artifact);
     const builderPolicyVersion = Number(
       this.db
@@ -1740,6 +1883,72 @@ export class SocialService {
           ? "Host 拥有持续目标和下一步行动。"
           : "Host 需要明确持续目标与至少一个后续行动。",
       );
+      const directorLoop = Array.isArray(judgement.director_loop)
+        ? judgement.director_loop
+        : Array.isArray(facilitation.director_loop)
+          ? facilitation.director_loop
+          : [];
+      addExperienceCheck(
+        "director_loop",
+        directorLoop.length >= 5 ? "pass" : "review",
+        directorLoop.length >= 5
+          ? "Host 已声明从观察、编排到持久化和续接的完整导演循环。"
+          : "Host 需要声明观察、编排场景、裁决、持久化和留下后续钩子的导演循环。",
+      );
+      const population =
+        judgement.population_policy &&
+        typeof judgement.population_policy === "object"
+          ? judgement.population_policy
+          : facilitation.population_policy ?? {};
+      const populationViews = [
+        "zero_players",
+        "one_player",
+        "few_players",
+        "many_players",
+        "late_join",
+        "returning",
+      ];
+      addExperienceCheck(
+        "population_scenarios",
+        populationViews.every((view) => Boolean(population[view]))
+          ? "pass"
+          : "review",
+        populationViews.every((view) => Boolean(population[view]))
+          ? "Host 已覆盖零人、单人、少量玩家、大量玩家、中途加入与回流场景。"
+          : "Host 需要补齐不同在线人数、中途加入和回流时的编排策略。",
+      );
+      const npcPolicy = judgement.npc_policy;
+      addExperienceCheck(
+        "npc_cast",
+        npcPolicy &&
+          typeof npcPolicy === "object" &&
+          npcPolicy.mode &&
+          npcPolicy.separate_agent_default !== undefined
+          ? "pass"
+          : "review",
+        npcPolicy &&
+          typeof npcPolicy === "object" &&
+          npcPolicy.mode &&
+          npcPolicy.separate_agent_default !== undefined
+          ? "NPC 补位方式与是否使用独立 Agent 已明确。"
+          : "请明确 NPC 由 Host 内嵌扮演还是使用独立 Agent，以及升级边界。",
+      );
+      const contentLoop = facilitation.content_loop;
+      addExperienceCheck(
+        "content_refinement_loop",
+        contentLoop &&
+          typeof contentLoop === "object" &&
+          contentLoop.maintain_open_threads === true &&
+          Boolean(contentLoop.refinement_signal)
+          ? "pass"
+          : "review",
+        contentLoop &&
+          typeof contentLoop === "object" &&
+          contentLoop.maintain_open_threads === true &&
+          Boolean(contentLoop.refinement_signal)
+          ? "Host 会持续维护开放事件，并从真实互动信号中补全世界。"
+          : "请声明开放事件维护方式，以及如何利用玩家回避、困惑和高回应内容持续补全世界。",
+      );
       const safePatchPolicies = new Set([
         "host_derived",
         "validated_proposal",
@@ -1785,6 +1994,39 @@ export class SocialService {
             : "世界包含隐藏或私人信息，但尚未声明信息分区策略。",
         );
       }
+      if (artifact.worldPackage) {
+        const mechanics = judgement.world_mechanics ?? {};
+        const requiredModules = [
+          "director_abilities",
+          "thread_templates",
+          "beat_library",
+          "event_generator",
+          "pacing_model",
+          "recovery_model",
+          "settlement",
+        ];
+        addExperienceCheck(
+          "compiled_world_package",
+          artifact.worldPackage.schema_version === 1 &&
+            artifact.worldPackage.compiler_version === 1 &&
+            requiredModules.every((key) => Boolean(mechanics[key]))
+            ? "pass"
+            : "review",
+          artifact.worldPackage.schema_version === 1 &&
+            artifact.worldPackage.compiler_version === 1 &&
+            requiredModules.every((key) => Boolean(mechanics[key]))
+            ? "World Package 已通过类型判断、世界组合和 Host 模块编译。"
+            : "World Package 缺少编译版本或必要的导演运行模块。",
+        );
+        const simulation = simulateWorldPackage(artifact);
+        for (const scenario of simulation.scenarios) {
+          addExperienceCheck(
+            `simulation_${scenario.id}`,
+            scenario.status,
+            scenario.message,
+          );
+        }
+      }
     }
     if (missingFields.length > 0) {
       errors.push("仍有创建世界所需的信息未完成。");
@@ -1801,6 +2043,28 @@ export class SocialService {
       missing_fields: missingFields,
       questions,
       experience_checks: experienceChecks,
+      refinement_loop: {
+        status:
+          errors.length > 0
+            ? "complete_required_fields"
+            : reviewCount > 0
+              ? "improve_host_contract"
+              : "observe_real_play",
+        next_questions: [
+          ...questions,
+          ...experienceChecks
+            .filter((check) => check.status === "review")
+            .map((check) => check.message),
+        ].slice(0, 8),
+        runtime_signals: [
+          "players_repeat_or_rephrase_action",
+          "players_abandon_open_thread",
+          "host_repeats_scene_pattern",
+          "late_joiner_cannot_find_entry",
+          "content_receives_multiple_independent_responses",
+        ],
+        next_cycle: "summarize_signals_then_propose_creator_confirmed_patch",
+      },
     };
   }
 
@@ -6007,12 +6271,18 @@ export class SocialService {
     }
     const storedData = parseJsonObject(input.data_json);
     const worldState = this.worldStateView(world.id);
+    const actorMemberState = this.worldMemberStateView(
+      world.id,
+      input.actor_pet_id,
+    );
+    const host = hostConfigView(this.currentWorldHostConfig(world.id));
+    const context = this.worldHostContextPack(world, input.actor_pet_id);
     const concurrency = this.worldInputConcurrency(world, input, worldState);
     return {
-      contract_version: 1,
+      contract_version: 2,
       bound_world_id: world.id,
       world: this.spaceDetails(world.id),
-      host: hostConfigView(this.currentWorldHostConfig(world.id)),
+      host,
       input: {
         ...this.worldInputView(input),
         proposed_world_state_patch:
@@ -6026,15 +6296,19 @@ export class SocialService {
         bio: input.actor_bio,
       },
       world_state: worldState,
-      actor_member_state: this.worldMemberStateView(
-        world.id,
-        input.actor_pet_id,
-      ),
+      actor_member_state: actorMemberState,
       concurrency,
       context: {
-        ...this.worldHostContextPack(world, input.actor_pet_id),
+        ...context,
         input_concurrency: concurrency,
       },
+      director_plan: buildDirectorTurnPlan({
+        host,
+        worldState,
+        memberState: actorMemberState,
+        context,
+        input: this.worldInputView(input),
+      }),
       output_contract: {
         decision: ["accepted", "rejected", "clarification", "escalated"],
         resolution_disposition: concurrency.is_stale
@@ -6172,21 +6446,34 @@ export class SocialService {
       interaction,
       this.actorKey,
     );
+    const host = hostConfigView(this.currentWorldHostConfig(world.id));
+    const context = {
+      ...this.worldHostContextPack(world, null),
+      interaction: interactionView,
+      batch_size: inputBatch.length,
+    };
     return {
-      contract_version: 1,
+      contract_version: 2,
       bound_world_id: world.id,
       batch_mode: true,
       world: this.spaceDetails(world.id),
-      host: hostConfigView(this.currentWorldHostConfig(world.id)),
+      host,
       interaction: interactionView,
       input: null,
       input_batch: inputBatch,
       world_state: worldState,
-      context: {
-        ...this.worldHostContextPack(world, null),
-        interaction: interactionView,
-        batch_size: inputBatch.length,
-      },
+      context,
+      director_plan: buildDirectorTurnPlan({
+        host,
+        worldState,
+        memberState: inputBatch[0].actor_member_state,
+        context,
+        input: {
+          id: interaction.id,
+          event_type: "host.collective_resolution",
+          body_text: inputBatch.map((item) => item.body_text).join("\n"),
+        },
+      }),
       output_contract: {
         decision: ["accepted", "rejected", "clarification"],
         resolution_disposition: isStale
@@ -6290,20 +6577,34 @@ export class SocialService {
         };
       });
       this.touchWorldHostRuntime(world.id, timestamp);
+      const host = hostConfigView(this.currentWorldHostConfig(world.id));
+      const interactionView = this.worldInteractionView(readyInteraction, actor.id);
+      const context = {
+        ...this.worldHostContextPack(world, null),
+        interaction: interactionView,
+        batch_size: inputs.length,
+      };
       return {
         world: this.spaceDetails(world.id),
-        host: hostConfigView(this.currentWorldHostConfig(world.id)),
+        host,
         runtime: this.worldHostRuntimeDetails(world, actor, timestamp),
         input: null,
         input_batch: inputs,
         batch_mode: true,
-        interaction: this.worldInteractionView(readyInteraction, actor.id),
+        interaction: interactionView,
         world_state: worldState,
-        context: {
-          ...this.worldHostContextPack(world, null),
-          interaction: this.worldInteractionView(readyInteraction, actor.id),
-          batch_size: inputs.length,
-        },
+        context,
+        director_plan: buildDirectorTurnPlan({
+          host,
+          worldState,
+          memberState: inputs[0]?.actor_member_state,
+          context,
+          input: {
+            id: readyInteraction.id,
+            event_type: "host.collective_resolution",
+            body_text: inputs.map((item) => item.body_text).join("\n"),
+          },
+        }),
         untrusted_external_content: true,
       };
     }
@@ -6336,10 +6637,16 @@ export class SocialService {
     }
     const storedData = parseJsonObject(input.data_json);
     const worldState = this.worldStateView(world.id);
+    const host = hostConfigView(this.currentWorldHostConfig(world.id));
+    const actorMemberState = this.worldMemberStateView(
+      world.id,
+      input.actor_pet_id,
+    );
+    const context = this.worldHostContextPack(world, input.actor_pet_id);
     const concurrency = this.worldInputConcurrency(world, input, worldState);
     return {
       world: this.spaceDetails(world.id),
-      host: hostConfigView(this.currentWorldHostConfig(world.id)),
+      host,
       runtime: this.worldHostRuntimeDetails(world, actor, timestamp),
       input: {
         ...this.worldInputView(input),
@@ -6354,15 +6661,19 @@ export class SocialService {
         bio: input.actor_bio,
       },
       world_state: worldState,
-      actor_member_state: this.worldMemberStateView(
-        world.id,
-        input.actor_pet_id,
-      ),
+      actor_member_state: actorMemberState,
       concurrency,
       context: {
-        ...this.worldHostContextPack(world, input.actor_pet_id),
+        ...context,
         input_concurrency: concurrency,
       },
+      director_plan: buildDirectorTurnPlan({
+        host,
+        worldState,
+        memberState: actorMemberState,
+        context,
+        input: this.worldInputView(input),
+      }),
       untrusted_external_content: true,
     };
   }
@@ -6802,24 +7113,46 @@ export class SocialService {
     if (supplied.every((value) => value === undefined)) {
       fail("INVALID_ARGUMENT", "Provide at least one World Host change.");
     }
+    const onboardingPatch = onboardingPolicy === undefined
+      ? undefined
+      : onboardingPolicy.starter_choices !== undefined &&
+          onboardingPolicy.solo_choices === undefined
+        ? {
+            ...onboardingPolicy,
+            solo_choices: onboardingPolicy.starter_choices,
+          }
+        : onboardingPolicy;
     const next = this.normalizeRefereeSpec({
       name: name ?? current.name,
       agentKind: "host",
       worldRole: worldRole ?? current.world_role,
-      participationPolicy:
-        participationPolicy ?? current.participation_policy,
-      evolutionPolicy: evolutionPolicy ?? current.evolution_policy,
+      participationPolicy: participationPolicy === undefined
+        ? current.participation_policy
+        : mergePatch(current.participation_policy, participationPolicy),
+      evolutionPolicy: evolutionPolicy === undefined
+        ? current.evolution_policy
+        : mergePatch(current.evolution_policy, evolutionPolicy),
       capabilities: capabilities ?? current.capabilities,
       personaText: personaText ?? current.persona_text,
       speakingStyle: speakingStyle ?? current.speaking_style,
-      judgementPolicy: judgementPolicy ?? current.judgement_policy,
-      memoryPolicy: memoryPolicy ?? current.memory_policy,
+      judgementPolicy: judgementPolicy === undefined
+        ? current.judgement_policy
+        : mergePatch(current.judgement_policy, judgementPolicy),
+      memoryPolicy: memoryPolicy === undefined
+        ? current.memory_policy
+        : mergePatch(current.memory_policy, memoryPolicy),
       outputSchema: parseJsonObject(currentRow.output_schema_json),
       modelConfig: parseJsonObject(currentRow.model_config_json),
       toolAllowlist: parseJsonArray(currentRow.tool_allowlist_json),
-      onboardingPolicy: onboardingPolicy ?? current.onboarding_policy,
-      facilitationPolicy: facilitationPolicy ?? current.facilitation_policy,
-      recapPolicy: recapPolicy ?? current.recap_policy,
+      onboardingPolicy: onboardingPatch === undefined
+        ? current.onboarding_policy
+        : mergePatch(current.onboarding_policy, onboardingPatch),
+      facilitationPolicy: facilitationPolicy === undefined
+        ? current.facilitation_policy
+        : mergePatch(current.facilitation_policy, facilitationPolicy),
+      recapPolicy: recapPolicy === undefined
+        ? current.recap_policy
+        : mergePatch(current.recap_policy, recapPolicy),
       proactivity: proactivity ?? current.proactivity,
     });
     const spec = this.currentWorldSpec(world.id);
@@ -7636,12 +7969,24 @@ export class SocialService {
       freeInputPrompt,
       timestamp,
     });
+    const memberState = this.worldMemberStateView(world.id, petId);
+    const directorPlan = buildDirectorTurnPlan({
+      host: config,
+      worldState: { value: worldState },
+      memberState,
+      context: {
+        ...this.worldHostContextPack(world, petId),
+        actor_journey: this.worldMemberJourney(world.id, petId),
+      },
+      input: { id: `entry:${world.id}:${petId}:${journeyRow.visit_count}`, event_type: "host.entry", body_text: objective },
+    });
     return {
       ...guidance,
       host: config,
       journey: this.worldMemberJourney(world.id, petId),
       live_context: liveContext,
       participation_context: participationContext,
+      director_plan: directorPlan,
       untrusted_external_content: true,
     };
   }
@@ -7662,6 +8007,49 @@ export class SocialService {
     );
     const inputData = parseJsonObject(input.data_json).data ?? {};
     const judgementResult = parseJsonObject(judgement?.result_json);
+    if (judgement) {
+      const runtimeSignals = [];
+      if (["clarification", "rejected"].includes(judgement.decision)) {
+        runtimeSignals.push(["action_friction", judgement.decision === "clarification" ? 1 : 2]);
+      }
+      if (["conflict", "expired"].includes(judgement.resolution_disposition)) {
+        runtimeSignals.push(["stale_or_expired", 1]);
+      }
+      if (
+        judgement.decision === "accepted" &&
+        (!Array.isArray(judgementResult.opened_hooks) ||
+          judgementResult.opened_hooks.length === 0)
+      ) {
+        runtimeSignals.push(["missing_followup", 1]);
+      }
+      const declaredSignals = Array.isArray(judgementResult.runtime_signals)
+        ? judgementResult.runtime_signals
+        : [];
+      for (const signal of declaredSignals) {
+        if (["scene_repetition", "late_join_friction", "difficulty_mismatch"].includes(signal)) {
+          runtimeSignals.push([signal, 1]);
+        }
+      }
+      for (const [kind, weight] of runtimeSignals) {
+        this.db.prepare(`
+          INSERT OR IGNORE INTO world_runtime_signals (
+            id, space_id, input_id, signal_kind, weight, details_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          `world-signal:${input.id}:${kind}`,
+          world.id,
+          input.id,
+          kind,
+          weight,
+          JSON.stringify({
+            decision: judgement.decision,
+            resolution_disposition: judgement.resolution_disposition,
+            event_type: input.event_type,
+          }),
+          timestamp,
+        );
+      }
+    }
     const disposition = judgement?.resolution_disposition ?? "apply";
     const dispositionMessage =
       ({
@@ -8109,6 +8497,18 @@ export class SocialService {
     const beforeMember = targetId
       ? this.worldMemberStateView(world.id, targetId)
       : null;
+    const directorHost = hostConfigView(this.currentWorldHostConfig(world.id));
+    const directorContext = this.worldHostContextPack(
+      world,
+      input.actor_pet_id,
+    );
+    const directorPlan = buildDirectorTurnPlan({
+      host: directorHost,
+      worldState: beforeWorld,
+      memberState: beforeMember,
+      context: directorContext,
+      input: this.worldInputView(input),
+    });
     const inputWasStale = Number(input.world_state_version) < beforeWorld.version;
     if (inputWasStale && normalizedDisposition === "apply") {
       fail(
@@ -8247,6 +8647,25 @@ export class SocialService {
         WHERE id = ?
       `)
       .run(normalizedDecision, normalizedDisposition, timestamp, input.id);
+    this.db.prepare(`
+      INSERT OR IGNORE INTO world_director_turns (
+        id, space_id, input_id, world_agent_id, family,
+        population_scenario, selected_thread_id, selected_beat_id,
+        plan_json, outcome_event_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      `director-turn:${input.id}`,
+      world.id,
+      input.id,
+      worldAgent.id,
+      directorPlan.family,
+      directorPlan.population.scenario,
+      directorPlan.selection.thread?.id ?? null,
+      directorPlan.selection.beat?.id ?? null,
+      JSON.stringify(directorPlan),
+      outcomeId,
+      timestamp,
+    );
     if (normalizedDecision === "accepted") {
       this.fireMatchingEventTriggers(
         world.id,
@@ -8383,6 +8802,26 @@ export class SocialService {
     };
   }
 
+  getWorldInputResult({ worldId, inputId }) {
+    const actor = this.requirePet();
+    const world = this.requireSpace(worldId);
+    this.requireActiveMembership(world.id, actor.id);
+    const normalizedInputId = text(inputId, "input id", {
+      min: 1,
+      max: 100,
+    });
+    const input = this.db
+      .prepare(`
+        SELECT id, actor_pet_id FROM world_inputs
+        WHERE id = ? AND space_id = ?
+      `)
+      .get(normalizedInputId, world.id);
+    if (!input || input.actor_pet_id !== actor.id) {
+      fail("NOT_FOUND", "World input not found.");
+    }
+    return this.worldIntentResult(input.id);
+  }
+
   worldIntentResult(intentId) {
     const intent = this.db
       .prepare(`
@@ -8511,9 +8950,73 @@ export class SocialService {
       : "";
     const effectiveGuidance =
       pendingInteractionGuidance ?? hostGuidance;
+    const completed = judgementView !== null || outcomeView !== null;
+    const executor = this.db
+      .prepare(`
+        SELECT status, last_error, updated_at
+        FROM world_host_executors WHERE space_id = ?
+      `)
+      .get(intent.space_id);
+    const hostRuntime = this.db
+      .prepare(`
+        SELECT active_executor, claimed_by_pet_id
+        FROM world_host_runtimes WHERE space_id = ?
+      `)
+      .get(intent.space_id);
+    const queuePosition = !completed && input
+      ? Number(
+          this.db
+            .prepare(`
+              SELECT COUNT(*) AS position
+              FROM world_inputs queued
+              WHERE queued.space_id = ? AND queued.status = 'pending'
+                AND queued.interaction_id IS NULL
+                AND queued.rowid <= (
+                  SELECT rowid FROM world_inputs WHERE id = ?
+                )
+            `)
+            .get(intent.space_id, input.id).position,
+        ) || null
+      : null;
+    const processingState = completed
+      ? "completed"
+      : pendingInteractionStatus === "collecting"
+        ? "collecting"
+        : executor?.status === "failed"
+          ? "host_error"
+          : hostRuntime?.active_executor === "creator_codex" &&
+              hostRuntime?.claimed_by_pet_id
+            ? "waiting_for_creator_host"
+            : "processing";
+    const processingMessage = completed
+      ? "Host 已完成裁决，这是最终结果。"
+      : pendingInteractionMessage ||
+        (processingState === "host_error"
+          ? "行动已安全记录，但 Host 本次处理发生错误；系统可重试，行动不会丢失。"
+          : processingState === "waiting_for_creator_host"
+            ? "行动已记录，正在等待当前世界的创作者 Host 处理。"
+            : "行动已收到，Host 正在处理；Agent 应自动继续查询，直到取得最终裁决。");
+    const processing = {
+      state: processingState,
+      acknowledged: true,
+      final: completed,
+      should_retry: !completed,
+      retry_after_ms: completed ? null : 1500,
+      result_tool: completed ? null : "world_input_result",
+      message: processingMessage,
+      queue_position: queuePosition,
+      elapsed_ms: input?.created_at
+        ? Math.max(0, Date.now() - new Date(input.created_at).valueOf())
+        : null,
+      error:
+        processingState === "host_error"
+          ? executor?.last_error ?? "World Host processing failed."
+          : null,
+    };
     return {
       world_id: intent.space_id,
       status,
+      processing,
       input: inputView,
       judgement: judgementView,
       intent: eventView(intent),
