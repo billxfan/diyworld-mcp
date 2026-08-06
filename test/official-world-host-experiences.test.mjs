@@ -15,18 +15,18 @@ function createCharacter(db, ownerId, name) {
   return service;
 }
 
-test("the platform publishes 20 distinct solo-first official Worlds", () => {
+test("the platform publishes five focused solo-first official Worlds", () => {
   const db = openDatabase(":memory:");
   const visitor = createCharacter(db, "official-catalog-visitor", "目录体验者");
   try {
     const catalog = visitor.searchWorlds({ limit: 50 }).worlds;
-    assert.equal(catalog.length, 20);
+    assert.equal(catalog.length, 5);
     assert.deepEqual(
       catalog.map((world) => world.id),
       OFFICIAL_WORLDS.map((world) => world.id),
     );
-    assert.equal(new Set(catalog.map((world) => world.category)).size, 6);
-    assert.equal(new Set(catalog.map((world) => world.shortcut)).size, 20);
+    assert.equal(new Set(catalog.map((world) => world.category)).size, 5);
+    assert.equal(new Set(catalog.map((world) => world.shortcut)).size, 5);
 
     for (const definition of OFFICIAL_WORLDS) {
       const world = catalog.find((candidate) => candidate.id === definition.id);
@@ -62,7 +62,7 @@ test("every official World provides an isolated Host and an immediate solo actio
       );
       assert.equal(entered.host_guidance.kind, "welcome");
       assert.equal(entered.host_guidance.host.name, definition.host.name);
-      assert.match(entered.host_guidance.message, /没有其他真人在线也可以完整参与/);
+      assert.match(entered.host_guidance.message, /没有其他真人在线也可以完成完整玩法循环/);
       assert.ok(
         ["action", "choice", "speech"].includes(
           entered.host_guidance.choices[0].input_type,
@@ -96,7 +96,32 @@ test("every official World has a distinct gameplay loop, state model, and Host c
       assert.ok(mechanics.core_loop.length > 30, definition.id);
       assert.ok(mechanics.core_tension.length > 10, definition.id);
       assert.ok(mechanics.progression.length > 15, definition.id);
-      assert.equal(mechanics.host_directives.length, 2, definition.id);
+      assert.ok(mechanics.host_directives.length >= 3, definition.id);
+      assert.ok(host.judgement_policy.director_loop.length >= 5, definition.id);
+      assert.ok(mechanics.director_abilities.length >= 3, definition.id);
+      assert.ok(mechanics.thread_templates.length >= 3, definition.id);
+      assert.ok(mechanics.beat_library.length >= 2, definition.id);
+      assert.ok(mechanics.event_generator.inputs.length >= 5, definition.id);
+      assert.ok(mechanics.event_generator.rules.length >= 3, definition.id);
+      assert.ok(mechanics.pacing_model.baseline, definition.id);
+      assert.ok(mechanics.recovery_model.failure, definition.id);
+      assert.ok(mechanics.settlement.authority, definition.id);
+      assert.ok(host.judgement_policy.npc_policy.cast.length >= 2, definition.id);
+      assert.equal(
+        host.judgement_policy.npc_policy.separate_agent_default,
+        false,
+        definition.id,
+      );
+      for (const scenario of [
+        "zero_players",
+        "one_player",
+        "few_players",
+        "many_players",
+        "late_join",
+        "returning",
+      ]) {
+        assert.ok(host.judgement_policy.population_policy[scenario], definition.id);
+      }
       assert.match(details.rules_text, new RegExp(`【${definition.name}专属玩法规则】`, "u"));
       assert.match(details.definition_text, /核心循环：/u);
       assert.match(details.definition_text, /长期成长：/u);
@@ -126,7 +151,7 @@ test("every official World has a distinct gameplay loop, state model, and Host c
   }
 });
 
-test("all 20 official Host contracts execute one mechanic-specific turn and reject undeclared state", () => {
+test("all five official Host contracts execute one mechanic-specific turn and reject undeclared state", () => {
   const db = openDatabase(":memory:");
   const visitor = new SocialService(db, "official-turn-visitor", {
     platformHostMode: "local_codex",
@@ -180,6 +205,16 @@ test("all 20 official Host contracts execute one mechanic-specific turn and reje
       assert.equal(work.input.event_type, choice.event_type, definition.id);
       assert.ok(work.world_state.value[worldKey], definition.id);
       assert.ok(work.actor_member_state.value[memberKey], definition.id);
+      assert.equal(work.contract_version, 2, definition.id);
+      assert.equal(work.director_plan.contract_version, 1, definition.id);
+      assert.equal(
+        work.director_plan.family,
+        work.host.judgement_policy.world_mechanics.family ?? "general",
+        definition.id,
+      );
+      assert.ok(work.director_plan.selection.beat, definition.id);
+      assert.ok(work.director_plan.scene_contract.required_hook, definition.id);
+      assert.ok(work.director_plan.settlement.authority, definition.id);
 
       executor.resolveLocalCodexHostInput({
         worldId: definition.id,
@@ -207,6 +242,11 @@ test("all 20 official Host contracts execute one mechanic-specific turn and reje
       visitor.leaveWorld({ worldId: definition.id });
     }
 
+    assert.equal(
+      db.prepare("SELECT COUNT(*) AS count FROM world_director_turns").get().count,
+      OFFICIAL_WORLDS.length,
+    );
+
     assert.throws(
       () =>
         executor.enforceWorldMechanicStateContract({
@@ -220,7 +260,7 @@ test("all 20 official Host contracts execute one mechanic-specific turn and reje
   }
 });
 
-test("official v2 gameplay state backfills preserve existing World and Character progress", () => {
+test("official v4 gameplay state backfills preserve existing World and Character progress", () => {
   const db = openDatabase(":memory:");
   const visitor = createCharacter(db, "official-v2-migration", "旧版居民");
   const worldId = "official-center-town";
@@ -254,6 +294,41 @@ test("official v2 gameplay state backfills preserve existing World and Character
     assert.equal(memberState.journey.stage, "legacy");
     assert.equal(memberState.legacy_badge, "founder");
     assert.ok(memberState.resident);
+  } finally {
+    db.close();
+  }
+});
+
+test("urban mystery and backrooms exploration are separate official gameplay families", () => {
+  const db = openDatabase(":memory:");
+  const visitor = createCharacter(db, "official-mystery-split", "类型检验者");
+  try {
+    const mystery = visitor.getWorldHost({
+      worldId: "official-city-detective-agency",
+    }).host;
+    const backrooms = visitor.getWorldHost({
+      worldId: "official-liminal-backrooms",
+    }).host;
+    const mysteryMechanics = mystery.judgement_policy.world_mechanics;
+    const backroomsMechanics = backrooms.judgement_policy.world_mechanics;
+    assert.equal(
+      mysteryMechanics.settlement.truth_package.mutable_after_open,
+      false,
+    );
+    assert.deepEqual(
+      mysteryMechanics.settlement.evidence_classes,
+      ["physical", "testimony", "record", "inference", "red_herring"],
+    );
+    assert.equal(
+      backroomsMechanics.settlement.hidden_rule_policy.mutable_after_first_observation,
+      false,
+    );
+    assert.ok(
+      backroomsMechanics.thread_templates.some(
+        (thread) => thread.id === "rescue",
+      ),
+    );
+    assert.notEqual(mysteryMechanics.core_loop, backroomsMechanics.core_loop);
   } finally {
     db.close();
   }
@@ -314,13 +389,13 @@ test("official Worlds preserve Character agency and private speech", () => {
   const db = openDatabase(":memory:");
   const first = createCharacter(db, "official-agency-first", "住户甲");
   const second = createCharacter(db, "official-agency-second", "住户乙");
-  const worldId = "official-shared-apartment";
+  const worldId = "official-center-town";
   try {
     for (const visitor of [first, second]) {
       visitor.joinWorld({ worldId, ruleVersion: OFFICIAL_WORLD_VERSION });
       visitor.enterWorld({
         worldId,
-        clientSessionId: `shared-apartment:${visitor.requirePet().id}`,
+        clientSessionId: `center-town:${visitor.requirePet().id}`,
       });
     }
     const rejected = first.actInWorld({

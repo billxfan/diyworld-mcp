@@ -86,7 +86,7 @@ export async function connectAgent(options = {}, dependencies = {}) {
     throw new Error("provider must be codex, claude, cursor, custom, or other.");
   }
 
-  await checkPetSocialHealth(serverUrl, dependencies.fetch ?? globalThis.fetch);
+  const health = await checkPetSocialHealth(serverUrl, dependencies.fetch ?? globalThis.fetch);
   const existing = readExistingConfig(configPath);
   if (existing) {
     if (normalizeServerUrl(existing.serverUrl) !== serverUrl) {
@@ -111,7 +111,8 @@ export async function connectAgent(options = {}, dependencies = {}) {
       config: normalized,
       identity,
       reused: true,
-      recovered: false
+      recovered: false,
+      remoteMcpReady: health.mcp?.ready === true
     });
   }
 
@@ -149,11 +150,19 @@ export async function connectAgent(options = {}, dependencies = {}) {
     config,
     identity: registration,
     reused: false,
-    recovered: Boolean(options.recoveryCode)
+    recovered: Boolean(options.recoveryCode),
+    remoteMcpReady: health.mcp?.ready === true
   });
 }
 
-function connectionResult({ configPath, config, identity, reused, recovered }) {
+function connectionResult({
+  configPath,
+  config,
+  identity,
+  reused,
+  recovered,
+  remoteMcpReady
+}) {
   return {
     reused,
     recovered,
@@ -165,14 +174,24 @@ function connectionResult({ configPath, config, identity, reused, recovered }) {
     agentProvider: config.agentProvider,
     profile: identity.profile ?? identity.character ?? identity.pet,
     configPath,
-    remoteMcp: {
-      type: "http",
-      url: `${config.serverUrl.replace(/\/$/, "")}/mcp`,
-      headers: { Authorization: `Bearer ${config.token}` }
-    },
+    remoteMcp: remoteMcpReady
+      ? {
+          type: "http",
+          url: `${config.serverUrl.replace(/\/$/, "")}/mcp`,
+          headers: { Authorization: `Bearer ${config.token}` }
+        }
+      : null,
     mcp: {
       command: "npx",
-      args: ["-y", "@diyworld/mcp@latest", "mcp", "--config", configPath]
+      args: [
+        "-y",
+        "@diyworld/mcp@latest",
+        "mcp",
+        "--profile",
+        "standard",
+        "--config",
+        configPath
+      ]
     }
   };
 }

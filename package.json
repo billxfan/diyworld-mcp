@@ -1,6 +1,6 @@
 {
   "name": "@diyworld/mcp",
-  "version": "0.8.2",
+  "version": "0.8.7",
   "private": false,
   "type": "module",
   "description": "DIYworld MCP server and connector for persistent shared worlds.",

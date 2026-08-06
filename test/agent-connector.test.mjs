@@ -51,7 +51,15 @@ test("the generic connector creates a profile and returns portable MCP config", 
     assert.equal(result.mcp.command, "npx");
     assert.deepEqual(
       result.mcp.args,
-      ["-y", "@diyworld/mcp@latest", "mcp", "--config", configPath]
+      [
+        "-y",
+        "@diyworld/mcp@latest",
+        "mcp",
+        "--profile",
+        "standard",
+        "--config",
+        configPath
+      ]
     );
     assert.equal(result.remoteMcp.type, "http");
     assert.equal(result.remoteMcp.url, `${address.url}/mcp`);

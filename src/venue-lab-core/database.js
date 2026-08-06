@@ -6,6 +6,10 @@ import {
   OFFICIAL_WORLD_VERSION,
   OFFICIAL_WORLDS as OFFICIAL_WORLD_CATALOG,
 } from "./official-worlds.js";
+import {
+  compileWorldPackage,
+  directorFamilyModules,
+} from "./world-agent-system.js";
 
 export { OFFICIAL_WORLD_VERSION };
 
@@ -40,256 +44,227 @@ export const OFFICIAL_WORLDS = OFFICIAL_WORLD_CATALOG;
 
 export const PLATFORM_WORLD_BUILDER_ID = "platform-world-builder";
 
-export const WORLD_AGENT_TEMPLATES = [
-  {
-    id: "general-referee",
-    name: "通用世界主持",
-    description: "适合多数文字互动、轻剧情与规则驱动世界。",
+const DIRECTOR_LOOP = [
+  "observe_shared_and_member_state",
+  "select_player_relevant_open_thread",
+  "frame_actionable_scene",
+  "adjudicate_attempt",
+  "persist_consequences",
+  "seed_follow_up_hook",
+];
+
+const POPULATION_POLICY = {
+  zero_players: "pause_costs_keep_open_threads",
+  one_player: "host_embedded_npcs_complete_loop",
+  few_players: "connect_complementary_goals_without_forced_consent",
+  many_players: "parallel_scenes_and_explicit_collective_windows",
+  late_join: "short_recap_and_side_door_entry",
+  returning: "changes_since_last_visit_then_restore_or_offer_hook",
+};
+
+function directorTemplate({
+  id,
+  name,
+  description,
+  role = "host",
+  persona,
+  objective,
+  entryPrompt,
+  hostPrompt,
+  state = {},
+  memberState = {},
+  choices,
+  mechanics,
+}) {
+  return {
+    id,
+    name,
+    description,
+    status: "active",
     worldDefaults: {
       visibility: "public",
       joinPolicy: "open",
       friendPolicy: "enabled",
       resolutionMode: "direct",
-      entryPrompt: "",
-      hostPrompt: "",
-      initialWorldState: {},
-      initialMemberState: {},
+      entryPrompt,
+      hostPrompt,
+      initialWorldState: state,
+      initialMemberState: memberState,
     },
     refereeDefaults: {
-      name: "世界主持",
+      name,
       agentKind: "host",
-      worldRole: "host",
+      worldRole: role,
       participationPolicy: DEFAULT_WORLD_PARTICIPATION_POLICY,
       evolutionPolicy: DEFAULT_WORLD_EVOLUTION_POLICY,
       capabilities: WORLD_HOST_CAPABILITIES,
-      personaText:
-        "保持中立、可解释和一致，帮助成员理解世界、开始参与，并依据当前世界规则裁决。",
-      speakingStyle:
-        "简洁、清晰，先说明当前情境，再给出结果、依据和可选下一步。",
+      personaText: persona,
+      speakingStyle: "先给出可行动的当前局势，再明确裁决依据、影响和下一步。",
       judgementPolicy: {
-        rule_priority: ["platform_safety", "world_rules", "world_definition"],
-        invalid_input: "reject_or_clarify",
-        state_writes: "referee_only",
-        state_patch_policy: "host_derived",
-      },
-      memoryPolicy: {
-        scope: "world",
-        retain_events: true,
-        cross_world_memory: false,
-      },
-      outputSchema: {
-        required: ["decision", "reason_text", "outcome_text"],
-        decisions: ["accepted", "rejected", "clarification", "escalated"],
-      },
-      modelConfig: { mode: "platform_default" },
-      toolAllowlist: [],
-      onboardingPolicy: {
-        welcome_text: "",
-        setup_prompt: "你希望先如何参与这个世界？",
-        starter_choices: [
-          {
-            id: "observe",
-            label: "先了解当前情况",
-            input_type: "choice",
-            event_type: "host.onboarding.intent_selected",
-            body_text: "我想先了解当前情况。",
-          },
-          {
-            id: "greet",
-            label: "向在场成员打招呼",
-            input_type: "speech",
-            event_type: "speech",
-            body_text: "大家好，我刚来到这里。",
-          },
-          {
-            id: "contribute",
-            label: "看看有什么可以参与",
-            input_type: "choice",
-            event_type: "host.onboarding.intent_selected",
-            body_text: "我想看看现在有什么可以参与。",
-          },
-        ],
-        free_input_prompt: "也可以直接说你想做什么。",
-      },
-      facilitationPolicy: {
-        objective_text: "找到一个适合自己的参与方式。",
-        next_actions: [
-          "观察最近发生的事情",
-          "回应一位成员",
-          "提出一个与当前世界有关的行动",
-        ],
-      },
-      recapPolicy: { enabled: true, max_events: 3 },
-      proactivity: "balanced",
-    },
-  },
-  {
-    id: "persistent-sandbox",
-    name: "持久共建世界",
-    description: "适合类似沙盒的长期建设、资源和共同状态推进。",
-    worldDefaults: {
-      visibility: "public",
-      joinPolicy: "open",
-      friendPolicy: "enabled",
-      resolutionMode: "direct",
-      entryPrompt: "请先观察当前世界状态，再说明你希望采取的行动。",
-      hostPrompt: "裁决时明确资源、位置、关系或公共状态发生了什么变化。",
-      initialWorldState: { phase: "initial", shared_resources: {} },
-      initialMemberState: { inventory: {}, location: "entry" },
-    },
-    refereeDefaults: {
-      name: "共建主持",
-      agentKind: "host",
-      worldRole: "steward",
-      participationPolicy: DEFAULT_WORLD_PARTICIPATION_POLICY,
-      evolutionPolicy: DEFAULT_WORLD_EVOLUTION_POLICY,
-      capabilities: WORLD_HOST_CAPABILITIES,
-      personaText:
-        "维护持久世界的一致性、资源约束和成员之间的公平，并帮助新成员找到可贡献的事情。",
-      speakingStyle: "像可靠的社区主持人，描述进展并列出关键状态变化。",
-      judgementPolicy: {
-        rule_priority: ["platform_safety", "world_rules", "state_consistency"],
+        rule_priority: ["platform_safety", "world_rules", "character_agency", "state_consistency"],
         invalid_input: "reject_or_clarify",
         conflicts: "deterministic_then_escalate",
         state_writes: "referee_only",
         state_patch_policy: "host_derived",
+        director_loop: DIRECTOR_LOOP,
+        population_policy: POPULATION_POLICY,
+        npc_policy: {
+          mode: "host_embedded_cast",
+          separate_agent_default: false,
+          disclose_as_npc: true,
+          promotion_rule: "only_for_independent_long_lived_concurrent_actor",
+        },
+        world_mechanics: {
+          ...directorFamilyModules(mechanics?.family ?? "general"),
+          ...mechanics,
+        },
       },
       memoryPolicy: {
         scope: "world",
         retain_events: true,
         retain_state_history: true,
         cross_world_memory: false,
+        return_strategy: "recap_change_then_restore_or_offer_hook",
       },
       outputSchema: {
-        required: ["decision", "reason_text", "outcome_text"],
+        required: ["decision", "reason_text", "outcome_text", "new_facts", "opened_hooks"],
         decisions: ["accepted", "rejected", "clarification", "escalated"],
       },
       modelConfig: { mode: "platform_default" },
       toolAllowlist: [],
       onboardingPolicy: {
-        welcome_text: "这里的建设会持续保留，你的贡献也会成为世界的一部分。",
-        setup_prompt: "你想从哪种方式开始参与？",
-        starter_choices: [
-          {
-            id: "inspect",
-            label: "查看当前建设",
-            input_type: "choice",
-            event_type: "host.onboarding.intent_selected",
-            body_text: "我先查看当前建设和待处理事项。",
-          },
-          {
-            id: "small-task",
-            label: "领取一件小任务",
-            input_type: "choice",
-            event_type: "host.onboarding.intent_selected",
-            body_text: "请给我一件现在就能完成的小任务。",
-          },
-          {
-            id: "proposal",
-            label: "提出一个建设想法",
-            input_type: "action",
-            event_type: "proposal",
-            body_text: "我想提出一个新的建设想法。",
-          },
-        ],
-        free_input_prompt: "也可以直接说明你希望带来什么变化。",
+        welcome_text: description,
+        setup_prompt: objective,
+        solo_message: "没有其他真人在线时，Host 会用明确标识的 NPC 与环境补足互动，并保证本轮可完成。",
+        solo_objective_text: objective,
+        solo_choices: choices,
+        starter_choices: choices,
+        free_input_prompt: "也可以直接说你现在想尝试的行动。",
       },
       facilitationPolicy: {
-        objective_text: "完成一件能被其他成员看见的小贡献。",
-        next_actions: [
-          "查看待处理事项",
-          "完成一项小建设",
-          "回应其他成员的提案",
-        ],
+        objective_text: objective,
+        next_actions: choices,
+        free_input_prompt: "可以继续当前目标，也可以提出符合规则的新尝试。",
+        director_loop: DIRECTOR_LOOP,
+        population_policy: POPULATION_POLICY,
+        content_loop: {
+          maintain_open_threads: true,
+          min_player_relevant_hooks: 1,
+          min_public_followups: 1,
+          refinement_signal: "track_avoidance_repetition_confusion_and_high_response_content",
+        },
       },
-      recapPolicy: { enabled: true, max_events: 5 },
-      proactivity: "balanced",
+      recapPolicy: { enabled: true, max_events: 8 },
+      proactivity: "active",
     },
+  };
+}
+
+const commonChoices = [
+  { id: "observe", label: "了解当前局势", input_type: "choice", event_type: "host.onboarding.intent_selected", body_text: "我先了解当前局势和可参与的事件。" },
+  { id: "act", label: "领取可完成的行动", input_type: "choice", event_type: "host.onboarding.intent_selected", body_text: "请给我一件现在能完成并影响世界的行动。" },
+  { id: "free", label: "提出自己的行动", input_type: "action", event_type: "action", body_text: "我想根据当前局势提出自己的行动。" },
+];
+
+export const WORLD_AGENT_TEMPLATES = [
+  directorTemplate({
+    id: "general-referee",
+    name: "通用导演",
+    description: "通用持久多人世界基座；信息不足时可先创建，再按体验信号循环补全。",
+    persona: "维护共享事实、玩家自主权与持续可玩的开放事件。",
+    objective: "找到一个与当前玩家有关、现在可完成并会留下后续影响的行动。",
+    entryPrompt: "先观察当前共享状态，再选择或提出行动。",
+    hostPrompt: "持续执行观察、编排、裁决、持久化与续接的导演循环。",
+    choices: commonChoices,
+    mechanics: { family: "general", focus: "player_relevant_open_threads" },
+  }),
+  directorTemplate({
+    id: "social-director",
+    name: "社交世界导演",
+    description: "适合公共小镇、社区和长期弱连接社交。",
+    role: "steward",
+    persona: "创造低压力、可拒绝、可异步续接的社交机会，并保护私人边界。",
+    objective: "完成一个日常行动、回应一条真实玩家痕迹或留下新的社交入口。",
+    entryPrompt: "查看当前公共动态和与你相关的社交机会。",
+    hostPrompt: "用日常事件、公共痕迹和共同项目连接玩家，不伪造真人关系。",
+    choices: commonChoices,
+    mechanics: { family: "social", focus: "relationships_traces_and_shared_places" },
+  }),
+  directorTemplate({
+    id: "quest-director",
+    name: "任务冒险导演",
+    description: "适合任务链、探索、成长与可选组队。",
+    role: "narrator",
+    persona: "把开放世界组织成有目标、有风险、有阶段结果且可中途加入的任务。",
+    objective: "选择或继续一项任务，推进一个节点并留下可复用发现。",
+    entryPrompt: "查看任务、风险、准备条件和当前开放节点。",
+    hostPrompt: "维持任务图、难度、阶段、奖励与余波；组队永远不是开始任务的前置条件。",
+    choices: commonChoices,
+    mechanics: { family: "quest", focus: "quest_graph_risk_reward_and_progression" },
+  }),
+  directorTemplate({
+    id: "mystery-director",
+    name: "悬疑世界导演",
+    description: "适合证据链、假说、隐藏真相和持续调查。",
+    role: "narrator",
+    persona: "维护幕后真相和信息边界，以可验证证据制造公平的悬疑。",
+    objective: "获取或核验一条证据，推进一个可证伪的调查方向。",
+    entryPrompt: "区分已知事实、他人记录、当前假说和未解矛盾。",
+    hostPrompt: "关键真相提供多条证据路径；不因猜中关键词直接揭晓，不用含糊替代线索。",
+    choices: commonChoices,
+    mechanics: { family: "mystery", focus: "truth_evidence_hypotheses_and_information_partitions" },
+  }),
+  directorTemplate({
+    id: "anomaly-director",
+    name: "异常探索导演",
+    description: "适合后室、阈限空间、异常规则验证、公共标记和异步救援。",
+    role: "narrator",
+    persona: "维持跨玩家一致的异常规律，用有限探索、可复核记录和安全锚点组织持续探索。",
+    objective: "从稳定锚点完成一次有限勘察、规则验证、痕迹续接或救援推进。",
+    entryPrompt: "查看稳定锚点、公共地图、前人记录、补给、暴露与当前撤退条件。",
+    hostPrompt: "异常规律不可随意改写；探索必须有范围、预算、预兆和撤退窗口；优先续接真实玩家痕迹。",
+    choices: commonChoices,
+    mechanics: { family: "anomaly", focus: "anchors_routes_rules_traces_exposure_and_rescue" },
+  }),
+  directorTemplate({
+    id: "survival-director",
+    name: "生存经营导演",
+    description: "适合资源、生产、建设、风险和集体经营。",
+    role: "steward",
+    persona: "维护清楚可解释的资源约束和反馈回路，让危机有取舍也有恢复路径。",
+    objective: "处理一个瓶颈并结算资源、设施、风险与个人状态的连锁变化。",
+    entryPrompt: "先查看资源、设施、风险和当前生产队列。",
+    hostPrompt: "所有收益说明来源和消耗；无人在线时暂停消耗；全体决策进入明确集体窗口。",
+    choices: commonChoices,
+    mechanics: { family: "survival", focus: "resources_production_risk_and_recovery" },
+  }),
+  {
+    ...directorTemplate({
+      id: "persistent-sandbox",
+      name: "持久共建世界（旧版）",
+      description: "兼容既有构建记录；新世界应使用更具体的导演模板。",
+      persona: "维护持久世界状态。",
+      objective: "完成一项持久贡献。",
+      entryPrompt: "查看共享状态。",
+      hostPrompt: "维护状态一致性。",
+      choices: commonChoices,
+      mechanics: { family: "legacy_persistent" },
+    }),
+    status: "retired",
   },
   {
-    id: "story-host",
-    name: "剧情主持世界",
-    description: "适合持续故事、角色扮演、选择和冲突判定。",
-    worldDefaults: {
-      visibility: "public",
-      joinPolicy: "open",
-      friendPolicy: "enabled",
-      resolutionMode: "direct",
-      entryPrompt: "请描述角色身份、当前目标或选择一个入场选项。",
-      hostPrompt: "推进剧情但不替成员决定；冲突结果必须能追溯到当前规则与状态。",
-      initialWorldState: { chapter: 1, scene: "opening" },
-      initialMemberState: { role: "", traits: [], status: {} },
-    },
-    refereeDefaults: {
-      name: "剧情主持",
-      agentKind: "host",
-      worldRole: "narrator",
-      participationPolicy: DEFAULT_WORLD_PARTICIPATION_POLICY,
-      evolutionPolicy: DEFAULT_WORLD_EVOLUTION_POLICY,
-      capabilities: WORLD_HOST_CAPABILITIES,
-      personaText:
-        "兼顾叙事张力与规则公平，帮助成员进入情境，但不替成员决定角色意志。",
-      speakingStyle: "有画面感，但裁决结论和可选下一步必须明确。",
-      judgementPolicy: {
-        rule_priority: ["platform_safety", "world_rules", "character_agency"],
-        invalid_input: "clarify",
-        conflicts: "rule_based",
-        state_writes: "referee_only",
-        state_patch_policy: "host_derived",
-      },
-      memoryPolicy: {
-        scope: "world",
-        retain_events: true,
-        retain_character_continuity: true,
-        cross_world_memory: false,
-      },
-      outputSchema: {
-        required: ["decision", "reason_text", "outcome_text"],
-        decisions: ["accepted", "rejected", "clarification", "escalated"],
-      },
-      modelConfig: { mode: "platform_default" },
-      toolAllowlist: [],
-      onboardingPolicy: {
-        welcome_text: "欢迎进入这个持续发展的故事空间。",
-        setup_prompt: "请选择一个进入当前情境的方式。",
-        starter_choices: [
-          {
-            id: "participant",
-            label: "以参与者身份加入",
-            input_type: "choice",
-            event_type: "host.onboarding.role_selected",
-            body_text: "我以参与者身份加入。",
-            data: { role: "参与者" },
-          },
-          {
-            id: "visitor",
-            label: "先作为访客观察",
-            input_type: "choice",
-            event_type: "host.onboarding.role_selected",
-            body_text: "我先作为访客进入。",
-            data: { role: "访客" },
-          },
-          {
-            id: "custom",
-            label: "自定义身份",
-            input_type: "choice",
-            event_type: "host.onboarding.custom_role",
-            body_text: "我想自定义自己的身份。",
-          },
-        ],
-        free_input_prompt: "也可以直接描述你的身份和来到这里的原因。",
-      },
-      facilitationPolicy: {
-        objective_text: "建立自己的身份，并完成第一次有意义的互动。",
-        next_actions: [
-          "回应当前场景",
-          "与一位角色交流",
-          "提出符合情境的行动",
-        ],
-      },
-      recapPolicy: { enabled: true, max_events: 4 },
-      proactivity: "balanced",
-    },
+    ...directorTemplate({
+      id: "story-host",
+      name: "剧情主持世界（旧版）",
+      description: "兼容既有构建记录；新世界应使用任务或悬疑导演。",
+      persona: "维护叙事连续性。",
+      objective: "推进当前场景。",
+      entryPrompt: "查看当前场景。",
+      hostPrompt: "维护玩家自主权。",
+      choices: commonChoices,
+      mechanics: { family: "legacy_story" },
+    }),
+    status: "retired",
   },
 ];
 
@@ -807,6 +782,34 @@ export function migrateWorldRuntime(db) {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS world_runtime_signals (
+      id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      input_id TEXT REFERENCES world_inputs(id) ON DELETE CASCADE,
+      signal_kind TEXT NOT NULL,
+      weight INTEGER NOT NULL DEFAULT 1 CHECK (weight BETWEEN 1 AND 10),
+      details_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      UNIQUE (space_id, input_id, signal_kind)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_world_runtime_signals_world_kind
+    ON world_runtime_signals (space_id, signal_kind, created_at);
+
+    CREATE TABLE IF NOT EXISTS world_director_turns (
+      id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      input_id TEXT NOT NULL UNIQUE REFERENCES world_inputs(id) ON DELETE CASCADE,
+      world_agent_id TEXT NOT NULL REFERENCES world_agents(id),
+      family TEXT NOT NULL DEFAULT 'general',
+      population_scenario TEXT NOT NULL,
+      selected_thread_id TEXT,
+      selected_beat_id TEXT,
+      plan_json TEXT NOT NULL,
+      outcome_event_id TEXT REFERENCES world_events(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS world_sessions (
       id TEXT PRIMARY KEY,
       space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
@@ -1151,13 +1154,21 @@ export function migrateWorldRuntime(db) {
     db.prepare(`
       INSERT OR IGNORE INTO platform_agents (
         id, kind, name, status, policy_version, created_at, updated_at
-      ) VALUES (?, 'world_builder', '创世 Agent', 'active', 1, ?, ?)
+      ) VALUES (?, 'world_builder', '创世 Agent', 'active', 3, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        status = excluded.status,
+        policy_version = excluded.policy_version,
+        updated_at = excluded.updated_at
+      WHERE platform_agents.name IS NOT excluded.name
+        OR platform_agents.status IS NOT excluded.status
+        OR platform_agents.policy_version IS NOT excluded.policy_version
     `).run(PLATFORM_WORLD_BUILDER_ID, timestamp, timestamp);
     const insertTemplate = db.prepare(`
       INSERT INTO world_agent_templates (
         id, name, description, version, status, world_defaults_json,
         referee_defaults_json, created_by_agent_id, created_at, updated_at
-      ) VALUES (?, ?, ?, 3, 'active', ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, 5, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         description = excluded.description,
@@ -1178,6 +1189,7 @@ export function migrateWorldRuntime(db) {
         template.id,
         template.name,
         template.description,
+        template.status ?? "active",
         JSON.stringify(template.worldDefaults),
         JSON.stringify(template.refereeDefaults),
         PLATFORM_WORLD_BUILDER_ID,
@@ -1352,7 +1364,7 @@ function officialHost(world) {
 }
 
 function officialBuildArtifact(world) {
-  return {
+  const baseArtifact = {
     world: {
       name: world.name,
       description: world.description,
@@ -1370,6 +1382,16 @@ function officialBuildArtifact(world) {
     },
     host: officialHost(world),
   };
+  const template = officialTemplate(world);
+  return compileWorldPackage({
+    briefText: world.definition,
+    templateId: template.id,
+    family:
+      template.refereeDefaults.judgementPolicy?.world_mechanics?.family ??
+      "general",
+    baseArtifact,
+    source: "official",
+  });
 }
 
 function stableJson(value) {
@@ -1504,15 +1526,50 @@ export function seedOfficialWorlds(db) {
       .all()
       .map((row) => row.id)
       .filter((id) => !activeOfficialWorldIds.has(id));
-    const deleteBuild = db.prepare(
-      "DELETE FROM world_build_sessions WHERE world_id = ?",
+    const retireOfficialWorld = db.prepare(`
+      UPDATE spaces
+      SET publication_status = 'closed', visibility = 'unlisted',
+        join_policy = 'invite_only', updated_at = ?
+      WHERE id = ? AND kind = 'official'
+        AND (
+          publication_status <> 'closed'
+          OR visibility <> 'unlisted'
+          OR join_policy <> 'invite_only'
+        )
+    `);
+    const closeRetiredSessions = db.prepare(`
+      UPDATE world_sessions
+      SET status = 'closed', last_active_at = ?, closed_at = ?
+      WHERE space_id = ? AND status = 'active'
+    `);
+    const clearRetiredPresence = db.prepare(
+      "DELETE FROM presence WHERE space_id = ?",
     );
-    const deleteOfficialWorld = db.prepare(
-      "DELETE FROM spaces WHERE id = ? AND kind = 'official'",
-    );
+    const idleRetiredRuntime = db.prepare(`
+      UPDATE world_host_runtimes
+      SET status = 'idle', active_executor = 'platform',
+        claimed_by_pet_id = NULL, claimed_principal_user_id = NULL,
+        claim_session_id = NULL, lease_expires_at = NULL,
+        deactivated_at = COALESCE(deactivated_at, ?), updated_at = ?
+      WHERE space_id = ?
+        AND (
+          status <> 'idle' OR active_executor <> 'platform'
+          OR claimed_by_pet_id IS NOT NULL
+          OR claimed_principal_user_id IS NOT NULL
+          OR claim_session_id IS NOT NULL OR lease_expires_at IS NOT NULL
+        )
+    `);
+    const idleRetiredExecutor = db.prepare(`
+      UPDATE world_host_executors
+      SET status = 'idle', updated_at = ?
+      WHERE space_id = ? AND status IN ('queued', 'running')
+    `);
     for (const worldId of retiredOfficialWorldIds) {
-      deleteBuild.run(worldId);
-      deleteOfficialWorld.run(worldId);
+      retireOfficialWorld.run(now, worldId);
+      closeRetiredSessions.run(now, now, worldId);
+      clearRetiredPresence.run(worldId);
+      idleRetiredRuntime.run(now, now, worldId);
+      idleRetiredExecutor.run(now, worldId);
     }
 
     const upgradedOfficialWorldIds = [];

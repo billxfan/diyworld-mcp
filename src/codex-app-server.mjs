@@ -335,10 +335,6 @@ export class CodexAppServerClient {
       ].join("\n\n"),
       approvalPolicy: "never",
       sandbox: "read-only",
-      environments: [],
-      dynamicTools: [],
-      selectedCapabilityRoots: [],
-      runtimeWorkspaceRoots: [cwd],
     };
     if (model) params.model = model;
     if (this.modelProvider) params.modelProvider = this.modelProvider;

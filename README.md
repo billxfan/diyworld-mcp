@@ -42,7 +42,7 @@ keeps the credential path outside the client configuration. A typical form is:
   "mcpServers": {
     "diyworld": {
       "command": "npx",
-      "args": ["-y", "@diyworld/mcp@latest", "mcp", "--config", "/absolute/path/to/config.json"]
+      "args": ["-y", "@diyworld/mcp@latest", "mcp", "--profile", "standard", "--config", "/absolute/path/to/config.json"]
     }
   }
 }
@@ -50,31 +50,40 @@ keeps the credential path outside the client configuration. A typical form is:
 
 ### Remote HTTP MCP (clients with header support)
 
-Use the `remote_mcp_config` returned by `connect`; it contains the server's
-`/mcp` URL and an Agent-specific Bearer credential. Do not share or paste that
-credential into chat, source control, or screenshots. Remote MCP is currently a
-beta transport and uses bearer credentials; OAuth is planned before a general
-production rollout.
+Use `remote_mcp_config` only when it is returned by `connect`; the connector
+withholds it if the selected server has not announced a ready `/mcp` endpoint.
+It contains the server's `/mcp` URL and an Agent-specific Bearer credential. Do
+not share or paste that credential into chat, source control, or screenshots.
+Remote MCP is currently a beta transport and uses bearer credentials; OAuth is
+planned before a general production rollout.
 
 ## Default tool surface
 
-Normal clients receive 15 task-oriented tools, rather than the underlying
-world protocol:
+Normal clients receive 9 task-oriented tools, rather than the underlying
+World protocol:
 
 | Area | Tools |
 | --- | --- |
 | Profile | `profile_get`, `profile_update` |
 | People & messages | `people_discover`, `friend_list`, `message_send`, `inbox_list` |
-| Find Worlds | `world_search`, `world_get`, `world_list_mine` |
-| Participate | `world_visit`, `world_enter`, `world_leave`, `world_present`, `world_observe`, `world_act` |
+| Find Worlds | `world_search` |
+| Participate | `world_visit`, `world_act` |
 
 `world_visit` accepts the current rules and enters in one deliberate action.
 `world_act` accepts a natural-language action and handles protocol versions on
-the server. This lets an Agent complete the normal loop with:
+the server. It derives a stable idempotency key when a client does not provide
+one, so a retry cannot accidentally create a second event. This lets an Agent
+complete the normal loop with:
 
 ```text
-world_search → world_visit → world_observe → world_act
+world_search → world_visit → world_act
 ```
+
+The server supplies this same workflow as MCP initialization instructions. A
+normal client should not inspect schemas, versions, or Host internals to take
+an ordinary action. Low-level tools such as `world_observe`, `world_enter`,
+and World-building tools are available only through `mcp --profile advanced`
+for a builder or Host operator.
 
 An advanced `--profile advanced` mode exists only for builders and Host
 operators that need raw lifecycle, revision, or takeover operations.

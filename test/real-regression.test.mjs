@@ -50,7 +50,7 @@ test("real journey: Builder creation, visitor play, privacy, governance, and rer
 
     const build = await owner.client.startWorldBuild({
       briefText: "一个成员共同维护夜市、可以自由交谈和交换物品的持久世界。",
-      templateId: "persistent-sandbox",
+      templateId: "social-director",
       artifact: {
         world: {
           name: "萤火夜市",
@@ -339,16 +339,16 @@ test("real journey: official Worlds remain solo-complete, asynchronous, and priv
     });
     assert.equal(townContribution.status, "accepted");
 
-    const island = await traveler.client.world("official-island-community");
-    await traveler.client.joinWorld(island.id, { ruleVersion: island.rule_version });
-    await traveler.client.enterWorld(island.id, {
-      clientSessionId: "real-island-entry",
+    const survival = await traveler.client.world("official-apocalypse-shelter");
+    await traveler.client.joinWorld(survival.id, { ruleVersion: survival.rule_version });
+    await traveler.client.enterWorld(survival.id, {
+      clientSessionId: "real-survival-entry",
     });
-    const built = await traveler.client.submitWorldInput(island.id, {
+    const built = await traveler.client.submitWorldInput(survival.id, {
       inputType: "action",
-      eventType: "world.primary_action",
-      bodyText: "我在北侧沙滩修好一张供后来者休息的长椅。",
-      idempotencyKey: "real-island-bench",
+      eventType: "survival.production",
+      bodyText: "我检查净水器并更换一处磨损密封，让后来者能继续使用。",
+      idempotencyKey: "real-survival-repair",
       requireLive: true,
     });
     assert.equal(built.status, "accepted");
@@ -398,19 +398,19 @@ test("real journey: official Worlds remain solo-complete, asynchronous, and priv
       true,
     );
 
-    const theater = await traveler.client.world("official-world-theater");
-    await traveler.client.joinWorld(theater.id, { ruleVersion: theater.rule_version });
-    await traveler.client.enterWorld(theater.id, {
-      clientSessionId: "real-theater-entry",
+    const adventure = await traveler.client.world("official-adventurers-guild");
+    await traveler.client.joinWorld(adventure.id, { ruleVersion: adventure.rule_version });
+    await traveler.client.enterWorld(adventure.id, {
+      clientSessionId: "real-adventure-entry",
     });
     const userWorldCountBefore = store.db
       .prepare("SELECT COUNT(*) AS count FROM spaces WHERE kind = 'user'")
       .get().count;
-    const scene = await traveler.client.submitWorldInput(theater.id, {
+    const scene = await traveler.client.submitWorldInput(adventure.id, {
       inputType: "choice",
-      eventType: "world.primary_action",
-      bodyText: "我加入一段正在等待下一位演员的太空站修复故事。",
-      idempotencyKey: "real-theater-scene",
+      eventType: "adventure.accept_quest",
+      bodyText: "我领取失踪补给车任务，先核对旧路地图和已知风险。",
+      idempotencyKey: "real-adventure-quest",
       requireLive: true,
     });
     assert.equal(scene.status, "accepted");

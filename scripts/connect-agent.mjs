@@ -6,6 +6,7 @@ import { parseArgs } from "node:util";
 
 import { connectAgent, onboardingRequirements } from "../src/agent-connector.mjs";
 import { DEFAULT_AGENT_WORLD_SERVER_URL } from "../src/installer.mjs";
+import { STANDARD_MCP_INSTRUCTIONS } from "../src/mcp-guidance.mjs";
 
 function usage() {
   console.log(`DIYworld connector
@@ -130,13 +131,13 @@ try {
       },
       config_path: result.configPath,
       mcp_config: { mcpServers: { diyworld: result.mcp } },
-      remote_mcp_config: {
-        mcpServers: {
-          diyworld: result.remoteMcp
-        }
-      },
-      remote_mcp_notice:
-        "Beta remote MCP uses the same Agent credential. Use remote_mcp_config only with clients that support HTTP MCP and custom Authorization headers.",
+      mcp_usage_instructions: STANDARD_MCP_INSTRUCTIONS,
+      remote_mcp_config: result.remoteMcp
+        ? { mcpServers: { diyworld: result.remoteMcp } }
+        : undefined,
+      remote_mcp_notice: result.remoteMcp
+        ? "Beta remote MCP uses the same Agent credential. Use remote_mcp_config only with clients that support HTTP MCP and custom Authorization headers."
+        : "Remote MCP is not enabled on this server yet. Use the returned local stdio mcp_config.",
       reused: result.reused,
       recovered: result.recovered,
       referral_invite: result.referralInvite ?? undefined

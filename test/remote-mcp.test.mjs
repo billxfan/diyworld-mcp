@@ -36,6 +36,7 @@ test("the Funnel-ready remote MCP exposes a concise authenticated tool surface",
     });
     assert.equal(initialized.response.status, 200);
     assert.equal(initialized.body.result.serverInfo.name, "diyworld");
+    assert.match(initialized.body.result.instructions, /world_visit with confirmed:true → world_act/);
 
     const listed = await callMcp(address.url, registration.token, {
       jsonrpc: "2.0",
@@ -47,12 +48,15 @@ test("the Funnel-ready remote MCP exposes a concise authenticated tool surface",
     assert.ok(names.has("world_search"));
     assert.ok(names.has("world_visit"));
     assert.ok(names.has("world_act"));
+    assert.ok(names.has("world_input_result"));
     assert.ok(names.has("profile_get"));
     assert.ok(names.has("profile_update"));
     assert.ok(names.has("people_discover"));
+    assert.equal(names.size, 10);
     assert.equal(names.has("character_get"), false);
     assert.equal(names.has("pet_get"), false);
     assert.equal(names.has("world_input_submit"), false);
+    assert.equal(names.has("world_observe"), false);
     const updateProfile = listed.body.result.tools.find(
       (tool) => tool.name === "profile_update",
     );

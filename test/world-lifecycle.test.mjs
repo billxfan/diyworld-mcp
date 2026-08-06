@@ -514,19 +514,19 @@ test("an existing venue database upgrades to World v0 without losing old records
       .map((row) => row.name);
     assert.ok(columns.includes("publication_status"));
     assert.ok(columns.includes("definition_text"));
-    assert.equal(
-      upgraded
-        .prepare("SELECT 1 FROM spaces WHERE id = ?")
-        .get("official-world-entry"),
-      undefined,
-    );
+    const retired = upgraded
+      .prepare("SELECT publication_status, visibility, join_policy FROM spaces WHERE id = ?")
+      .get("official-world-entry");
+    assert.equal(retired.publication_status, "closed");
+    assert.equal(retired.visibility, "unlisted");
+    assert.equal(retired.join_policy, "invite_only");
     assert.equal(
       upgraded
         .prepare(
           "SELECT COUNT(*) AS count FROM spaces WHERE kind = 'official' AND publication_status = 'published'",
         )
         .get().count,
-      20,
+      OFFICIAL_WORLDS.length,
     );
   } finally {
     upgraded.close();
