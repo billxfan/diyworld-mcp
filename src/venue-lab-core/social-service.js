@@ -4588,6 +4588,7 @@ export class SocialService {
     targetPetId,
     expectedWorldStateVersion,
     expectedMemberStateVersion,
+    expectedHostRuntimeVersion,
     resolutionDisposition,
     applyProposedState = true,
     [WORLD_HOST_CLAIM_AUTHORIZATION]: hostClaimAuthorized = false,
@@ -4669,6 +4670,33 @@ export class SocialService {
     if (targetId) this.requireActiveMembership(world.id, targetId);
     const timestamp = now();
     withTransaction(this.db, () => {
+      if (platformHostAuthorized) {
+        const expectedRuntimeVersion = integer(
+          expectedHostRuntimeVersion,
+          "expected Host runtime version",
+          { min: 1 },
+        );
+        const lockedRuntime = this.db
+          .prepare(`
+            SELECT active_executor, runtime_version
+            FROM world_host_runtimes WHERE space_id = ?
+          `)
+          .get(world.id);
+        if (
+          lockedRuntime?.active_executor !== "platform" ||
+          Number(lockedRuntime.runtime_version) !== expectedRuntimeVersion
+        ) {
+          fail(
+            "WORLD_HOST_EXECUTOR_CHANGED",
+            "World Host execution authority changed while the platform Host was deciding.",
+            {
+              expected_runtime_version: expectedRuntimeVersion,
+              current_runtime_version: Number(lockedRuntime?.runtime_version ?? 0),
+              active_executor: lockedRuntime?.active_executor ?? null,
+            },
+          );
+        }
+      }
       const currentWorldState = this.worldStateView(world.id);
       const isStale = Number(input.world_state_version) < currentWorldState.version;
       if (isStale && resolutionDisposition === undefined) {
@@ -6328,6 +6356,10 @@ export class SocialService {
     return {
       contract_version: 2,
       bound_world_id: world.id,
+      execution_fence: {
+        active_executor: "platform",
+        runtime_version: Number(runtime.runtime_version),
+      },
       world: this.spaceDetails(world.id),
       host,
       input: {
@@ -6663,6 +6695,10 @@ export class SocialService {
     return {
       contract_version: 2,
       bound_world_id: world.id,
+      execution_fence: {
+        active_executor: "platform",
+        runtime_version: Number(runtime.runtime_version),
+      },
       batch_mode: true,
       world: this.spaceDetails(world.id),
       host,
@@ -6988,6 +7024,7 @@ export class SocialService {
     result = {},
     worldStatePatch,
     expectedWorldStateVersion,
+    expectedHostRuntimeVersion,
     [PLATFORM_HOST_AUTHORIZATION]: platformHostAuthorized = false,
   }) {
     if (platformHostAuthorized && !this.platformHostExecutor) {
@@ -7117,6 +7154,33 @@ export class SocialService {
     const aggregateOutcomeId = randomUUID();
     let afterWorldState;
     withTransaction(this.db, () => {
+      if (platformHostAuthorized) {
+        const expectedRuntimeVersion = integer(
+          expectedHostRuntimeVersion,
+          "expected Host runtime version",
+          { min: 1 },
+        );
+        const lockedRuntime = this.db
+          .prepare(`
+            SELECT active_executor, runtime_version
+            FROM world_host_runtimes WHERE space_id = ?
+          `)
+          .get(world.id);
+        if (
+          lockedRuntime?.active_executor !== "platform" ||
+          Number(lockedRuntime.runtime_version) !== expectedRuntimeVersion
+        ) {
+          fail(
+            "WORLD_HOST_EXECUTOR_CHANGED",
+            "World Host execution authority changed while the platform Host was deciding.",
+            {
+              expected_runtime_version: expectedRuntimeVersion,
+              current_runtime_version: Number(lockedRuntime?.runtime_version ?? 0),
+              active_executor: lockedRuntime?.active_executor ?? null,
+            },
+          );
+        }
+      }
       const lockedInteraction = this.db
         .prepare(`
           SELECT * FROM world_interactions

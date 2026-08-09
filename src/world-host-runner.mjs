@@ -97,6 +97,9 @@ export function worldHostPrompt(work) {
         : ", and optional world_state_patch/member_state_patch"
     }.`,
     "Never create public World state from a non-world-visible input. Never decide another member's behavior or consent.",
+    batchMode
+      ? "input_batch responses and member details are participant-private evidence. Use them only to compute the declared aggregate rule; never quote, attribute, identify, or expose an individual response or private member state in outcome_text, result, or world_state_patch."
+      : "Preserve actor-private input and member state at their declared visibility; do not expose them through public World output.",
     "outcome_text may state that speech or action was written into the World, but must never claim it was delivered, displayed, read, heard, or answered by another Character. Delivery receipts are outside Host authority.",
     "If host.judgement_policy.world_mechanics.state_contract is present, patch only its declared top-level keys and preserve unrelated state. Apply the World-specific loop, tension, progression, and host directives when judging the result.",
     "For an accepted decision, result should include new_facts and opened_hooks arrays plus 2-3 next_actions derived from the actual outcome and current open threads. Each next action uses: label, input_type, event_type, body_text, visibility. Do not repeat generic starter choices when the scene has materially changed.",
@@ -125,8 +128,8 @@ export class LocalCodexWorldHostRunner {
     if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 8) {
       throw new Error("World Host maxConcurrency must be between 1 and 8");
     }
-    if (!new Set(["per_turn", "per_world"]).has(threadIsolation)) {
-      throw new Error("World Host threadIsolation must be per_turn or per_world");
+    if (threadIsolation !== "per_turn") {
+      throw new Error("World Host threadIsolation must be per_turn");
     }
     this.db = db;
     this.codexClient = codexClient;
@@ -199,10 +202,6 @@ export class LocalCodexWorldHostRunner {
       } catch (error) {
         failedWorldIds.push(world.world_id);
         await this.#recordFailure(world.world_id, error);
-        this.onError?.(error, {
-          worldId: world.world_id,
-          phase: "prewarm",
-        });
       }
     }
     return { bound_world_ids: boundWorldIds, failed_world_ids: failedWorldIds };
@@ -409,6 +408,8 @@ export class LocalCodexWorldHostRunner {
         prompt: worldHostPrompt(work),
         model: this.model,
         effort: this.effort,
+        resume: this.threadIsolation !== "per_turn",
+        ephemeral: this.threadIsolation === "per_turn",
       });
       const decision = parseWorldHostDecision(turn.text);
       if (next.kind === "interaction" && decision.memberStatePatch !== undefined) {
@@ -428,6 +429,7 @@ export class LocalCodexWorldHostRunner {
           },
         },
         expectedWorldStateVersion: work.world_state.version,
+        expectedHostRuntimeVersion: work.execution_fence.runtime_version,
       };
       const result =
         next.kind === "interaction"

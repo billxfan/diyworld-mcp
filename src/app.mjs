@@ -423,6 +423,9 @@ export function createPetSocialApp(options = {}) {
         ? { recipients: [runtime.claimed_by_pet_id] }
         : { visibility: "managers" }
     );
+    if (!runtime?.claimed_by_pet_id) {
+      worldHostRunner?.enqueue(interaction.space_id);
+    }
   }
 
   function scheduleInteractionDeadline(interaction) {

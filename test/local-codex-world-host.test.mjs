@@ -8,6 +8,7 @@ import { createAgentWorldApp } from "../src/app.mjs";
 import { AgentWorldClient } from "../src/client.mjs";
 import { PetSocialStore } from "../src/store.mjs";
 import {
+  LocalCodexWorldHostRunner,
   parseWorldHostDecision,
 } from "../src/world-host-runner.mjs";
 
@@ -23,8 +24,8 @@ class FakeCodexWorldHosts {
     return thread;
   }
 
-  async runWorldHostTurn({ threadId, prompt }) {
-    this.turns.push({ threadId, prompt });
+  async runWorldHostTurn({ threadId, prompt, resume }) {
+    this.turns.push({ threadId, prompt, resume });
     return {
       threadId,
       turnId: `turn:${this.turns.length}`,
@@ -47,6 +48,44 @@ class SlowFakeCodexWorldHosts extends FakeCodexWorldHosts {
     return super.runWorldHostTurn(args);
   }
 }
+
+class ControlledFakeCodexWorldHosts extends FakeCodexWorldHosts {
+  constructor() {
+    super();
+    this.started = new Promise((resolve) => {
+      this.resolveStarted = resolve;
+    });
+    this.released = new Promise((resolve) => {
+      this.resolveReleased = resolve;
+    });
+  }
+
+  async runWorldHostTurn(args) {
+    this.resolveStarted();
+    await this.released;
+    return super.runWorldHostTurn(args);
+  }
+
+  completeTurn() {
+    this.resolveReleased();
+  }
+}
+
+test("persistent per-World Host threads are rejected to preserve Character privacy", () => {
+  const store = new PetSocialStore(":memory:");
+  try {
+    assert.throws(
+      () => new LocalCodexWorldHostRunner({
+        db: store.db,
+        codexClient: new FakeCodexWorldHosts(),
+        threadIsolation: "per_world",
+      }),
+      /threadIsolation must be per_turn/u,
+    );
+  } finally {
+    store.close();
+  }
+});
 
 async function createPublishedWorld(client, name, marker) {
   const world = await client.createWorld({
@@ -119,6 +158,7 @@ test("every Host turn gets a fresh isolated local Codex thread", async () => {
     assert.equal(new Set(codex.created.map((item) => item.threadId)).size, 3);
     assert.ok(codex.created.every((item) => item.ephemeral === true));
     assert.equal(codex.turns.length, 3);
+    assert.ok(codex.turns.every((item) => item.resume === false));
     const amberTurn = codex.turns.find((item) => item.prompt.includes("来自 amber 的输入"));
     const celadonTurn = codex.turns.find((item) => item.prompt.includes("来自 celadon 的输入"));
     assert.match(amberTurn.prompt, /AMBER_ONLY/u);
@@ -261,6 +301,67 @@ test("a submitted action is acknowledged and its final Host result is waitable",
     assert.equal(completed.status, "accepted");
     assert.match(completed.host_response.outcome_text, /已处理该输入/u);
   } finally {
+    await app.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a platform Host cannot commit after a creator takes over mid-turn", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-takeover-fence-"));
+  const store = new PetSocialStore(join(directory, "social.sqlite"));
+  const codex = new ControlledFakeCodexWorldHosts();
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostCodexClient: codex,
+    worldHostRoot: join(directory, "hosts"),
+  });
+  const address = await app.listen();
+  try {
+    const registration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-takeover-fence@example.test",
+      displayName: "Host 接管测试者",
+      agentProvider: "codex",
+    });
+    const owner = new AgentWorldClient({
+      serverUrl: address.url,
+      token: registration.token,
+    });
+    const world = await createPublishedWorld(owner, "接管栅栏世界", "FENCE_ONLY");
+    await owner.enterWorld(world.id, { clientSessionId: "takeover-fence-session" });
+    const observed = await owner.observeWorld(world.id);
+    const pending = await owner.submitWorldInput(world.id, {
+      inputType: "action",
+      eventType: "inspect",
+      bodyText: "等待平台 Host 判断时接管主持权。",
+      observedWorldStateVersion: observed.world_state.version,
+      observedMemberStateVersion: observed.member_state.version,
+      idempotencyKey: "takeover-fence-input",
+    });
+
+    await codex.started;
+    await owner.takeoverWorldHost(world.id, {
+      clientSessionId: "takeover-fence-session",
+    });
+    codex.completeTurn();
+    await app.worldHostRunner.whenIdle();
+
+    const input = store.db
+      .prepare("SELECT status FROM world_inputs WHERE id = ?")
+      .get(pending.input.id);
+    const judgement = store.db
+      .prepare("SELECT id FROM world_judgements WHERE input_id = ?")
+      .get(pending.input.id);
+    const executor = store.db
+      .prepare("SELECT status, last_error FROM world_host_executors WHERE space_id = ?")
+      .get(world.id);
+    assert.equal(input.status, "pending");
+    assert.equal(judgement, undefined);
+    assert.equal(executor.status, "failed");
+    assert.match(executor.last_error, /execution authority changed/u);
+  } finally {
+    codex.completeTurn();
     await app.close();
     store.close();
     rmSync(directory, { recursive: true, force: true });
