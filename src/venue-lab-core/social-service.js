@@ -396,7 +396,7 @@ function hostRuntimeView(
         ? "platform_policy_v2"
         : "platform_policy_v1",
     model_backed: creatorCodexActive || localCodexEnabled,
-    context_isolation: localCodexEnabled ? "one_thread_per_world" : null,
+    context_isolation: localCodexEnabled ? "one_fresh_thread_per_turn" : null,
     executor_status: localCodexEnabled ? executorStatus : null,
     judgement_contract_version: judgementContractV2 ? 2 : 1,
     structured_state: judgementContractV2,
@@ -717,7 +717,7 @@ function spaceView(row) {
               row.world_runtime_active_executor === "creator_codex" ||
               localCodexHost,
             context_isolation: localCodexHost
-              ? "one_thread_per_world"
+              ? "one_fresh_thread_per_turn"
               : null,
             judgement_contract_version:
               row.world_runtime_active_executor === "creator_codex" ||
@@ -2020,6 +2020,32 @@ export class SocialService {
             ? "World Package 已通过类型判断、世界组合和 Host 模块编译。"
             : "World Package 缺少编译版本或必要的导演运行模块。",
         );
+        const beats = Array.isArray(mechanics.beat_library)
+          ? mechanics.beat_library
+          : [];
+        const beatIds = new Set(
+          beats
+            .map((beat) => beat?.id)
+            .filter((id) => typeof id === "string" && id.trim()),
+        );
+        const openThreads = Array.isArray(
+          world.initialWorldState?.world_progress?.open_threads,
+        )
+          ? world.initialWorldState.world_progress.open_threads
+          : [];
+        const missingBeatReferences = openThreads.filter(
+          (thread) => thread?.beat && !beatIds.has(thread.beat),
+        );
+        if (beatIds.size !== beats.length) {
+          errors.push("Host Beat 库包含缺失或重复的 ID。");
+        }
+        if (missingBeatReferences.length > 0) {
+          errors.push(
+            `开放线程引用了不存在的 Beat：${missingBeatReferences
+              .map((thread) => `${thread.id ?? "unknown"}->${thread.beat}`)
+              .join("、")}。`,
+          );
+        }
         const simulation = simulateWorldPackage(artifact);
         for (const scenario of simulation.scenarios) {
           addExperienceCheck(
@@ -4231,6 +4257,25 @@ export class SocialService {
       max: 4000,
     });
     const normalizedData = jsonObject(data, "event data");
+    if (normalizedType === "speech.directed") {
+      const targetCharacterId = text(
+        normalizedData.target_character_id ?? normalizedData.target_pet_id,
+        "target character id",
+        { min: 1, max: 100 },
+      );
+      if (targetCharacterId === actor.id) {
+        fail("INVALID_ARGUMENT", "Directed World speech must target another Character.");
+      }
+      this.requireActiveMembership(world.id, targetCharacterId);
+      normalizedData.target_character_id = targetCharacterId;
+      delete normalizedData.target_pet_id;
+      if (visibility !== "world") {
+        fail(
+          "INVALID_ARGUMENT",
+          "Directed World speech must be world-visible so its target can receive it.",
+        );
+      }
+    }
     const worldPatch = optionalJsonObject(
       proposedWorldStatePatch,
       "proposed world state patch",
@@ -6355,6 +6400,167 @@ export class SocialService {
         );
       }
     }
+
+    const mechanicFamily =
+      host.judgement_policy?.world_mechanics?.family;
+    const currentWorldState = this.worldStateView(worldId).value;
+    const nextWorldState =
+      worldStatePatch === undefined || worldStatePatch === null
+        ? currentWorldState
+        : mergePatch(currentWorldState, worldStatePatch);
+    const currentMemberState =
+      memberStatePatch === undefined || memberStatePatch === null
+        ? {}
+        : this.worldMemberStateView(worldId, this.actorKey).value;
+    const nextMemberState =
+      memberStatePatch === undefined || memberStatePatch === null
+        ? {}
+        : mergePatch(currentMemberState, memberStatePatch);
+    const violation = (message, details = {}) =>
+      fail("WORLD_STATE_CONTRACT_VIOLATION", message, details);
+    const boundedNumber = (value, path, min, max = Infinity) => {
+      if (
+        typeof value !== "number" ||
+        !Number.isFinite(value) ||
+        value < min ||
+        value > max
+      ) {
+        violation(`The Host attempted to write an invalid value at ${path}.`, {
+          path,
+          minimum: min,
+          ...(Number.isFinite(max) ? { maximum: max } : {}),
+          received: value,
+        });
+      }
+    };
+
+    if (mechanicFamily === "survival") {
+      const settlement = nextWorldState.settlement;
+      const currentSettlement = currentWorldState.settlement ?? {};
+      if (!settlement || typeof settlement !== "object") {
+        violation("The Host cannot remove the survival settlement state.");
+      }
+      for (const name of Object.keys(currentSettlement.resources ?? {})) {
+        if (!(name in (settlement.resources ?? {}))) {
+          violation("The Host cannot remove a tracked survival resource.", {
+            resource: name,
+          });
+        }
+      }
+      for (const [name, value] of Object.entries(settlement.resources ?? {})) {
+        boundedNumber(value, `settlement.resources.${name}`, 0);
+      }
+      for (const name of Object.keys(currentSettlement.indicators ?? {})) {
+        if (!(name in (settlement.indicators ?? {}))) {
+          violation("The Host cannot remove a tracked survival indicator.", {
+            indicator: name,
+          });
+        }
+      }
+      for (const [name, value] of Object.entries(settlement.indicators ?? {})) {
+        boundedNumber(value, `settlement.indicators.${name}`, 0, 100);
+      }
+      for (const name of Object.keys(currentSettlement.facilities ?? {})) {
+        if (!(name in (settlement.facilities ?? {}))) {
+          violation("The Host cannot remove a tracked survival facility.", {
+            facility: name,
+          });
+        }
+      }
+      for (const [name, facility] of Object.entries(settlement.facilities ?? {})) {
+        boundedNumber(
+          facility?.condition,
+          `settlement.facilities.${name}.condition`,
+          0,
+          100,
+        );
+      }
+      boundedNumber(
+        settlement.season_phase?.days_to_thaw,
+        "settlement.season_phase.days_to_thaw",
+        0,
+      );
+      if (currentMemberState.operator && !nextMemberState.operator) {
+        violation("The Host cannot remove the member's operator state.");
+      }
+      if (nextMemberState.operator) {
+        boundedNumber(nextMemberState.operator.health, "operator.health", 0, 100);
+        boundedNumber(nextMemberState.operator.fatigue, "operator.fatigue", 0, 100);
+      }
+    }
+
+    if (mechanicFamily === "mystery") {
+      const currentCases = new Map(
+        (currentWorldState.mystery?.active_cases ?? []).map((item) => [item.id, item]),
+      );
+      const nextCases = new Map(
+        (nextWorldState.mystery?.active_cases ?? []).map((item) => [item.id, item]),
+      );
+      for (const [id, currentCase] of currentCases) {
+        if (currentCase.truth_commitment === "pending_seal") continue;
+        const nextCase = nextCases.get(id);
+        if (
+          !nextCase ||
+          nextCase.truth_commitment !== currentCase.truth_commitment
+        ) {
+          violation("The Host cannot alter or remove a sealed case truth commitment.", {
+            case_id: id,
+          });
+        }
+      }
+    }
+
+    if (mechanicFamily === "anomaly") {
+      const currentClaims = new Map(
+        (currentWorldState.backrooms?.rule_claims ?? []).map((item) => [item.id, item]),
+      );
+      const nextClaims = new Map(
+        (nextWorldState.backrooms?.rule_claims ?? []).map((item) => [item.id, item]),
+      );
+      for (const [id, currentClaim] of currentClaims) {
+        const nextClaim = nextClaims.get(id);
+        if (!nextClaim) {
+          violation("The Host cannot remove an observed anomaly rule claim.", {
+            rule_claim_id: id,
+          });
+        }
+        if (
+          !Number.isInteger(nextClaim.confirmations) ||
+          nextClaim.confirmations < 0
+        ) {
+          violation("Anomaly rule confirmations must be a non-negative integer.", {
+            rule_claim_id: id,
+          });
+        }
+        if (!new Set(["unverified", "verified", "disproved"]).has(nextClaim.status)) {
+          violation("Anomaly rule status is invalid.", {
+            rule_claim_id: id,
+          });
+        }
+        if (Number(nextClaim.confirmations ?? 0) < Number(currentClaim.confirmations ?? 0)) {
+          violation("Anomaly rule confirmations cannot decrease.", {
+            rule_claim_id: id,
+          });
+        }
+        if (
+          (Number(currentClaim.confirmations ?? 0) > 0 ||
+            currentClaim.status !== "unverified") &&
+          nextClaim.claim !== currentClaim.claim
+        ) {
+          violation("The Host cannot rewrite an anomaly rule after observation.", {
+            rule_claim_id: id,
+          });
+        }
+        if (
+          currentClaim.status !== "unverified" &&
+          nextClaim.status !== currentClaim.status
+        ) {
+          violation("The Host cannot reverse a resolved anomaly rule status.", {
+            rule_claim_id: id,
+          });
+        }
+      }
+    }
   }
 
   resolveLocalCodexHostInput({ worldId, inputId, ...resolution }) {
@@ -7583,8 +7789,17 @@ export class SocialService {
       .all(spaceId);
     const selfPresent = rows.some((row) => row.id === petId);
     const otherPresentCount = rows.filter((row) => row.id !== petId).length;
+    const memberCount = Number(
+      this.db
+        .prepare(`
+          SELECT COUNT(*) AS count FROM space_memberships
+          WHERE space_id = ? AND status = 'active'
+        `)
+        .get(spaceId).count,
+    );
     return {
       present_count: rows.length,
+      member_count: memberCount,
       other_present_count: otherPresentCount,
       currently_alone: selfPresent && otherPresentCount === 0,
       waiting_for_others: false,
@@ -7617,6 +7832,8 @@ export class SocialService {
       current_mode: currentMode,
       world_state_scope: "shared",
       participation_style: multiplayerPresent ? "co_present" : "independent",
+      present_count: liveContext.present_count,
+      member_count: liveContext.member_count,
       solo_enabled: policy.solo_enabled,
       multiplayer_enabled: policy.multiplayer_enabled,
       multiplayer_transition: policy.multiplayer_transition,
@@ -7866,6 +8083,9 @@ export class SocialService {
     const independentVisit =
       liveContext.other_present_count === 0 &&
       config.participation_policy.solo_enabled;
+    const populationSummary = independentVisit
+      ? `当前只检测到你一个实时会话；本世界已有${liveContext.member_count}名真人成员。其他成员未保持实时心跳不代表他们没有加入。`
+      : `当前检测到${liveContext.present_count}个实时会话；本世界已有${liveContext.member_count}名真人成员。`;
     const stage = firstVisit ? "setup" : "returning";
     const kind = waitingForOthers
       ? "waiting"
@@ -7891,8 +8111,8 @@ export class SocialService {
       ? [
           `${config.name}${firstVisit ? "欢迎你来到" : "欢迎你回到"}${world.name}。`,
           firstVisit ? onboarding.welcome_text : "",
-          onboarding.solo_message ||
-            "目前只有你在线；你可以先选择参与方向，等待其他成员进入。",
+          populationSummary,
+          onboarding.solo_message || "你可以先选择参与方向。",
           firstVisit ? spec.entry_prompt : "",
         ]
       : firstVisit
@@ -7905,6 +8125,7 @@ export class SocialService {
             openLoops.length > 0
               ? `当前未解目标：${openLoops.slice(-3).join("；")}`
               : "",
+            populationSummary,
             independentVisit ? onboarding.solo_message : "",
             spec.entry_prompt,
           ]
@@ -7914,6 +8135,7 @@ export class SocialService {
             openLoops.length > 0
               ? `仍未解决：${openLoops.slice(-2).join("；")}`
               : "",
+            populationSummary,
           ];
     const baseChoices = waitingForOthers
       ? this.normalizeStoredHostChoices(
@@ -8211,11 +8433,18 @@ export class SocialService {
       !Array.isArray(facilitation.event_next_actions)
         ? facilitation.event_next_actions[input.event_type]
         : undefined;
+    const judgedNextActions =
+      judgement?.decision === "accepted" &&
+      Array.isArray(judgementResult.next_actions)
+        ? judgementResult.next_actions
+        : undefined;
     const choices = this.normalizeStoredHostChoices(
       offerNextActions
-        ? Array.isArray(eventNextActions)
-          ? eventNextActions
-          : facilitation.next_actions
+        ? Array.isArray(judgedNextActions) && judgedNextActions.length > 0
+          ? judgedNextActions
+          : Array.isArray(eventNextActions)
+            ? eventNextActions
+            : facilitation.next_actions
         : config.onboarding_policy.starter_choices,
     );
     const eventObjective =
@@ -9015,6 +9244,56 @@ export class SocialService {
           ? executor?.last_error ?? "World Host processing failed."
           : null,
     };
+    let delivery = null;
+    if (inputView?.event_type === "speech.directed") {
+      const targetCharacterId =
+        inputView.data?.target_character_id ?? inputView.data?.target_pet_id ?? null;
+      const deliveryTablesAvailable = Number(
+        this.db
+          .prepare(`
+            SELECT COUNT(*) AS count FROM sqlite_master
+            WHERE type = 'table' AND name IN ('events', 'event_receipts')
+          `)
+          .get().count,
+      ) === 2;
+      const notification = targetCharacterId && deliveryTablesAvailable
+        ? this.db
+            .prepare(`
+              SELECT event.id,
+                MAX(receipt.delivered_at) AS delivered_at,
+                MAX(receipt.displayed_at) AS displayed_at,
+                MAX(receipt.read_at) AS read_at
+              FROM events event
+              LEFT JOIN event_receipts receipt ON receipt.event_id = event.id
+              WHERE event.pet_id = ?
+                AND event.event_type = 'world.event_committed'
+                AND json_extract(event.payload_json, '$.inputId') = ?
+              GROUP BY event.id
+              ORDER BY event.id DESC LIMIT 1
+            `)
+            .get(targetCharacterId, inputView.id)
+        : null;
+      delivery = {
+        world_write: completed ? "written" : "pending_host",
+        target_character_id: targetCharacterId,
+        notification_event_id: notification ? `evt_${notification.id}` : null,
+        target_delivery_state: notification?.read_at != null
+          ? "read"
+          : notification?.displayed_at != null
+            ? "displayed"
+            : notification?.delivered_at != null
+              ? "delivered"
+              : notification
+                ? "queued"
+                : completed
+                  ? deliveryTablesAvailable
+                    ? "notification_pending"
+                    : "receipt_unavailable"
+                  : "not_created",
+        claim_boundary:
+          "written, queued, delivered, displayed, and read are distinct states",
+      };
+    }
     return {
       world_id: intent.space_id,
       status,
@@ -9027,6 +9306,7 @@ export class SocialService {
       member_state: memberState,
       journey,
       interaction: interactionView,
+      delivery,
       host_guidance: effectiveGuidance,
       host_response: {
         response_type: judgementView

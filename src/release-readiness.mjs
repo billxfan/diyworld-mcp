@@ -15,6 +15,7 @@ const PRESERVED_TABLES = [
   "read_cursors",
   "events",
   "event_acks",
+  "event_receipts",
   "invite_codes",
   "invite_redemptions",
   "account_deletion_confirmations",

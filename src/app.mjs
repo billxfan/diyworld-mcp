@@ -106,6 +106,7 @@ function requiredAgentScope(method, pathname) {
     pathname === "/v1/friend-requests" ||
     pathname === "/v1/friends" ||
     pathname === "/v1/inbox" ||
+    pathname === "/v1/activity" ||
     pathname === "/v1/events"
   ) {
     return method === "GET" ? "social:read" : "social:write";
@@ -181,7 +182,8 @@ function eventEnvelope(event) {
     sequence: event.id,
     eventType: event.type,
     occurredAt: event.createdAt,
-    payload: event.payload
+    payload: event.payload,
+    delivery: event.delivery ?? { state: "queued" }
   };
 }
 
@@ -288,9 +290,73 @@ export function createPetSocialApp(options = {}) {
         .map((row) => row.pet_id);
     }
     return store.db
-      .prepare("SELECT pet_id FROM presence WHERE space_id = ?")
+      .prepare(`
+        SELECT pet_id FROM space_memberships
+        WHERE space_id = ? AND status = 'active'
+      `)
       .all(worldId)
       .map((row) => row.pet_id);
+  }
+
+  function worldNotificationPayload(worldId, payload = {}) {
+    const world = store.db
+      .prepare("SELECT name FROM spaces WHERE id = ?")
+      .get(worldId);
+    const input = payload.inputId
+      ? store.db
+          .prepare(`
+            SELECT input.*, actor.display_name AS actor_name
+            FROM world_inputs input
+            LEFT JOIN pets actor ON actor.id = input.actor_pet_id
+            WHERE input.id = ? AND input.space_id = ?
+          `)
+          .get(payload.inputId, worldId)
+      : null;
+    const outcome = payload.outcomeEventId
+      ? store.db
+          .prepare(`
+            SELECT body_text, event_type FROM world_events
+            WHERE id = ? AND space_id = ?
+          `)
+          .get(payload.outcomeEventId, worldId)
+      : null;
+    const interaction = payload.interactionId
+      ? store.db
+          .prepare(`
+            SELECT interaction.mode, interaction.quorum,
+              interaction.late_input_policy, interaction.closes_at,
+              prompt.body_text AS prompt_text
+            FROM world_interactions interaction
+            JOIN world_events prompt ON prompt.id = interaction.prompt_event_id
+            WHERE interaction.id = ? AND interaction.space_id = ?
+          `)
+          .get(payload.interactionId, worldId)
+      : null;
+    let inputData = {};
+    try {
+      inputData = input ? JSON.parse(input.data_json ?? "{}")?.data ?? {} : {};
+    } catch {
+      inputData = {};
+    }
+    const targetCharacterId =
+      inputData.target_character_id ?? inputData.target_pet_id ?? null;
+    return {
+      ...payload,
+      worldName: world?.name ?? worldId,
+      actorCharacterId: input?.actor_pet_id ?? null,
+      actorName: input?.actor_name ?? null,
+      inputType: input?.input_type ?? null,
+      inputEventType: input?.event_type ?? null,
+      inputBodyText: input?.body_text ?? null,
+      targetCharacterId,
+      outcomeText: outcome?.body_text ?? payload.outcomeText ?? null,
+      outcomeEventType: outcome?.event_type ?? null,
+      promptText: interaction?.prompt_text ?? payload.promptText ?? null,
+      interactionMode: interaction?.mode ?? null,
+      interactionQuorum: interaction?.quorum ?? null,
+      interactionLateInputPolicy: interaction?.late_input_policy ?? null,
+      interactionClosesAt: interaction?.closes_at ?? payload.closesAt ?? null,
+    };
   }
 
   function notifyWorld(
@@ -302,8 +368,11 @@ export function createPetSocialApp(options = {}) {
     const petIds =
       recipients ??
       worldNotificationRecipients(worldId, visibility, actorPetId);
+    const durablePayload = eventType.startsWith("world.")
+      ? worldNotificationPayload(worldId, payload)
+      : payload;
     const emitted = [...new Set(petIds)].map((petId) =>
-      store.createEvent(petId, eventType, { worldId, ...payload })
+      store.createEvent(petId, eventType, { worldId, ...durablePayload })
     );
     pushEvents(emitted);
     return emitted;
@@ -399,6 +468,7 @@ export function createPetSocialApp(options = {}) {
           hostRoot: options.worldHostRoot,
           model: options.worldHostModel,
           effort: options.worldHostEffort,
+          threadIsolation: options.worldHostThreadIsolation ?? "per_turn",
           onCommitted(result) {
             if (result.interaction) {
               cancelInteractionDeadline(result.interaction.id);
@@ -1246,6 +1316,9 @@ export function createPetSocialApp(options = {}) {
               actorPetId: result.input.actor_pet_id
             }
           );
+          if (result.input.event_type === "speech.directed") {
+            result = worldService(auth).worldIntentResult(result.input.id);
+          }
         }
         return sendJson(res, 201, result);
       }
@@ -1256,7 +1329,7 @@ export function createPetSocialApp(options = {}) {
       );
       if (req.method === "POST" && worldResolveParams) {
         const body = await readJson(req);
-        const result = worldService(auth).resolveWorldIntent({
+        let result = worldService(auth).resolveWorldIntent({
           ...body,
           worldId: worldResolveParams.id,
           intentId: worldResolveParams.intentId
@@ -1274,6 +1347,9 @@ export function createPetSocialApp(options = {}) {
             actorPetId: result.input.actor_pet_id
           }
         );
+        if (result.input.event_type === "speech.directed") {
+          result = worldService(auth).worldIntentResult(result.input.id);
+        }
         return sendJson(res, 200, result);
       }
 
@@ -1452,6 +1528,14 @@ export function createPetSocialApp(options = {}) {
         return sendJson(res, 200, { messages: store.listInbox(auth, { limit }) });
       }
 
+      if (req.method === "GET" && pathname === "/v1/activity") {
+        const limit = clampInteger(url.searchParams.get("limit"), 1, 100, 50);
+        return sendJson(res, 200, {
+          channels: ["private_message", "world"],
+          items: store.listActivity(auth, { limit }),
+        });
+      }
+
       const readParams = routeMatch(pathname, "/v1/conversations/:id/read");
       if (req.method === "POST" && readParams) {
         const body = await readJson(req);
@@ -1491,6 +1575,16 @@ export function createPetSocialApp(options = {}) {
         const result = store.ackEvent(auth, eventId);
         pushEvents(result.events);
         return sendJson(res, 200, { acked: true });
+      }
+
+      const receiptParams = routeMatch(pathname, "/v1/events/:id/receipt");
+      if (req.method === "POST" && receiptParams) {
+        const eventId = Number(String(receiptParams.id).replace(/^evt_/, ""));
+        invariant(Number.isSafeInteger(eventId), 400, "INVALID_EVENT_ID", "Invalid event ID.");
+        const body = await readJson(req);
+        const result = store.recordEventReceipt(auth, eventId, body.state);
+        pushEvents(result.events);
+        return sendJson(res, 200, result);
       }
 
       throw new AppError(404, "NOT_FOUND", "Endpoint not found.");

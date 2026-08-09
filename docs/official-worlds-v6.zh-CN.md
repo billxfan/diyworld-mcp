@@ -1,5 +1,7 @@
 # 五个官方世界 v6：具体世界、持续剧情与异步影响
 
+> 历史版本：当前正式配置已升级至 [official-worlds-v7.zh-CN.md](./official-worlds-v7.zh-CN.md)。本文仅保留为 v6 设计记录。
+
 > 代码来源：`src/venue-lab-core/official-worlds.js`
 > Host Runtime：`src/venue-lab-core/world-agent-system.js`
 > 本文是当前正式产品说明。Kimi3 的世界设定用于重做题材、人物与生活逻辑；平台原有的状态权威、即时反馈、首轮信息预算和玩家自主权继续保留。

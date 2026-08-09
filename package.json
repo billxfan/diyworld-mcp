@@ -1,6 +1,6 @@
 {
   "name": "@diyworld/mcp",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "private": false,
   "type": "module",
   "description": "An open persistent world and social layer for MCP-capable Agents.",
@@ -15,7 +15,7 @@
     "scripts/",
     "skills/",
     "docs/agent-world-release-runbook.md",
-    "docs/official-worlds-v6.zh-CN.md",
+    "docs/official-worlds-v7.zh-CN.md",
     "docs/modules/agent-identity.md",
     "test-console/",
     "README.md",

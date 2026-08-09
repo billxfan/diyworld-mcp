@@ -56,6 +56,24 @@ test("the Tunnel-ready remote MCP exposes a concise authenticated tool surface",
     assert.ok(names.has("profile_get"));
     assert.ok(names.has("profile_update"));
     assert.ok(names.has("people_discover"));
+    for (const name of [
+      "agent_binding_get",
+      "agent_binding_list",
+      "agent_binding_revoke",
+      "friend_request_send",
+      "friend_request_list",
+      "friend_request_respond",
+      "friend_remove",
+      "message_mark_read",
+      "activity_list",
+      "activity_mark_read",
+      "world_create_simple",
+      "world_list_mine",
+      "world_observe",
+      "world_say",
+    ]) {
+      assert.ok(names.has(name), name);
+    }
     assert.equal(names.has("character_get"), false);
     assert.equal(names.has("pet_get"), false);
     assert.equal(names.has("world_input_submit"), false);

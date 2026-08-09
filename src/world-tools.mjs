@@ -632,7 +632,7 @@ export const worldTools = [
   },
   {
     name: "world_observe",
-    description: "读取世界状态、自己的状态、可见事件和待处理行动。",
+    description: "读取已加入世界的最新状态、自己的状态、可见事件和待处理行动；可用于补看离线期间遗漏的世界对话。",
     inputSchema: objectSchema(
       {
         world_id: worldId,
@@ -641,6 +641,21 @@ export const worldTools = [
       },
       ["world_id"]
     )
+  },
+  {
+    name: "world_say",
+    description:
+      "在已加入的世界中对指定 Character 公开说话。内容先写入世界并由 Host 裁决；目标会收到可持久补投的世界通知，但只有投递/显示/已读回执才能证明其送达状态。",
+    inputSchema: objectSchema(
+      {
+        world_id: worldId,
+        target_character_id: text("同一世界内目标 Character 的准确 ID。", 100),
+        body_text: text("要在世界内说的话。", 4000),
+        reply_to_event_id: text("可选：要回应的世界事件 ID。", 100),
+        idempotency_key: text("稳定的幂等键；省略时由客户端生成。", 120),
+      },
+      ["world_id", "target_character_id", "body_text"],
+    ),
   },
   {
     name: "world_input_submit",
@@ -689,7 +704,7 @@ export const worldTools = [
     inputSchema: objectSchema(
       {
         world_id: worldId,
-        input_id: text("world_input_submit 返回的输入 ID。", 100),
+        input_id: text("world_act 返回的输入 ID；高级模式也可使用 world_input_submit 返回值。", 100),
         wait_ms: integer("本次最多等待多久；建议 25000 毫秒。", 0, 30000)
       },
       ["world_id", "input_id"]
@@ -1016,11 +1031,26 @@ export async function callWorldTool(client, name, args = {}) {
         friendPolicy: "enabled",
         rulesText: args.rules_text,
         definitionText: args.rules_text,
-        entryPrompt: "请介绍你来到这里后想做的第一件事。",
-        hostPrompt: "依据世界规则引导成员、判断行动边界并持续推进世界。",
+        entryPrompt: `你来到${args.name}。先说一件你想观察、尝试或与后来者共同推进的事。`,
+        hostPrompt: "依据世界规则给出具体场景、裁决行动并持续推进共享状态。不得伪造真人玩家或替成员表态；接受公共行动后留下可由后来者观察或续接的痕迹，并给出随结果变化的二至三个下一步。",
         resolutionMode: "direct",
-        initialWorldState: {},
-        initialMemberState: {},
+        initialWorldState: {
+          world_progress: {
+            phase: "起步",
+            public_progress: 0,
+            open_threads: [],
+            recent_changes: [],
+            next_event_seeds: [],
+          },
+        },
+        initialMemberState: {
+          journey: {
+            stage: "new",
+            completed_actions: 0,
+            discoveries: [],
+            open_goals: [],
+          },
+        },
       });
       const published = await client.publishWorld(draft.id, {
         expectedSpecVersion: draft.spec_version,
@@ -1171,6 +1201,18 @@ export async function callWorldTool(client, name, args = {}) {
         await client.observeWorld(args.world_id, {
           afterSequence: args.after_sequence,
           limit: args.limit ?? 50
+        })
+      );
+    case "world_say":
+      return safe(
+        await client.actInWorld(args.world_id, {
+          inputType: "speech",
+          eventType: "speech.directed",
+          bodyText: args.body_text,
+          data: { target_character_id: args.target_character_id },
+          replyToEventId: args.reply_to_event_id,
+          visibility: "world",
+          idempotencyKey: args.idempotency_key ?? `mcp-${randomUUID()}`,
         })
       );
     case "world_input_submit":

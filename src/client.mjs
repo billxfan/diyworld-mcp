@@ -506,6 +506,17 @@ export class PetSocialClient {
     return this.request(`/v1/inbox?limit=${encodeURIComponent(limit)}`);
   }
 
+  activity(limit = 50) {
+    return this.request(`/v1/activity?limit=${encodeURIComponent(limit)}`);
+  }
+
+  markEventReceipt(eventId, state) {
+    return this.request(`/v1/events/${encodeURIComponent(eventId)}/receipt`, {
+      method: "POST",
+      body: JSON.stringify({ state })
+    });
+  }
+
   markRead(conversationId, maxSequenceNo) {
     return this.request(`/v1/conversations/${encodeURIComponent(conversationId)}/read`, {
       method: "POST",

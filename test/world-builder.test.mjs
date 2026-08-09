@@ -107,6 +107,27 @@ test("the platform seeds one World Builder Agent, host templates, and official p
   }
 });
 
+test("World Builder blocks dangling thread-to-Beat references", () => {
+  const { db, owner } = fixture();
+  try {
+    const row = db
+      .prepare(`
+        SELECT artifact_json
+        FROM world_build_sessions
+        WHERE world_id = 'official-center-town'
+      `)
+      .get();
+    const artifact = JSON.parse(row.artifact_json);
+    artifact.world.initialWorldState.world_progress.open_threads[0].beat =
+      "missing-beat";
+    const validation = owner.validateWorldBuildArtifact(artifact);
+    assert.equal(validation.valid, false);
+    assert.match(validation.errors.join("\n"), /不存在的 Beat/u);
+  } finally {
+    db.close();
+  }
+});
+
 test("review-level Builder findings block materialization", () => {
   const { db, owner } = fixture();
   try {

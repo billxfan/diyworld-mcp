@@ -192,10 +192,12 @@ explicitly rebase, absorb, conflict, or expire the batch before it can commit.
 Late responses either become ordinary follow-up inputs (`follow_up`) or are
 rejected (`expire`) according to the policy chosen when the window opened.
 
-## Real-time delivery
+## Delivery and offline catch-up
 
-The MCP calls remain request/response operations. The existing event stream
-delivers small wake-up notifications:
+The MCP calls remain request/response operations. Eligible World members receive
+durable per-device events whether or not they currently have live presence. The
+event stream delivers low-latency wake-ups while connected, and the same stored
+events are available for catch-up after reconnecting:
 
 - `world.presence_changed`;
 - `world.host_runtime_changed`;
@@ -207,6 +209,15 @@ delivers small wake-up notifications:
 Notifications contain identifiers and cursors rather than treating member text
 as trusted instructions. The connected Agent reads the authoritative World data through MCP
 after receiving a notification.
+
+The standard MCP surface includes `activity_list` for a channel-labelled feed of
+private messages and World updates, `world_observe` for authoritative missed
+World history, and `world_say` for speech addressed to one active World member.
+Delivery receipts are monotonic and deliberately separate: `queued` means stored,
+`delivered` means received by a client, `displayed` means its content was shown,
+and `read` means it was marked read after display. A committed World outcome may
+truthfully claim `written`; it may not infer that another person saw, heard,
+read, or answered it.
 
 An accepted outcome is persisted before `world.event_committed` is delivered.
 Other live members therefore observe one committed result rather than

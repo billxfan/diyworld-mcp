@@ -17,9 +17,9 @@ class FakeCodexWorldHosts {
     this.turns = [];
   }
 
-  async createWorldHostThread({ worldId, worldName, cwd }) {
-    const thread = { id: `thread:${worldId}` };
-    this.created.push({ worldId, worldName, cwd, threadId: thread.id });
+  async createWorldHostThread({ worldId, worldName, cwd, ephemeral }) {
+    const thread = { id: `thread:${worldId}:${this.created.length + 1}` };
+    this.created.push({ worldId, worldName, cwd, ephemeral, threadId: thread.id });
     return thread;
   }
 
@@ -79,12 +79,12 @@ async function submitAndDrain(app, client, world, key) {
   });
   assert.equal(pending.status, "pending");
   assert.equal(pending.host_runtime.engine, "local_codex_world_host");
-  assert.equal(pending.host_runtime.context_isolation, "one_thread_per_world");
+  assert.equal(pending.host_runtime.context_isolation, "one_fresh_thread_per_turn");
   await app.worldHostRunner.whenIdle();
   return client.observeWorld(world.id);
 }
 
-test("each World binds one isolated local Codex Host thread", async () => {
+test("every Host turn gets a fresh isolated local Codex thread", async () => {
   const directory = mkdtempSync(join(tmpdir(), "agent-world-host-isolation-"));
   const store = new PetSocialStore(join(directory, "social.sqlite"));
   const codex = new FakeCodexWorldHosts();
@@ -113,12 +113,14 @@ test("each World binds one isolated local Codex Host thread", async () => {
     assert.match(firstObserved.events.at(-1).body_text, /thread:/u);
     const secondObserved = await submitAndDrain(app, client, second, "celadon");
     assert.match(secondObserved.events.at(-1).body_text, /thread:/u);
+    await submitAndDrain(app, client, first, "amber-again");
 
-    assert.equal(codex.created.length, 2);
-    assert.equal(new Set(codex.created.map((item) => item.threadId)).size, 2);
-    assert.equal(codex.turns.length, 2);
-    const amberTurn = codex.turns.find((item) => item.threadId === `thread:${first.id}`);
-    const celadonTurn = codex.turns.find((item) => item.threadId === `thread:${second.id}`);
+    assert.equal(codex.created.length, 3);
+    assert.equal(new Set(codex.created.map((item) => item.threadId)).size, 3);
+    assert.ok(codex.created.every((item) => item.ephemeral === true));
+    assert.equal(codex.turns.length, 3);
+    const amberTurn = codex.turns.find((item) => item.prompt.includes("来自 amber 的输入"));
+    const celadonTurn = codex.turns.find((item) => item.prompt.includes("来自 celadon 的输入"));
     assert.match(amberTurn.prompt, /AMBER_ONLY/u);
     assert.doesNotMatch(amberTurn.prompt, /CELADON_ONLY/u);
     assert.match(celadonTurn.prompt, /CELADON_ONLY/u);
@@ -136,6 +138,76 @@ test("each World binds one isolated local Codex Host thread", async () => {
     assert.ok(executors.every((row) => row.status === "idle"));
     assert.ok(executors.every((row) => row.codex_thread_id));
     assert.ok(executors.every((row) => row.last_turn_id));
+  } finally {
+    await app.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("actor-private history is absent from another Character's fresh Host turn", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-private-isolation-"));
+  const store = new PetSocialStore(join(directory, "social.sqlite"));
+  const codex = new FakeCodexWorldHosts();
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostCodexClient: codex,
+    worldHostRoot: join(directory, "hosts"),
+  });
+  const address = await app.listen();
+  try {
+    const ownerRegistration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-private-owner@example.test",
+      displayName: "私密行动者",
+      agentProvider: "codex",
+    });
+    const guestRegistration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-private-guest@example.test",
+      displayName: "后续行动者",
+      agentProvider: "other",
+    });
+    const owner = new AgentWorldClient({
+      serverUrl: address.url,
+      token: ownerRegistration.token,
+    });
+    const guest = new AgentWorldClient({
+      serverUrl: address.url,
+      token: guestRegistration.token,
+    });
+    const world = await createPublishedWorld(owner, "私密边界世界", "PRIVATE_BOUNDARY");
+    await guest.joinWorld(world.id, { ruleVersion: world.rule_version });
+    await owner.enterWorld(world.id, { clientSessionId: "private-owner" });
+    await guest.enterWorld(world.id, { clientSessionId: "private-guest" });
+
+    let observed = await owner.observeWorld(world.id);
+    await owner.submitWorldInput(world.id, {
+      inputType: "speech",
+      eventType: "private_note",
+      bodyText: "PRIVATE_SENTINEL_ONLY_FOR_OWNER",
+      visibility: "actor",
+      observedWorldStateVersion: observed.world_state.version,
+      observedMemberStateVersion: observed.member_state.version,
+      idempotencyKey: "private-sentinel-owner",
+    });
+    await app.worldHostRunner.whenIdle();
+
+    observed = await guest.observeWorld(world.id);
+    await guest.submitWorldInput(world.id, {
+      inputType: "action",
+      eventType: "public_followup",
+      bodyText: "我检查公共区域的新变化。",
+      visibility: "world",
+      observedWorldStateVersion: observed.world_state.version,
+      observedMemberStateVersion: observed.member_state.version,
+      idempotencyKey: "public-followup-guest",
+    });
+    await app.worldHostRunner.whenIdle();
+
+    assert.equal(codex.turns.length, 2);
+    assert.notEqual(codex.turns[0].threadId, codex.turns[1].threadId);
+    assert.match(codex.turns[0].prompt, /PRIVATE_SENTINEL_ONLY_FOR_OWNER/u);
+    assert.doesNotMatch(codex.turns[1].prompt, /PRIVATE_SENTINEL_ONLY_FOR_OWNER/u);
   } finally {
     await app.close();
     store.close();
@@ -195,7 +267,7 @@ test("a submitted action is acknowledged and its final Host result is waitable",
   }
 });
 
-test("beta startup prewarms one isolated Host for every published World", async () => {
+test("beta startup prewarms World runtimes without retaining private Host threads", async () => {
   const directory = mkdtempSync(join(tmpdir(), "agent-world-host-prewarm-"));
   const store = new PetSocialStore(join(directory, "social.sqlite"));
   const codex = new FakeCodexWorldHosts();
@@ -215,8 +287,7 @@ test("beta startup prewarms one isolated Host for every published World", async 
     );
     assert.equal(result.failed_world_ids.length, 0);
     assert.equal(result.bound_world_ids.length, expectedCount);
-    assert.equal(codex.created.length, expectedCount);
-    assert.equal(new Set(codex.created.map((item) => item.threadId)).size, expectedCount);
+    assert.equal(codex.created.length, 0);
   } finally {
     await app.close();
     store.close();
@@ -224,7 +295,7 @@ test("beta startup prewarms one isolated Host for every published World", async 
   }
 });
 
-test("a ready collective interaction is settled by the same isolated World Host", async () => {
+test("a ready collective interaction is settled in a fresh isolated World Host thread", async () => {
   const directory = mkdtempSync(join(tmpdir(), "agent-world-host-batch-"));
   const store = new PetSocialStore(join(directory, "social.sqlite"));
   const codex = new FakeCodexWorldHosts();
@@ -297,7 +368,7 @@ test("a ready collective interaction is settled by the same isolated World Host"
 
     assert.equal(codex.created.length, 1);
     assert.equal(codex.turns.length, 1);
-    assert.equal(codex.turns[0].threadId, `thread:${world.id}`);
+    assert.equal(codex.turns[0].threadId, `thread:${world.id}:1`);
     assert.match(codex.turns[0].prompt, /collective interaction batch/u);
     assert.match(codex.turns[0].prompt, /COLLECTIVE_ONLY/u);
     const resolution = store.db

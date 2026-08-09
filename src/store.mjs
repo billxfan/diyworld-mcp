@@ -161,6 +161,16 @@ export class PetSocialStore {
         PRIMARY KEY(event_id, device_id)
       );
 
+      CREATE TABLE IF NOT EXISTS event_receipts (
+        event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+        device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        delivered_at INTEGER,
+        displayed_at INTEGER,
+        read_at INTEGER,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(event_id, device_id)
+      );
+
       CREATE TABLE IF NOT EXISTS invite_codes (
         id TEXT PRIMARY KEY,
         code_hash TEXT NOT NULL UNIQUE,
@@ -233,6 +243,7 @@ export class PetSocialStore {
 
       CREATE UNIQUE INDEX IF NOT EXISTS idx_pets_owner_unique ON pets(owner_id);
       CREATE INDEX IF NOT EXISTS idx_events_pet_id ON events(pet_id, id);
+      CREATE INDEX IF NOT EXISTS idx_event_receipts_device ON event_receipts(device_id, updated_at);
       CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_pet_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_friendships_addressee ON friendships(addressee_pet_id, status);
       CREATE INDEX IF NOT EXISTS idx_pets_square ON pets(visibility, status, last_codex_open_at);
@@ -1304,14 +1315,213 @@ export class PetSocialStore {
 
   listEvents(auth, afterId = 0, limit = 200) {
     return this.db.prepare(`
-      SELECT * FROM events WHERE pet_id = ? AND id > ? ORDER BY id ASC LIMIT ?
-    `).all(auth.pet_id, afterId, limit).map((row) => ({
+      SELECT event.*, receipt.delivered_at, receipt.displayed_at,
+        receipt.read_at
+      FROM events event
+      LEFT JOIN event_receipts receipt
+        ON receipt.event_id = event.id AND receipt.device_id = ?
+      WHERE event.pet_id = ? AND event.id > ?
+      ORDER BY event.id ASC LIMIT ?
+    `).all(auth.device_id, auth.pet_id, afterId, limit).map((row) => ({
       id: row.id,
       petId: row.pet_id,
       type: row.event_type,
       payload: parseJson(row.payload_json, {}),
-      createdAt: row.created_at
+      createdAt: row.created_at,
+      delivery: {
+        state: row.read_at != null
+          ? "read"
+          : row.displayed_at != null
+            ? "displayed"
+            : row.delivered_at != null
+              ? "delivered"
+              : "queued",
+        deliveredAt: row.delivered_at,
+        displayedAt: row.displayed_at,
+        readAt: row.read_at,
+      },
     }));
+  }
+
+  listActivity(auth, { limit = 50 } = {}) {
+    const boundedLimit = Math.max(1, Math.min(Number(limit) || 50, 100));
+    const events = this.db.prepare(`
+      SELECT event.*, receipt.delivered_at, receipt.displayed_at,
+        receipt.read_at
+      FROM events event
+      LEFT JOIN event_receipts receipt
+        ON receipt.event_id = event.id AND receipt.device_id = ?
+      WHERE event.pet_id = ?
+        AND (
+          event.event_type = 'message.created'
+          OR event.event_type = 'world.event_committed'
+          OR event.event_type = 'world.interaction_opened'
+        )
+      ORDER BY event.id DESC
+      LIMIT ?
+    `).all(auth.device_id, auth.pet_id, boundedLimit);
+    return events.map((row) => {
+      const payload = parseJson(row.payload_json, {});
+      const delivery = {
+        state: row.read_at != null
+          ? "read"
+          : row.displayed_at != null
+            ? "displayed"
+            : row.delivered_at != null
+              ? "delivered"
+              : "queued",
+        deliveredAt: row.delivered_at,
+        displayedAt: row.displayed_at,
+        readAt: row.read_at,
+      };
+      if (row.event_type === "message.created") {
+        const message = this.db.prepare(`
+          SELECT message.*, sender.display_name AS sender_name,
+            sender.handle AS sender_handle
+          FROM messages message
+          JOIN pets sender ON sender.id = message.sender_pet_id
+          WHERE message.id = ?
+        `).get(payload.messageId);
+        return {
+          eventId: `evt_${row.id}`,
+          sequence: Number(row.id),
+          channel: "private_message",
+          eventType: row.event_type,
+          messageId: message?.id ?? payload.messageId ?? null,
+          summary: message?.content_text ?? String(payload.text ?? ""),
+          sender: message
+            ? {
+                id: message.sender_pet_id,
+                name: message.sender_name,
+                handle: `@${message.sender_handle}`,
+              }
+            : { id: payload.senderPetId ?? null, name: "未知角色", handle: "" },
+          conversationId: message?.conversation_id ?? payload.conversationId ?? null,
+          createdAt: row.created_at,
+          delivery,
+        };
+      }
+      return {
+        eventId: `evt_${row.id}`,
+        sequence: Number(row.id),
+        channel: "world",
+        eventType: row.event_type,
+        summary:
+          payload.targetCharacterId === auth.pet_id && payload.inputBodyText
+            ? `${payload.actorName ?? "世界成员"}对你说：${payload.inputBodyText}`
+            : payload.outcomeText ??
+              payload.promptText ??
+              payload.inputBodyText ??
+              "所在世界有一条新动态。",
+        world: {
+          id: payload.worldId ?? null,
+          name: payload.worldName ?? payload.worldId ?? "未知世界",
+        },
+        actor: payload.actorCharacterId
+          ? {
+              id: payload.actorCharacterId,
+              name: payload.actorName ?? "世界成员",
+            }
+          : null,
+        targetCharacterId: payload.targetCharacterId ?? null,
+        outcomeEventId: payload.outcomeEventId ?? null,
+        outcomeSequence: payload.outcomeSequence ?? null,
+        reply: payload.targetCharacterId === auth.pet_id
+          ? {
+              available: true,
+              tool: "world_say",
+              worldId: payload.worldId,
+              targetCharacterId: payload.actorCharacterId,
+            }
+          : { available: false },
+        createdAt: row.created_at,
+        delivery,
+      };
+    });
+  }
+
+  _recordEventReceipt(auth, eventId, state, timestamp) {
+    invariant(
+      new Set(["delivered", "displayed", "read"]).has(state),
+      400,
+      "INVALID_EVENT_RECEIPT_STATE",
+      "Event receipt state must be delivered, displayed, or read.",
+    );
+    const event = this.db
+      .prepare("SELECT * FROM events WHERE id = ? AND pet_id = ?")
+      .get(eventId, auth.pet_id);
+    invariant(event, 404, "EVENT_NOT_FOUND", "Event was not found.");
+    const deliveredAt = timestamp;
+    const displayedAt = state === "displayed" || state === "read" ? timestamp : null;
+    const readAt = state === "read" ? timestamp : null;
+    this.db.prepare(`
+      INSERT INTO event_receipts (
+        event_id, device_id, delivered_at, displayed_at, read_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(event_id, device_id) DO UPDATE SET
+        delivered_at = COALESCE(event_receipts.delivered_at, excluded.delivered_at),
+        displayed_at = COALESCE(event_receipts.displayed_at, excluded.displayed_at),
+        read_at = COALESCE(event_receipts.read_at, excluded.read_at),
+        updated_at = excluded.updated_at
+    `).run(
+      eventId,
+      auth.device_id,
+      deliveredAt,
+      displayedAt,
+      readAt,
+      timestamp,
+    );
+    const emitted = [];
+    if (event.event_type === "message.created") {
+      const payload = parseJson(event.payload_json, {});
+      const message = this.db.prepare("SELECT * FROM messages WHERE id = ?").get(payload.messageId);
+      if (message && message.status === "queued") {
+        this.db.prepare("UPDATE messages SET status = 'delivered', delivered_at = ? WHERE id = ?")
+          .run(timestamp, message.id);
+        emitted.push(this.createEvent(message.sender_pet_id, "message.delivered", {
+          messageId: message.id,
+          conversationId: message.conversation_id,
+          deliveredAt: timestamp,
+        }, timestamp));
+      }
+      if (state === "read" && message && message.status !== "read") {
+        this.db.prepare(`
+          UPDATE messages SET status = 'read',
+            delivered_at = COALESCE(delivered_at, ?),
+            read_at = COALESCE(read_at, ?)
+          WHERE id = ?
+        `).run(timestamp, timestamp, message.id);
+        emitted.push(this.createEvent(message.sender_pet_id, "message.read", {
+          messageId: message.id,
+          conversationId: message.conversation_id,
+          readerPetId: auth.pet_id,
+          readAt: timestamp,
+        }, timestamp));
+      }
+    }
+    const receipt = this.db.prepare(`
+      SELECT delivered_at, displayed_at, read_at
+      FROM event_receipts WHERE event_id = ? AND device_id = ?
+    `).get(eventId, auth.device_id);
+    return {
+      eventId: `evt_${eventId}`,
+      state: receipt.read_at != null
+        ? "read"
+        : receipt.displayed_at != null
+          ? "displayed"
+          : "delivered",
+      deliveredAt: receipt.delivered_at,
+      displayedAt: receipt.displayed_at,
+      readAt: receipt.read_at,
+      events: emitted,
+    };
+  }
+
+  recordEventReceipt(auth, eventId, state) {
+    const timestamp = this.now();
+    return this.transaction(() =>
+      this._recordEventReceipt(auth, eventId, state, timestamp)
+    );
   }
 
   ackEvent(auth, eventId) {
@@ -1320,20 +1530,8 @@ export class PetSocialStore {
       const event = this.db.prepare("SELECT * FROM events WHERE id = ? AND pet_id = ?").get(eventId, auth.pet_id);
       invariant(event, 404, "EVENT_NOT_FOUND", "Event was not found.");
       this.db.prepare("INSERT OR IGNORE INTO event_acks (event_id, device_id, acked_at) VALUES (?, ?, ?)").run(eventId, auth.device_id, now);
-      const emitted = [];
-      if (event.event_type === "message.created") {
-        const payload = parseJson(event.payload_json, {});
-        const message = this.db.prepare("SELECT * FROM messages WHERE id = ?").get(payload.messageId);
-        if (message && message.status === "queued") {
-          this.db.prepare("UPDATE messages SET status = 'delivered', delivered_at = ? WHERE id = ?").run(now, message.id);
-          emitted.push(this.createEvent(message.sender_pet_id, "message.delivered", {
-            messageId: message.id,
-            conversationId: message.conversation_id,
-            deliveredAt: now
-          }, now));
-        }
-      }
-      return { acked: true, events: emitted };
+      const receipt = this._recordEventReceipt(auth, eventId, "displayed", now);
+      return { acked: true, receipt, events: receipt.events };
     });
   }
 
@@ -1366,6 +1564,34 @@ export class PetSocialStore {
         WHERE conversation_id = ? AND recipient_pet_id = ?
           AND sequence_no > ? AND sequence_no <= ?
       `).run(now, conversationId, auth.pet_id, current, next);
+      this.db.prepare(`
+        INSERT INTO event_receipts (
+          event_id, device_id, delivered_at, displayed_at, read_at, updated_at
+        )
+        SELECT event.id, ?, ?, ?, ?, ?
+        FROM events event
+        JOIN messages message
+          ON message.id = json_extract(event.payload_json, '$.messageId')
+        WHERE event.pet_id = ? AND event.event_type = 'message.created'
+          AND message.conversation_id = ? AND message.recipient_pet_id = ?
+          AND message.sequence_no > ? AND message.sequence_no <= ?
+        ON CONFLICT(event_id, device_id) DO UPDATE SET
+          delivered_at = COALESCE(event_receipts.delivered_at, excluded.delivered_at),
+          displayed_at = COALESCE(event_receipts.displayed_at, excluded.displayed_at),
+          read_at = COALESCE(event_receipts.read_at, excluded.read_at),
+          updated_at = excluded.updated_at
+      `).run(
+        auth.device_id,
+        now,
+        now,
+        now,
+        now,
+        auth.pet_id,
+        conversationId,
+        auth.pet_id,
+        current,
+        next,
+      );
       const senderIds = this.db.prepare(`
         SELECT DISTINCT sender_pet_id FROM messages
         WHERE conversation_id = ? AND recipient_pet_id = ?
@@ -1421,6 +1647,7 @@ export class PetSocialStore {
         .map(({ pet_id: petId }) => this.createEvent(petId, "account.deleted", { petId: auth.pet_id }, now));
 
       this.db.prepare("DELETE FROM event_acks WHERE event_id IN (SELECT id FROM events WHERE pet_id = ?)").run(auth.pet_id);
+      this.db.prepare("DELETE FROM event_receipts WHERE event_id IN (SELECT id FROM events WHERE pet_id = ?)").run(auth.pet_id);
       this.db.prepare("DELETE FROM events WHERE pet_id = ?").run(auth.pet_id);
       this.db.prepare("DELETE FROM read_cursors WHERE pet_id = ?").run(auth.pet_id);
       this.db.prepare("DELETE FROM account_deletion_confirmations WHERE owner_id = ?").run(auth.owner_id);

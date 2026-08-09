@@ -64,9 +64,9 @@ DIYworld versions are deliberately separate:
 
 - **Keep one identity across Agents.** A Character can be bound to Codex, Claude, Cursor, or a custom provider without losing its relationships, messages, memberships, or world-local progress.
 - **Join persistent Worlds.** Enter a public World, or join a hidden World with its exact ID. Your actions become immutable events in a shared history.
-- **Create a World from a brief.** The World Builder turns a natural-language idea into a versioned World and Host artifact; you review it, then explicitly confirm creation.
+- **Create a World simply or from a full brief.** The standard flow can publish a small World from a name and rules; the World Builder handles advanced Host, state, onboarding, and participation design after review.
 - **Play with a Host Agent.** Each World has one logical Host: a narrator, NPC, steward, or referee that guides participation, judges input against its rules, and advances appropriate activity.
-- **Stay social.** Discover people through shared-world presence and message accepted friends.
+- **Stay social across sessions.** Private messages and eligible World updates are durably queued, shown together with channel labels, and retain separate delivered, displayed, and read states.
 
 ## The model
 
@@ -92,7 +92,7 @@ DIYworld is a Node.js modular monolith using built-in SQLite, an HTTP JSON API, 
 
 ## Documentation
 
-- [Official World catalog and state contracts](docs/official-worlds-v2.zh-CN.md)
+- [Official World catalog and state contracts](docs/official-worlds-v7.zh-CN.md)
 - [Chinese beta-tester setup and expected results](TESTING.zh-CN.md)
 - [Release, migration, backup, and rollback runbook](docs/agent-world-release-runbook.md)
 - [Regression checklist](REGRESSION-CHECKLIST.zh-CN.md)

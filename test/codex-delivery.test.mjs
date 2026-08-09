@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
   codexAppServerArgs,
   formatIncomingCharacterMessage,
   formatIncomingCharacterMessagePrompt,
+  formatIncomingWorldEvent,
+  formatIncomingWorldEventPrompt,
   formatIncomingPetMessage,
   formatIncomingPetMessagePrompt,
   resolveCodexCommand
@@ -30,6 +33,46 @@ test("incoming message display contains only owner-facing fields and preserves t
   assert.equal(envelope.displayText, display);
   assert.equal(formatIncomingPetMessage(message), display);
   assert.equal(formatIncomingPetMessagePrompt(message), prompt);
+});
+
+test("World event delivery names the channel, target, and honest receipt boundary", () => {
+  const update = {
+    worldId: "world-river",
+    worldName: "河湾镇",
+    actorName: "frank",
+    inputBodyText: "桥边的记录我看过了。",
+    outcomeText: "frank 的发言已写入河湾镇。",
+    targetCharacterId: "character-owner",
+    isTarget: true,
+    createdAt: "2026-08-09T08:00:00.000Z",
+  };
+  const display = formatIncomingWorldEvent(update);
+  assert.match(display, /frank在河湾镇中对你说/u);
+  assert.match(display, /桥边的记录我看过了/u);
+  assert.match(display, /已写入世界/u);
+  assert.match(display, /已显示到绑定任务/u);
+  assert.match(display, /尚未确认用户已读/u);
+  assert.match(display, /在河湾镇中回复frank/u);
+  const prompt = formatIncomingWorldEventPrompt(update);
+  assert.equal(JSON.parse(prompt.split("\n").at(-1)).displayText, display);
+
+  const bridgeSource = readFileSync(new URL("../src/bridge.mjs", import.meta.url), "utf8");
+  assert.match(bridgeSource, /world\.event_committed/u);
+  assert.match(bridgeSource, /deliverIncomingWorldEvent/u);
+  assert.match(bridgeSource, /markEventReceipt\(event\.eventId, "delivered"\)/u);
+});
+
+test("collective World prompts display their durable prompt without claiming a committed outcome", () => {
+  const display = formatIncomingWorldEvent({
+    eventType: "world.interaction_opened",
+    worldName: "河湾镇",
+    promptText: "今晚是否共同封桥？参与是可选的，沉默不代表同意。",
+    createdAt: "2026-08-09T08:05:00.000Z",
+  });
+  assert.match(display, /新的集体事件/u);
+  assert.match(display, /今晚是否共同封桥/u);
+  assert.match(display, /已持久保存/u);
+  assert.doesNotMatch(display, /已写入世界/u);
 });
 
 test("explicit Codex command takes precedence", () => {

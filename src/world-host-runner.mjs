@@ -97,7 +97,9 @@ export function worldHostPrompt(work) {
         : ", and optional world_state_patch/member_state_patch"
     }.`,
     "Never create public World state from a non-world-visible input. Never decide another member's behavior or consent.",
+    "outcome_text may state that speech or action was written into the World, but must never claim it was delivered, displayed, read, heard, or answered by another Character. Delivery receipts are outside Host authority.",
     "If host.judgement_policy.world_mechanics.state_contract is present, patch only its declared top-level keys and preserve unrelated state. Apply the World-specific loop, tension, progression, and host directives when judging the result.",
+    "For an accepted decision, result should include new_facts and opened_hooks arrays plus 2-3 next_actions derived from the actual outcome and current open threads. Each next action uses: label, input_type, event_type, body_text, visibility. Do not repeat generic starter choices when the scene has materially changed.",
     JSON.stringify({
       bound_world_id: work.bound_world_id,
       input_id: work.input?.id ?? null,
@@ -115,6 +117,7 @@ export class LocalCodexWorldHostRunner {
     hostRoot = resolve(process.cwd(), "data/world-hosts"),
     model,
     effort = "medium",
+    threadIsolation = "per_turn",
     onCommitted,
     onError,
   } = {}) {
@@ -122,12 +125,16 @@ export class LocalCodexWorldHostRunner {
     if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 8) {
       throw new Error("World Host maxConcurrency must be between 1 and 8");
     }
+    if (!new Set(["per_turn", "per_world"]).has(threadIsolation)) {
+      throw new Error("World Host threadIsolation must be per_turn or per_world");
+    }
     this.db = db;
     this.codexClient = codexClient;
     this.maxConcurrency = maxConcurrency;
     this.hostRoot = hostRoot;
     this.model = model;
     this.effort = effort;
+    this.threadIsolation = threadIsolation;
     this.onCommitted = onCommitted;
     this.onError = onError;
     this.queuedWorldIds = new Set();
@@ -238,6 +245,13 @@ export class LocalCodexWorldHostRunner {
       platformHostExecutor: true,
       platformHostMode: "local_codex",
     });
+    service.ensureWorldHostRuntime(worldId);
+    if (this.threadIsolation === "per_turn") {
+      const executor = this.#executor(worldId);
+      const cwd = resolve(this.hostRoot, encodeURIComponent(worldId));
+      mkdirSync(cwd, { recursive: true, mode: 0o700 });
+      return { ...executor, context_isolation: "one_fresh_thread_per_turn" };
+    }
     return this.#boundThread(worldId, service);
   }
 
@@ -367,7 +381,10 @@ export class LocalCodexWorldHostRunner {
         platformHostExecutor: true,
         platformHostMode: "local_codex",
       });
-      const executor = await this.#boundThread(worldId, service);
+      const executor =
+        this.threadIsolation === "per_turn"
+          ? await this.#freshTurnThread(worldId, service)
+          : await this.#boundThread(worldId, service);
       const work =
         next.kind === "interaction"
           ? service.localCodexHostInteractionWork({
@@ -448,6 +465,30 @@ export class LocalCodexWorldHostRunner {
         .run(turn.turnId, latestSequence, completedAt, completedAt, worldId);
       await this.onCommitted?.(result);
     }
+  }
+
+  async #freshTurnThread(worldId, service) {
+    service.ensureWorldHostRuntime(worldId);
+    const executor = this.#executor(worldId);
+    const cwd = resolve(this.hostRoot, encodeURIComponent(worldId));
+    mkdirSync(cwd, { recursive: true, mode: 0o700 });
+    const thread = await this.codexClient.createWorldHostThread({
+      worldId,
+      worldName: executor.world_name,
+      cwd,
+      model: this.model,
+      ephemeral: true,
+    });
+    const timestamp = new Date().toISOString();
+    this.db
+      .prepare(`
+        UPDATE world_host_executors
+        SET codex_thread_id = ?, context_version = context_version + 1,
+          status = 'idle', last_error = NULL, updated_at = ?
+        WHERE space_id = ?
+      `)
+      .run(thread.id, timestamp, worldId);
+    return this.#executor(worldId);
   }
 
   #recordFailure(worldId, error) {

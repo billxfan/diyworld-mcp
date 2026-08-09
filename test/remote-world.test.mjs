@@ -388,6 +388,7 @@ test("the shared MCP registry exposes the complete World runtime surface", () =>
     "world_join_request_respond",
     "world_enter",
     "world_observe",
+    "world_say",
     "world_input_submit",
     "world_input_result",
     "world_act",
@@ -399,6 +400,104 @@ test("the shared MCP registry exposes the complete World runtime surface", () =>
     "world_trigger_cancel"
   ]) {
     assert.equal(names.has(name), true, `missing shared MCP tool: ${name}`);
+  }
+});
+
+test("offline World members receive durable directed speech with monotonic receipts", async () => {
+  const store = new PetSocialStore();
+  const app = createPetSocialApp({ store });
+  const address = await app.listen();
+  try {
+    const owner = await registerClient(address, "dir-owner");
+    const target = await registerClient(address, "dir-target");
+    const outsider = await registerClient(address, "dir-out");
+    const world = await createPublishedWorld(owner.client);
+    await target.client.joinWorld(world.id, { ruleVersion: world.rule_version });
+    await target.client.enterWorld(world.id, { clientSessionId: "target-temporary" });
+    await target.client.leaveWorld(world.id);
+
+    assert.equal(
+      store.db.prepare("SELECT COUNT(*) AS count FROM presence WHERE pet_id = ?")
+        .get(target.registration.pet.id).count,
+      0,
+    );
+    const spoken = await callWorldTool(owner.client, "world_say", {
+      world_id: world.id,
+      target_character_id: target.registration.pet.id,
+      body_text: "我把桥边的调查结果留给你，回来后可以从旧木桩继续。",
+      idempotency_key: "directed-offline-world-speech",
+    });
+    assert.equal(spoken.status, "accepted");
+    assert.equal(spoken.delivery.world_write, "written");
+    assert.equal(spoken.delivery.target_delivery_state, "queued");
+    assert.ok(spoken.delivery.notification_event_id);
+
+    const friendship = await owner.client.sendFriendRequest(target.registration.pet.id);
+    await target.client.respondFriendRequest(friendship.friendship.id, "accept");
+    const privateMessage = await owner.client.sendMessage({
+      target: target.registration.pet.id,
+      text: "私信补充：地图背面还有一行坐标。",
+    });
+
+    const activity = await target.client.activity();
+    const worldItem = activity.items.find(
+      (item) => item.eventId === spoken.delivery.notification_event_id,
+    );
+    assert.equal(worldItem.channel, "world");
+    assert.equal(worldItem.targetCharacterId, target.registration.pet.id);
+    assert.equal(worldItem.reply.available, true);
+    assert.equal(worldItem.reply.tool, "world_say");
+    assert.equal(worldItem.delivery.state, "queued");
+    assert.match(worldItem.summary, /桥边|调查结果|旧木桩/u);
+    const privateItem = activity.items.find(
+      (item) => item.channel === "private_message" && item.messageId === privateMessage.message.id,
+    );
+    assert.ok(privateItem);
+    assert.match(privateItem.summary, /地图背面|坐标/u);
+    await target.client.markEventReceipt(privateItem.eventId, "read");
+    assert.equal(
+      (await target.client.activity()).items.find((item) => item.eventId === privateItem.eventId)
+        .delivery.state,
+      "read",
+    );
+    assert.equal(
+      store.db.prepare("SELECT status FROM messages WHERE id = ?").get(privateMessage.message.id).status,
+      "read",
+    );
+
+    await target.client.markEventReceipt(worldItem.eventId, "delivered");
+    assert.equal(
+      (await target.client.activity()).items.find((item) => item.eventId === worldItem.eventId)
+        .delivery.state,
+      "delivered",
+    );
+    await target.client.markEventReceipt(worldItem.eventId, "displayed");
+    await target.client.markEventReceipt(worldItem.eventId, "read");
+    assert.equal(
+      (await target.client.activity()).items.find((item) => item.eventId === worldItem.eventId)
+        .delivery.state,
+      "read",
+    );
+
+    const observed = await callWorldTool(target.client, "world_observe", {
+      world_id: world.id,
+      after_sequence: 0,
+    });
+    assert.ok(observed.events.some((event) => event.id === spoken.outcome.id));
+    assert.equal(
+      (await outsider.client.activity()).items.some(
+        (item) => item.world?.id === world.id,
+      ),
+      false,
+    );
+
+    const refreshed = await owner.client.worldInputResult(world.id, spoken.input.id, {
+      waitMs: 0,
+    });
+    assert.equal(refreshed.delivery.target_delivery_state, "read");
+  } finally {
+    await app.close();
+    store.close();
   }
 });
 

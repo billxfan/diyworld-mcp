@@ -32,6 +32,22 @@ function eventMessage(event) {
       return null;
     case "message.read":
       return null;
+    case "world.event_committed":
+      return {
+        title: "DIYworld",
+        subtitle: String(event.payload.worldName ?? "世界新动态"),
+        message: String(
+          event.payload.targetCharacterId === config.petId
+            ? `${event.payload.actorName ?? "一位成员"}在世界中对你说：${event.payload.inputBodyText ?? ""}`
+            : event.payload.outcomeText ?? "所在世界有一条新动态。",
+        ).slice(0, 160),
+      };
+    case "world.interaction_opened":
+      return {
+        title: "DIYworld",
+        subtitle: String(event.payload.worldName ?? "新的集体事件"),
+        message: "所在世界开启了一项可选的集体互动。",
+      };
     default:
       return { title: "Agent World Social", subtitle: "新动态", message: "打开 Codex 查看 Character 消息。" };
   }
@@ -72,16 +88,30 @@ async function incomingMessage(event) {
 
 async function deliverMessageToCodex(event, delivery) {
   const lastDelivered = Number(delivery.lastDeliveredEventSequence ?? 0);
-  if (event.sequence <= lastDelivered) return;
+  if (event.sequence <= lastDelivered) return true;
 
   try {
-    const message = await incomingMessage(event);
-    await codexAppServer.deliverIncomingMessage({
-      threadId: delivery.threadId,
-      message,
-      model: delivery.model,
-      effort: delivery.effort
-    });
+    if (event.eventType === "message.created") {
+      const message = await incomingMessage(event);
+      await codexAppServer.deliverIncomingMessage({
+        threadId: delivery.threadId,
+        message,
+        model: delivery.model,
+        effort: delivery.effort
+      });
+    } else {
+      await codexAppServer.deliverIncomingWorldEvent({
+        threadId: delivery.threadId,
+        update: {
+          ...event.payload,
+          eventType: event.eventType,
+          createdAt: event.occurredAt,
+          isTarget: event.payload.targetCharacterId === config.petId,
+        },
+        model: delivery.model,
+        effort: delivery.effort,
+      });
+    }
     persistProgress({
       deliveryPatch: {
         lastDeliveredEventSequence: event.sequence,
@@ -90,6 +120,7 @@ async function deliverMessageToCodex(event, delivery) {
         lastErrorAt: null
       }
     });
+    return true;
   } catch (error) {
     const latest = readConfig(configPath).codexDelivery ?? delivery;
     if (
@@ -98,8 +129,8 @@ async function deliverMessageToCodex(event, delivery) {
     ) {
       await showNotification({
         title: "Agent World Social",
-        subtitle: "消息暂未进入 Codex",
-        message: "消息仍保留在收件箱；打开绑定会话后会自动重试。"
+        subtitle: "动态暂未进入 Codex",
+        message: "动态已持久保存；打开绑定任务后会自动重试。"
       });
     }
     persistProgress({
@@ -154,14 +185,16 @@ async function eventLoop() {
         console.log(`[bridge] ${event.eventType} #${event.sequence}`);
 
         const delivery = config.codexDelivery ?? {};
+        await client.markEventReceipt(event.eventId, "delivered");
         const deliverInCodex =
-          event.eventType === "message.created" &&
+          ["message.created", "world.event_committed", "world.interaction_opened"].includes(event.eventType) &&
           delivery.enabled === true &&
           typeof delivery.threadId === "string" &&
           delivery.threadId.length > 0;
+        let displayed = false;
 
         if (deliverInCodex) {
-          await deliverMessageToCodex(event, delivery);
+          displayed = await deliverMessageToCodex(event, delivery);
         } else {
           const notification = eventMessage(event);
           if (notification && process.env.PET_SOCIAL_NO_NOTIFY !== "1") {
@@ -169,7 +202,7 @@ async function eventLoop() {
           }
         }
 
-        await client.ackEvent(event.eventId);
+        if (displayed) await client.ackEvent(event.eventId);
         persistProgress({ eventCursor: event.sequence });
       }
       delay = 1_000;

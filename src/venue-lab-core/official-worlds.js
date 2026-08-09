@@ -1,4 +1,4 @@
-export const OFFICIAL_WORLD_VERSION = 6;
+export const OFFICIAL_WORLD_VERSION = 7;
 
 export const OFFICIAL_WORLD_CATEGORIES = [
   "公共社交",
@@ -171,8 +171,9 @@ const WORLDS = [
         { id: "town-issue", scope: "world", states: ["noticed", "discussed", "proposed", "decided", "remembered"] },
       ],
       beat_library: [
-        { id: "wet-letters", trigger: "entry_or_arrival_rain", scene: "你下火车时雨刚停。老邮差在站台上摔了一跤，一袋信散进水洼；茶铺老板娘一边帮他捡，一边问你今晚有地方住没有", choices: ["先捡湿信", "扶邮差去歇着", "问老板娘空屋在哪"], outcome: ["relationship", "home_lead", "public_trace"], hook: "其中一封信是另一位真人居民写给老磨坊管理员、一直没人送到的" },
+        { id: "wet-letters", trigger: "entry_or_arrival_rain", scene: "你下火车时雨刚停。老邮差在站台上摔了一跤，一袋信散进水洼；茶铺老板娘一边帮他捡，一边问你今晚有地方住没有", choices: ["先捡湿信", "扶邮差去歇着", "问老板娘空屋在哪"], outcome: ["relationship", "home_lead", "public_trace"], hook: "其中一封没有署名的旧信寄给老磨坊管理员，邮戳日期却比袋里其他信早了半年" },
         { id: "mill-roof", trigger: "mill_future_or_passing_by", scene: "老磨坊屋顶漏雨，管理员在梯子上喊你搭把手；街对面的杂货铺老板却说，这钱不如留着建仓库", choices: ["帮忙补屋顶", "听听两边怎么说", "提出一个临时共用办法"], outcome: ["relationships", "mill_condition", "public_position"], hook: "你的做法会被写上布告栏，后来者可以支持、反对或继续完善" },
+        { id: "needs-a-hand", trigger: "postman_route_or_morning", scene: "上午的邮路比平时晚了半个钟头。老邮差把一捆河对岸的信压在柜台上，说今天腿实在抬不起来，但每户都在等消息", choices: ["替他送近处三封信", "先重排今天的邮路", "问镇民谁愿意接力"], outcome: ["commitment", "relationship", "public_trace"], hook: "送信途中会发现一户地址已经变更，需要后来者继续确认去向" },
       ],
       npc_cast: [
         { id: "tea-owner", name: "茶铺老板娘", role: "店主", goal: "让人有地方坐下把话说完", tension: "什么都知道但不替人传话" },
@@ -180,7 +181,7 @@ const WORLDS = [
         { id: "mill-keeper", name: "磨坊管理员", role: "管理员", goal: "让老磨坊继续有用", tension: "把拆除建议听成对旧日子的否定" },
         { id: "grocer", name: "杂货铺老板", role: "商户", goal: "给集市扩一间仓库", tension: "账算得清楚，却低估了人对地方的感情" },
       ],
-      event_generator: { inputs: ["season", "weather", "resident_routines", "open_threads", "recent_changes", "player_stage"], pools: ["daily_help", "relationship", "money", "season", "public_issue"], rules: ["符合小镇常识", "至少一个本轮可收束入口", "优先续接真人痕迹", "不连续制造秘密"] },
+      event_generator: { inputs: ["season", "weather", "resident_routines", "open_threads", "recent_changes", "player_stage"], pools: ["daily_help", "relationship", "money", "season", "public_issue"], rules: ["符合小镇常识", "至少一个本轮可收束入口", "只续接已由公开事件确认的真人痕迹", "不连续制造秘密"] },
       pacing_model: { baseline: "大多数是顺手小事与关系回声", escalation: "已排期的集市、镇会和天气事件才进入公共强度", recovery: "公共事件后回到生活、关系与结果被议论的日子" },
       recovery_model: { failure: "转为修复委托或关系补偿", deviation: "保留自由行动并连接最近开放线程", deadlock: "注入一条公开邀请和一件单人日常" },
       settlement: { authority: "host", deterministic_fields: ["reputation", "contributions", "prosperity", "project_progress"], collective_fields: ["proposals", "world_projects"] },
@@ -250,8 +251,9 @@ const WORLDS = [
         { id: "shared-route", scope: "world", states: ["rumored", "marked", "walked", "trusted", "changed"] },
       ],
       beat_library: [
-        { id: "bridge-rope", trigger: "entry_or_storm_caravan", scene: "你刚到风口集，暴雨就把河上的木桥冲歪。二十车盐和药材堵在对岸，桥索只剩一根，另有一匹驮马受惊跑进山沟", choices: ["先固定桥索", "去找驮马", "问老向导能否绕山"], outcome: ["job_stage", "route", "time", "standing"], hook: "对岸桥墩上有另一位真人留下的旧绳结，仍能承重一次" },
-        { id: "mine-gap", trigger: "old_mine_or_heavy_rain", scene: "秋雨把封了二十年的矿道口冲开一角，里面水声不对；货栈老板肯出钱，老向导却只说进去要带两盏灯", choices: ["先测水和风", "问清两盏灯的缘故", "留下公开记号再进"], outcome: ["route", "injury_risk", "mountain_log", "old_case_clue"], hook: "洞壁刻字能被后来者描录、解释或纠正" },
+        { id: "bridge-rope", trigger: "entry_or_storm_caravan", scene: "你刚到风口集，暴雨就把河上的木桥冲歪。二十车盐和药材堵在对岸，桥索只剩一根，另有一匹驮马受惊跑进山沟", choices: ["先固定桥索", "去找驮马", "问老向导能否绕山"], outcome: ["job_stage", "route", "time", "standing"], hook: "对岸桥墩上有一枚来源不明的旧绳结，是否还能承重需要现场复核" },
+        { id: "rain-opened-gap", trigger: "old_mine_or_heavy_rain", scene: "秋雨把封了二十年的矿道口冲开一角，里面水声不对；货栈老板肯出钱，老向导却只说进去要带两盏灯", choices: ["先测水和风", "问清两盏灯的缘故", "留下公开记号再进"], outcome: ["route", "injury_risk", "mountain_log", "old_case_clue"], hook: "洞壁刻字能被后来者描录、解释或纠正" },
+        { id: "pass-trouble", trigger: "lost_cargo_or_red_pass", scene: "红风口下方散着三只破木箱，车辙在碎石坡上突然中断。货主只认货不认人，山脚却有人看见一名脚伤的赶车人往背风沟走", choices: ["先找伤员", "封存散落货物", "沿车辙确认事故位置"], outcome: ["rescue", "cargo_record", "route_risk", "standing"], hook: "找回的人和货可能指向两条不同的后续托付" },
       ],
       npc_cast: [
         { id: "innkeeper", name: "客栈老板娘", role: "客栈老板", goal: "让每件托付都找到肯负责的人", tension: "记得所有人的账，只说一半消息" },
@@ -328,8 +330,9 @@ const WORLDS = [
         { id: "case-season", scope: "world", states: ["dormant", "stirring", "investigating", "conclusion", "aftermath", "succeeded"] },
       ],
       beat_library: [
-        { id: "missing-cat-wharf", trigger: "entry_or_missing_cat", scene: "白渡口对门的老太太上楼找猫。她反复说猫从不往水边去；今天猫碗旁却有湿脚印，一直通向封了十五年的旧栈桥", choices: ["问清猫的习惯", "沿湿脚印去渡口", "查看老太太家旧照片"], outcome: ["evidence", "reason_to_ask", "relationship"], hook: "旧栈桥木桩上刻着七个短横，另一名真人调查员可以接着查它的来历" },
+        { id: "missing-cat-wharf", trigger: "entry_or_missing_cat", scene: "白渡口对门的老太太上楼找猫。她反复说猫从不往水边去；今天猫碗旁却有湿脚印，一直通向封了十五年的旧栈桥", choices: ["问清猫的习惯", "沿湿脚印去渡口", "查看老太太家旧照片"], outcome: ["evidence", "reason_to_ask", "relationship"], hook: "旧栈桥木桩上刻着七个短横，后来加入的调查员也可以接着查它的来历" },
         { id: "page-seventy-three", trigger: "wharf_mark_or_archive", scene: "阁楼卷宗第七十三页画着相同的七个短横，第七十四页却被整齐撕掉；师傅当年的调查正停在这里", choices: ["查谁借过卷宗", "去报社找旧报道", "等周三问桥头更夫"], outcome: ["archive", "reason_to_ask", "door_state"], hook: "后来者可以从任一路径继续，而真相不会随选择改变" },
+        { id: "blank-page", trigger: "why_master_stopped_or_missing_page", scene: "师傅的私人索引里，第七十四页对应的位置只写了一个日期和‘先别问她’四个字。墨水与十五年前卷宗一致，但‘她’没有姓名", choices: ["核对当日委托记录", "比较师傅其他笔迹", "先查谁能接触索引"], outcome: ["provenance", "reason_to_ask", "sealed_truth_progress"], hook: "任何新推论都先记为假说，直到出现第二条独立证据路径" },
       ],
       npc_cast: [
         { id: "tailor-landlady", name: "裁缝铺老板娘", role: "房东", goal: "让巷里的事有个体面说法", tension: "什么都看见，却只顺口提一句" },
@@ -414,7 +417,9 @@ const WORLDS = [
       ],
       beat_library: [
         { id: "clinic-night-power", trigger: "entry_or_clinic_night_power", scene: "每天一次的无线电通话里，山下村医说今晚有位产妇情况不好，问电站能不能多供两小时电。多供意味着开柴油机，油本来要留给水轮机停摆时救急", choices: ["问清用电时段", "核对柴油台账", "先召集当班人定临时方案"], outcome: ["diesel", "power", "duty_roster", "village_relation"], hook: "事情结束后，山下会把结果和一件具体物品送回站上，成为后来者看得见的记忆" },
-        { id: "pressure-pipe-walk", trigger: "inspection_due", scene: "连续降温后，老秦说两小时雪路外的压力钢管声音不对。巡检今天不去，明晚可能停机；去则需要两个人和一班体力", choices: ["跟老秦去", "先从机房测压力", "请另一名真人守站人搭伴"], outcome: ["pipe_condition", "fatigue", "skill", "public_trace"], hook: "前人沿雪路插下的木杆能被后来者修正成更安全的巡检线" },
+        { id: "pressure-pipe-walk", trigger: "inspection_due", scene: "连续降温后，老秦说两小时雪路外的压力钢管声音不对。巡检今天不去，明晚可能停机；去则需要两个人和一班体力", choices: ["跟老秦去", "先从机房测压力", "询问现场谁能搭伴"], outcome: ["pipe_condition", "fatigue", "skill", "public_trace"], hook: "老秦等巡检员沿雪路插下的旧木杆，能被后来者修正成更安全的巡检线" },
+        { id: "one-month-short", trigger: "coal_gap_or_ledger_review", scene: "老范把煤仓尺子递给你：按现在的火力，煤会比开山日早一个月见底。降温、少烧和下山运煤都能补缺口，但代价会落在不同的人身上", choices: ["复核煤耗", "试算分时供暖", "查旧运煤路线"], outcome: ["coal_forecast", "duty_roster", "collective_issue"], hook: "先形成可逆的试行方案，长期配给必须进入真人集体议题" },
+        { id: "county-letter", trigger: "station_future_or_spring_decision", scene: "老站长抽屉里压着县里的撤站征询函，要求开春前回复。它不会影响今晚供电，却决定下一季还有没有这支守站班组", choices: ["先核对函件期限", "整理电站贡献记录", "提出临时保站方案"], outcome: ["public_record", "proposal", "season_transition"], hook: "正式去留不能由一名成员或 NPC 单独决定" },
       ],
       npc_cast: [
         { id: "old-chief", name: "老站长", role: "站长", goal: "把班排平、账记清，让人都过完这个冬天", tension: "县里的撤站信压在桌下" },
@@ -485,7 +490,7 @@ const WORLDS = [
       director_abilities: [
         { id: "zone_composer", trigger: "bounded_exploration", effect: "依据原创区域语法和已知地图生成有限、可回退的探索片段" },
         { id: "rule_experiment", trigger: "verification_action", effect: "锁定实验条件、对照、观察结果和规则置信度" },
-        { id: "trace_echo", trigger: "public_marker_or_recording", effect: "让后来者在合理位置遇到真实玩家留下的记录与后果" },
+        { id: "trace_echo", trigger: "verified_public_member_marker_or_recording", effect: "只有公开事件已经确认来源时，才让后来者遇到真人成员留下的记录与后果" },
         { id: "rescue_weaver", trigger: "lost_or_missing", effect: "把失败转为带坐标、线索和窗口的异步救援线程" },
       ],
       thread_templates: [
@@ -494,14 +499,14 @@ const WORLDS = [
         { id: "rescue", scope: "member_and_world", states: ["missing", "signal_found", "route_open", "contact", "resolved"] },
       ],
       beat_library: [
-        { id: "elevator-wrong-floor", trigger: "entry_or_labeled_help_message", scene: "电梯门打开，外面是潮湿发黄的走廊。墙上刻着：“别信第三次铃声。——L”远处一部红色电话已经响了两次，而你身后的楼层数字正在熄灭", choices: ["按住电梯门", "检查两处刻字", "退到安全距离观察电话"], outcome: ["route", "recording", "risk", "public_trace"], hook: "刻字下面有另一名真人补的一句：我没有接，但这层少了一扇门" },
+        { id: "elevator-wrong-floor", trigger: "entry_or_labeled_help_message", scene: "电梯门打开，外面是潮湿发黄的走廊。墙上刻着：“别信第三次铃声。——L”远处一部红色电话已经响了两次，而你身后的楼层数字正在熄灭", choices: ["按住电梯门", "检查两处刻字", "退到安全距离观察电话"], outcome: ["route", "recording", "risk", "public_trace"], hook: "刻字下面还有一句不同笔迹的旧记录：‘我没有接，但这层少了一扇门’，来源需要核对" },
         { id: "conflicting-arrows", trigger: "follow_old_marker", scene: "转角出现两支方向相反的粉笔箭头：较旧的一支写着“出口”，较新的一支写着“他会模仿你的字”", choices: ["比较两种粉笔", "隔着转角呼喊", "留下第三种标记并退回"], outcome: ["marker_reliability", "route", "social_trace"], hook: "较新的箭头旁掉着一张写有当前日期的车票" },
       ],
       npc_cast: [
         { id: "station-recording", name: "17号旧广播", role: "明确标识的环境录音", goal: "重复一段不完整维修通知", tension: "不是活人，也不会回答" },
         { id: "maintenance-echo", name: "维修回声", role: "原创异常现象", goal: "重复固定维修流程", tension: "可预测但不具有人类意图" },
       ],
-      event_generator: { inputs: ["current_anchor", "documented_zones", "frontier", "rule_claims", "exposure", "disputed_records", "public_traces"], pools: ["spatial_shift", "sound_pattern", "record_change", "false_familiarity", "resource_cache", "signal", "presence_warning"], rules: ["新区域连接已知地点", "异常规则首次生成后锁定", "每段探索有撤退窗", "优先续接真人痕迹", "不采用外部现成后室 canon"] },
+      event_generator: { inputs: ["current_anchor", "documented_zones", "frontier", "rule_claims", "exposure", "disputed_records", "public_traces"], pools: ["spatial_shift", "sound_pattern", "record_change", "false_familiarity", "resource_cache", "signal", "presence_warning"], rules: ["新区域连接已知地点", "异常规则首次生成后锁定", "每段探索有撤退窗", "只续接已由公开事件确认的真人痕迹", "不采用外部现成后室 canon"] },
       pacing_model: { baseline: "观察1→不安2→验证3→风险4→撤退或发现2", escalation: "暴露、补给与离锚距离共同驱动；不随机跳到致命强度", recovery: "回到锚点后整理记录、补给和回应他人痕迹" },
       recovery_model: { failure: "转为迷失状态、遗落记录或救援线程", deviation: "把自由行为映射为观察、实验、标记或移动", deadlock: "开放前人录音、环境对照或安全回撤路线" },
       settlement: { authority: "host_plus_locked_anomaly_rules", deterministic_fields: ["supplies", "exposure", "anchor_stability", "marker_reliability", "rule_confidence"], hidden_rule_policy: { mutable_after_first_observation: false, minimum_confirmations: 2, contradiction_requires_explanation: true } },
@@ -514,10 +519,26 @@ function choice(slug, [id, label, inputType, eventType, bodyText]) {
 }
 
 function buildOfficialWorld(config) {
+  const beatIds = new Set(config.content.beat_library.map((beat) => beat.id));
+  const missingBeatReferences = config.initialThreads.filter(
+    (thread) => thread.beat && !beatIds.has(thread.beat),
+  );
+  if (missingBeatReferences.length > 0) {
+    throw new Error(
+      `${config.name} has missing Beat references: ${missingBeatReferences.map((thread) => `${thread.id}->${thread.beat}`).join(", ")}`,
+    );
+  }
+  if (beatIds.size !== config.content.beat_library.length) {
+    throw new Error(`${config.name} has duplicate Beat IDs.`);
+  }
   const id = `official-${config.slug}`;
   const choices = config.actions.map((action) => choice(config.slug, action));
   const worldStateKeys = ["world_progress", config.stateKey];
   const memberStateKeys = ["journey", config.memberKey];
+  const openingBeat =
+    config.content.beat_library.find(
+      (beat) => beat.id === config.initialThreads[0]?.beat,
+    ) ?? config.content.beat_library[0];
   const specificRules = config.rules.map((rule, index) => `${index + 6}. ${rule}`).join("\n");
   return {
     id,
@@ -531,7 +552,7 @@ function buildOfficialWorld(config) {
     tags: ["官方", config.category, ...config.tags],
     rules: `${COMMON_RULES}\n\n【${config.name}专属玩法规则】\n${specificRules}`,
     definition: `${config.premise}\n\n核心循环：${config.loop}\n核心张力：${config.tension}\n长期成长：${config.progression}\n\n这个世界不预设主角。无论当前有 0、1 个还是很多真人在线，Host 都必须维持一个可加入、可完成、可留下后续影响的共享事件。`,
-    entryPrompt: `Host 直接从一个正在发生、容易理解且会因你的选择改变的场景开始。先说清现在发生了什么、为什么值得管、行动可能改变什么，再给二至三个具体行动。不要展示内部术语、完整状态或规则说明。${config.objective}`,
+    entryPrompt: `${openingBeat.scene}。眼前目标：${config.objective}`,
     hostPrompt: [
       `核心目标：${config.objective}`,
       `导演循环：${DIRECTOR_LOOP.join(" -> ")}`,

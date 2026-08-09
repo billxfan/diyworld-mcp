@@ -16,7 +16,7 @@ test("the tester package contains every runtime and onboarding surface", () => {
     "scripts/",
     "skills/",
     "docs/agent-world-release-runbook.md",
-    "docs/official-worlds-v6.zh-CN.md",
+    "docs/official-worlds-v7.zh-CN.md",
     "docs/modules/agent-identity.md",
     "test-console/",
     "README.md",

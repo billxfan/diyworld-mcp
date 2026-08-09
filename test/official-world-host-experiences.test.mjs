@@ -67,6 +67,10 @@ test("every official World provides an isolated Host and an immediate solo actio
       assert.equal(entered.host_guidance.kind, "welcome");
       assert.equal(entered.host_guidance.host.name, definition.host.name);
       assert.match(entered.host_guidance.message, /没有其他真人在线也可以完成完整玩法循环/);
+      assert.match(entered.host_guidance.message, /本世界已有1名真人成员/u);
+      assert.equal(entered.host_guidance.live_context.present_count, 1);
+      assert.equal(entered.host_guidance.live_context.member_count, 1);
+      assert.doesNotMatch(definition.entryPrompt, /Host 直接|内部|Beat/u);
       assert.ok(
         ["action", "choice", "speech"].includes(
           entered.host_guidance.choices[0].input_type,
@@ -110,6 +114,14 @@ test("every official World has a distinct gameplay loop, state model, and Host c
       assert.ok(mechanics.director_abilities.length >= 3, definition.id);
       assert.ok(mechanics.thread_templates.length >= 3, definition.id);
       assert.ok(mechanics.beat_library.length >= 2, definition.id);
+      const beatIds = new Set(mechanics.beat_library.map((beat) => beat.id));
+      assert.equal(beatIds.size, mechanics.beat_library.length, definition.id);
+      assert.ok(
+        definition.initialState.world_progress.open_threads.every(
+          (thread) => !thread.beat || beatIds.has(thread.beat),
+        ),
+        definition.id,
+      );
       assert.ok(mechanics.event_generator.inputs.length >= 5, definition.id);
       assert.ok(mechanics.event_generator.rules.length >= 3, definition.id);
       assert.ok(mechanics.pacing_model.baseline, definition.id);
@@ -263,13 +275,27 @@ test("all five official Host contracts execute one mechanic-specific turn and re
       );
       assert.ok(work.director_plan.settlement.authority, definition.id);
 
-      executor.resolveLocalCodexHostInput({
+      const dynamicChoiceLabel = `续接${definition.name}本轮结果`;
+      const resolved = executor.resolveLocalCodexHostInput({
         worldId: definition.id,
         inputId: pending.input.id,
         decision: "accepted",
         reasonText: "行动符合本世界的专属玩法规则。",
         outcomeText: `${definition.host.name}完成了本轮专属玩法结算。`,
-        result: { mechanic: definition.slug },
+        result: {
+          mechanic: definition.slug,
+          new_facts: [`${definition.name}本轮事实`],
+          opened_hooks: [`${definition.name}后续钩子`],
+          next_actions: [
+            {
+              label: dynamicChoiceLabel,
+              input_type: "action",
+              event_type: `${definition.slug}.continue_result`,
+              body_text: `我继续处理${definition.name}刚刚出现的后果。`,
+              visibility: "world",
+            },
+          ],
+        },
         worldStatePatch: {
           [worldKey]: {
             ...work.world_state.value[worldKey],
@@ -286,6 +312,7 @@ test("all five official Host contracts execute one mechanic-specific turn and re
         expectedWorldStateVersion: work.world_state.version,
         expectedMemberStateVersion: work.actor_member_state.version,
       });
+      assert.equal(resolved.host_guidance.choices[0].label, dynamicChoiceLabel);
       visitor.leaveWorld({ worldId: definition.id });
     }
 
@@ -307,7 +334,86 @@ test("all five official Host contracts execute one mechanic-specific turn and re
   }
 });
 
-test("official v6 gameplay state backfills preserve existing World and Character progress", () => {
+test("official semantic contracts reject impossible ledgers and rewritten locked facts", () => {
+  const db = openDatabase(":memory:");
+  const visitor = createCharacter(db, "official-semantic-contract", "规则守门员");
+  try {
+    visitor.joinWorld({
+      worldId: "official-apocalypse-shelter",
+      ruleVersion: OFFICIAL_WORLD_VERSION,
+    });
+    visitor.enterWorld({
+      worldId: "official-apocalypse-shelter",
+      clientSessionId: "semantic:shelter",
+    });
+    assert.throws(
+      () =>
+        visitor.enforceWorldMechanicStateContract({
+          worldId: "official-apocalypse-shelter",
+          worldStatePatch: { settlement: { resources: { coal: -1 } } },
+        }),
+      (error) => error.code === "WORLD_STATE_CONTRACT_VIOLATION",
+    );
+
+    for (const worldId of [
+      "official-city-detective-agency",
+      "official-liminal-backrooms",
+    ]) {
+      visitor.joinWorld({ worldId, ruleVersion: OFFICIAL_WORLD_VERSION });
+      visitor.enterWorld({
+        worldId,
+        clientSessionId: `semantic:${worldId}`,
+      });
+    }
+    const mystery = visitor.worldStateView("official-city-detective-agency").value;
+    mystery.mystery.active_cases[0].truth_commitment = "sealed:missing-cat:v1";
+    db.prepare("UPDATE world_states SET state_json = ?, updated_by_world_agent_id = ? WHERE space_id = ?").run(
+      JSON.stringify(mystery),
+      "world-agent:official-city-detective-agency",
+      "official-city-detective-agency",
+    );
+    assert.throws(
+      () =>
+        visitor.enforceWorldMechanicStateContract({
+          worldId: "official-city-detective-agency",
+          worldStatePatch: {
+            mystery: {
+              active_cases: [
+                { ...mystery.mystery.active_cases[0], truth_commitment: "sealed:changed" },
+              ],
+            },
+          },
+        }),
+      (error) => error.code === "WORLD_STATE_CONTRACT_VIOLATION",
+    );
+
+    const backrooms = visitor.worldStateView("official-liminal-backrooms").value;
+    backrooms.backrooms.rule_claims[0].confirmations = 1;
+    db.prepare("UPDATE world_states SET state_json = ?, updated_by_world_agent_id = ? WHERE space_id = ?").run(
+      JSON.stringify(backrooms),
+      "world-agent:official-liminal-backrooms",
+      "official-liminal-backrooms",
+    );
+    assert.throws(
+      () =>
+        visitor.enforceWorldMechanicStateContract({
+          worldId: "official-liminal-backrooms",
+          worldStatePatch: {
+            backrooms: {
+              rule_claims: [
+                { ...backrooms.backrooms.rule_claims[0], claim: "被改写的规则" },
+              ],
+            },
+          },
+        }),
+      (error) => error.code === "WORLD_STATE_CONTRACT_VIOLATION",
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("official v7 gameplay state backfills preserve existing World and Character progress", () => {
   const db = openDatabase(":memory:");
   const visitor = createCharacter(db, "official-v2-migration", "旧版居民");
   const worldId = "official-center-town";
@@ -346,7 +452,7 @@ test("official v6 gameplay state backfills preserve existing World and Character
   }
 });
 
-test("official v6 adds grounded world-specific state without changing stable top-level contracts", () => {
+test("official v7 adds grounded world-specific state without changing stable top-level contracts", () => {
   const db = openDatabase(":memory:");
   const visitor = createCharacter(db, "official-v6-state", "新版状态检验者");
   try {
