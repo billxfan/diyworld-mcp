@@ -15,6 +15,9 @@ import { SocialError } from "./venue-lab-core/errors.js";
 import { SocialService } from "./venue-lab-core/social-service.js";
 import { LocalCodexWorldHostRunner } from "./world-host-runner.mjs";
 import { handleRemoteMcpMessage } from "./remote-mcp.mjs";
+import {
+  drainWorldDeliveryOutbox as drainDurableWorldDeliveryOutbox,
+} from "./world-delivery-outbox.mjs";
 
 const WORLD_NOT_FOUND_CODES = new Set(["NOT_FOUND"]);
 const WORLD_FORBIDDEN_CODES = new Set([
@@ -289,13 +292,147 @@ export function createPetSocialApp(options = {}) {
         .all(worldId, worldId)
         .map((row) => row.pet_id);
     }
+    return actorPetId ? [actorPetId] : [];
+  }
+
+  function presentWorldMembers(worldId) {
     return store.db
       .prepare(`
-        SELECT pet_id FROM space_memberships
-        WHERE space_id = ? AND status = 'active'
+        SELECT DISTINCT membership.pet_id
+        FROM space_memberships membership
+        JOIN presence ON presence.pet_id = membership.pet_id
+          AND presence.space_id = membership.space_id
+        WHERE membership.space_id = ? AND membership.status = 'active'
       `)
       .all(worldId)
       .map((row) => row.pet_id);
+  }
+
+  function interactionParticipants(worldId, interactionId) {
+    if (!interactionId) return [];
+    const interaction = store.db
+      .prepare(`
+        SELECT scene_id FROM world_interactions WHERE id = ? AND space_id = ?
+      `)
+      .get(interactionId, worldId);
+    if (interaction?.scene_id) {
+      return store.db
+        .prepare(`
+          SELECT DISTINCT pet_id FROM world_scene_participants
+          WHERE scene_id = ? AND space_id = ?
+            AND status IN ('invited', 'active')
+        `)
+        .all(interaction.scene_id, worldId)
+        .map((row) => row.pet_id);
+    }
+    return store.db
+      .prepare(`
+        SELECT DISTINCT actor_pet_id AS pet_id
+        FROM world_inputs
+        WHERE space_id = ? AND interaction_id = ?
+      `)
+      .all(worldId, interactionId)
+      .map((row) => row.pet_id);
+  }
+
+  function semanticWorldRecipients(
+    worldId,
+    eventType,
+    payload,
+    { visibility = "world", actorPetId = null, recipients, semantic } = {},
+  ) {
+    const descriptor = (petId, overrides) => ({
+      petId,
+      relevance: "contextual",
+      relevanceReason: "explicit_recipient",
+      deliveryPolicy: "ambient",
+      actionRequired: false,
+      ...semantic,
+      ...overrides,
+    });
+    if (recipients) {
+      const hostAction = new Set([
+        "world.host_input_pending",
+        "world.interaction_ready",
+      ]).has(eventType);
+      return recipients.map((petId) => descriptor(petId, hostAction
+        ? {
+            relevance: "direct",
+            relevanceReason: "host_action_required",
+            deliveryPolicy: "action_required",
+            actionRequired: true,
+          }
+        : {}));
+    }
+    if (visibility === "managers") {
+      return worldNotificationRecipients(worldId, visibility, actorPetId)
+        .map((petId) => descriptor(petId, {
+          relevance: "manager",
+          relevanceReason: "world_management",
+          deliveryPolicy: "immediate",
+        }));
+    }
+    if (eventType === "world.interaction_opened") {
+      const interaction = payload.interactionId
+        ? store.db
+            .prepare(`
+              SELECT created_by_pet_id, scene_id FROM world_interactions
+              WHERE id = ? AND space_id = ?
+            `)
+            .get(payload.interactionId, worldId)
+        : null;
+      const recipients = interaction?.scene_id
+        ? interactionParticipants(worldId, payload.interactionId)
+        : presentWorldMembers(worldId).filter(
+            (petId) => petId !== interaction?.created_by_pet_id,
+          );
+      return recipients
+        .map((petId) => descriptor(petId, {
+        relevance: "collective",
+        relevanceReason: "collective_response_invited",
+        deliveryPolicy: "immediate",
+      }));
+    }
+    if (eventType === "world.event_committed" && payload.interactionId) {
+      return interactionParticipants(worldId, payload.interactionId)
+        .map((petId) => descriptor(petId, {
+          relevance: "collective",
+          relevanceReason: "collective_participant_result",
+          deliveryPolicy: "immediate",
+        }));
+    }
+    if (eventType === "world.event_committed" && payload.inputId) {
+      const input = store.db
+        .prepare("SELECT actor_pet_id, event_type, data_json FROM world_inputs WHERE id = ? AND space_id = ?")
+        .get(payload.inputId, worldId);
+      let inputData = {};
+      try {
+        inputData = JSON.parse(input?.data_json ?? "{}")?.data ?? {};
+      } catch {
+        inputData = {};
+      }
+      const inputActorId = input?.actor_pet_id ?? actorPetId;
+      const targetId = inputData.target_character_id ?? inputData.target_pet_id ?? null;
+      const planned = [];
+      if (inputActorId) {
+        planned.push(descriptor(inputActorId, {
+          relevance: "self",
+          relevanceReason: "own_action_result",
+          deliveryPolicy: "digest",
+        }));
+      }
+      if (input?.event_type === "speech.directed" && targetId && targetId !== inputActorId) {
+        planned.push(descriptor(targetId, {
+          relevance: "direct",
+          relevanceReason: "directed_speech_target",
+          deliveryPolicy: "action_required",
+          actionRequired: true,
+        }));
+      }
+      return planned;
+    }
+    return worldNotificationRecipients(worldId, visibility, actorPetId)
+      .map((petId) => descriptor(petId));
   }
 
   function worldNotificationPayload(worldId, payload = {}) {
@@ -325,6 +462,7 @@ export function createPetSocialApp(options = {}) {
           .prepare(`
             SELECT interaction.mode, interaction.quorum,
               interaction.late_input_policy, interaction.closes_at,
+              interaction.scene_id,
               prompt.body_text AS prompt_text
             FROM world_interactions interaction
             JOIN world_events prompt ON prompt.id = interaction.prompt_event_id
@@ -353,6 +491,7 @@ export function createPetSocialApp(options = {}) {
       outcomeEventType: outcome?.event_type ?? null,
       promptText: interaction?.prompt_text ?? payload.promptText ?? null,
       interactionMode: interaction?.mode ?? null,
+      sceneId: interaction?.scene_id ?? payload.sceneId ?? null,
       interactionQuorum: interaction?.quorum ?? null,
       interactionLateInputPolicy: interaction?.late_input_policy ?? null,
       interactionClosesAt: interaction?.closes_at ?? payload.closesAt ?? null,
@@ -363,20 +502,80 @@ export function createPetSocialApp(options = {}) {
     worldId,
     eventType,
     payload,
-    { visibility = "world", actorPetId = null, recipients } = {}
+    options = {}
   ) {
-    const petIds =
-      recipients ??
-      worldNotificationRecipients(worldId, visibility, actorPetId);
+    if (
+      eventType === "world.event_committed" ||
+      eventType === "world.interaction_opened"
+    ) {
+      return drainSemanticWorldDeliveries(worldId).emitted;
+    }
     const durablePayload = eventType.startsWith("world.")
       ? worldNotificationPayload(worldId, payload)
       : payload;
-    const emitted = [...new Set(petIds)].map((petId) =>
-      store.createEvent(petId, eventType, { worldId, ...durablePayload })
-    );
-    pushEvents(emitted);
+    const plan = semanticWorldRecipients(worldId, eventType, payload, options);
+    const uniquePlan = new Map();
+    for (const item of plan) {
+      const previous = uniquePlan.get(item.petId);
+      if (!previous || item.actionRequired || item.deliveryPolicy === "immediate") {
+        uniquePlan.set(item.petId, item);
+      }
+    }
+    const emitted = [...uniquePlan.values()].map(({ petId, ...semantic }) => {
+      const dedupeKey = [
+        worldId,
+        eventType,
+        payload.inputId ?? "",
+        payload.outcomeEventId ?? "",
+        payload.interactionId ?? "",
+        semantic.relevanceReason ?? "",
+      ].join(":");
+      const existing = store.db
+        .prepare(`
+          SELECT * FROM events
+          WHERE pet_id = ? AND event_type = ?
+            AND json_extract(payload_json, '$.dedupeKey') = ?
+          ORDER BY id ASC LIMIT 1
+        `)
+        .get(petId, eventType, dedupeKey);
+      if (existing) {
+        return {
+          id: Number(existing.id),
+          petId,
+          type: eventType,
+          payload: JSON.parse(existing.payload_json),
+          createdAt: existing.created_at,
+          duplicate: true,
+        };
+      }
+      return store.createEvent(petId, eventType, {
+        worldId,
+        ...durablePayload,
+        ...semantic,
+        dedupeKey,
+      });
+    });
+    pushEvents(emitted.filter((event) => event.duplicate !== true));
     return emitted;
   }
+
+  function drainSemanticWorldDeliveries(worldId = null) {
+    const result = drainDurableWorldDeliveryOutbox(store.db, {
+      worldId,
+      now: clock,
+      decorateEnvelope: worldNotificationPayload,
+      beforePersist: options.worldDeliveryBeforePersist,
+    });
+    pushEvents(result.emitted);
+    for (const failure of result.failures) {
+      options.onError?.(Object.assign(failure.error, {
+        worldDeliveryOutboxId: failure.outboxId,
+      }));
+    }
+    return result;
+  }
+
+  const worldDeliveryStartupDrain = drainSemanticWorldDeliveries();
 
   function cancelInteractionDeadline(interactionId) {
     const timer = interactionTimers.get(interactionId);
@@ -480,7 +679,6 @@ export function createPetSocialApp(options = {}) {
                 "world.event_committed",
                 {
                   interactionId: result.interaction.id,
-                  inputIds: result.inputs.map((input) => input.input.id),
                   outcomeEventId: result.outcome?.id ?? null,
                   outcomeSequence: result.outcome?.sequence ?? null,
                 },
@@ -884,7 +1082,7 @@ export function createPetSocialApp(options = {}) {
         notifyWorld(worldHostTakeoverParams.id, "world.host_runtime_changed", {
           status: result.runtime.status,
           activeExecutor: result.runtime.active_executor
-        });
+        }, { visibility: "managers" });
         return sendJson(res, 200, result);
       }
 
@@ -917,7 +1115,7 @@ export function createPetSocialApp(options = {}) {
         notifyWorld(worldHostReleaseParams.id, "world.host_runtime_changed", {
           status: result.runtime.status,
           activeExecutor: result.runtime.active_executor
-        });
+        }, { visibility: "managers" });
         return sendJson(res, 200, result);
       }
 
@@ -978,6 +1176,7 @@ export function createPetSocialApp(options = {}) {
           "world.interaction_opened",
           {
             interactionId: result.interaction.id,
+            sceneId: result.interaction.scene_id,
             promptEventId: result.prompt_event.id,
             closesAt: result.interaction.closes_at
           }
@@ -1046,6 +1245,7 @@ export function createPetSocialApp(options = {}) {
       const worldEnterParams = routeMatch(pathname, "/v1/worlds/:id/enter");
       if (req.method === "POST" && worldEnterParams) {
         const body = await readJson(req);
+        drainSemanticWorldDeliveries(worldEnterParams.id);
         const service = worldService(auth);
         const result = service.enterWorld({
           worldId: worldEnterParams.id,
@@ -1067,12 +1267,6 @@ export function createPetSocialApp(options = {}) {
             }));
           }
         }
-        notifyWorld(worldEnterParams.id, "world.presence_changed", {
-          petId: auth.pet_id,
-          change: "entered",
-          activeMemberCount: result.host_runtime.active_member_count,
-          hostStatus: result.host_runtime.status
-        });
         return sendJson(res, 200, result);
       }
 
@@ -1080,12 +1274,6 @@ export function createPetSocialApp(options = {}) {
       if (req.method === "POST" && worldLeaveParams) {
         const result = worldService(auth).leaveWorld({
           worldId: worldLeaveParams.id
-        });
-        notifyWorld(worldLeaveParams.id, "world.presence_changed", {
-          petId: auth.pet_id,
-          change: "left",
-          activeMemberCount: result.host_runtime?.active_member_count ?? 0,
-          hostStatus: result.host_runtime?.status ?? "idle"
         });
         return sendJson(res, 200, result);
       }
@@ -1196,6 +1384,7 @@ export function createPetSocialApp(options = {}) {
         "/v1/worlds/:id/observe"
       );
       if (req.method === "GET" && worldObserveParams) {
+        drainSemanticWorldDeliveries(worldObserveParams.id);
         const afterSequence = url.searchParams.has("after")
           ? clampInteger(
               url.searchParams.get("after"),
@@ -1224,6 +1413,7 @@ export function createPetSocialApp(options = {}) {
       );
       if (req.method === "GET" && worldInputResultParams) {
         rateLimit(`world-result:${auth.pet_id}`, 180, 60 * 1000);
+        drainSemanticWorldDeliveries(worldInputResultParams.id);
         const service = worldService(auth);
         let result = service.getWorldInputResult({
           worldId: worldInputResultParams.id,
@@ -1261,6 +1451,7 @@ export function createPetSocialApp(options = {}) {
       if (req.method === "POST" && worldSubmitParams) {
         rateLimit(`world-act:${auth.pet_id}`, 120, 60 * 1000);
         const body = await readJson(req);
+        drainSemanticWorldDeliveries(worldSubmitParams.id);
         let result = worldService(auth).actInWorld({
           ...body,
           worldId: worldSubmitParams.id,
@@ -1613,6 +1804,8 @@ export function createPetSocialApp(options = {}) {
     store,
     worldHostRunner,
     worldHostPrewarm,
+    worldDeliveryStartupDrain,
+    drainWorldDeliveryOutbox: drainSemanticWorldDeliveries,
     isReachable,
     listen(port = 0, host = "127.0.0.1") {
       return new Promise((resolve, reject) => {

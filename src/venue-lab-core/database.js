@@ -10,6 +10,7 @@ import {
   compileWorldPackage,
   directorFamilyModules,
 } from "./world-agent-system.js";
+import { migrateWorldDeliveryOutbox } from "../world-delivery-outbox.mjs";
 
 export { OFFICIAL_WORLD_VERSION };
 
@@ -318,6 +319,8 @@ export function openDatabase(path = ":memory:") {
       profile_version INTEGER NOT NULL DEFAULT 1,
       current_spec_version INTEGER NOT NULL DEFAULT 1,
       current_rule_version INTEGER NOT NULL DEFAULT 1,
+      delivery_mode TEXT NOT NULL DEFAULT 'legacy_broadcast'
+        CHECK (delivery_mode IN ('legacy_broadcast', 'relevance_routed')),
       publication_status TEXT NOT NULL DEFAULT 'published'
         CHECK (publication_status IN ('draft', 'published', 'closed')),
       definition_text TEXT NOT NULL DEFAULT '',
@@ -463,6 +466,7 @@ export function openDatabase(path = ":memory:") {
       sequence INTEGER PRIMARY KEY AUTOINCREMENT,
       id TEXT NOT NULL UNIQUE,
       space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      scene_id TEXT REFERENCES world_scenes(id) ON DELETE SET NULL,
       actor_type TEXT NOT NULL
         CHECK (actor_type IN ('pet', 'world', 'system')),
       actor_pet_id TEXT REFERENCES pets(id),
@@ -555,6 +559,12 @@ export function openDatabase(path = ":memory:") {
   );
   ensureColumn(
     db,
+    "spaces",
+    "delivery_mode",
+    "TEXT NOT NULL DEFAULT 'legacy_broadcast'",
+  );
+  ensureColumn(
+    db,
     "space_rule_versions",
     "definition_text",
     "TEXT NOT NULL DEFAULT ''",
@@ -584,6 +594,12 @@ export function openDatabase(path = ":memory:") {
 
 export function migrateWorldRuntime(db) {
   const timestamp = new Date().toISOString();
+  ensureColumn(
+    db,
+    "spaces",
+    "delivery_mode",
+    "TEXT NOT NULL DEFAULT 'legacy_broadcast'",
+  );
   db.exec(`
     CREATE TABLE IF NOT EXISTS platform_agents (
       id TEXT PRIMARY KEY,
@@ -681,6 +697,7 @@ export function migrateWorldRuntime(db) {
     CREATE TABLE IF NOT EXISTS world_interactions (
       id TEXT PRIMARY KEY,
       space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      scene_id TEXT REFERENCES world_scenes(id) ON DELETE SET NULL,
       world_agent_id TEXT NOT NULL REFERENCES world_agents(id) ON DELETE CASCADE,
       prompt_event_id TEXT NOT NULL UNIQUE REFERENCES world_events(id),
       mode TEXT NOT NULL CHECK (mode IN ('windowed', 'quorum')),
@@ -894,6 +911,111 @@ export function migrateWorldRuntime(db) {
       PRIMARY KEY (space_id, pet_id)
     );
 
+    -- Story Loops are an additive narrative projection over authoritative
+    -- World events/state. They never commit World facts themselves: only a
+    -- bound World Host judgement may advance them after resolving an input.
+    CREATE TABLE IF NOT EXISTS world_story_loops (
+      id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      scope TEXT NOT NULL DEFAULT 'personal'
+        CHECK (scope IN ('personal', 'relationship', 'scene', 'public', 'world')),
+      owner_pet_id TEXT REFERENCES pets(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      phase TEXT NOT NULL DEFAULT 'open',
+      status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'suspended', 'completed')),
+      visibility TEXT NOT NULL DEFAULT 'actor'
+        CHECK (visibility IN ('actor', 'participants', 'world', 'managers')),
+      source_kind TEXT NOT NULL
+        CHECK (source_kind IN (
+          'continuity', 'journey_open_loop', 'world_open_thread', 'host'
+        )),
+      source_key TEXT NOT NULL,
+      context_json TEXT NOT NULL DEFAULT '{}',
+      intersection_contract_json TEXT NOT NULL DEFAULT '{}',
+      opened_by_input_id TEXT REFERENCES world_inputs(id) ON DELETE SET NULL,
+      completed_by_input_id TEXT REFERENCES world_inputs(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      completed_at TEXT,
+      UNIQUE (space_id, source_kind, source_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS world_loop_participants (
+      loop_id TEXT NOT NULL REFERENCES world_story_loops(id) ON DELETE CASCADE,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      role TEXT NOT NULL DEFAULT 'participant'
+        CHECK (role IN ('owner', 'participant', 'witness')),
+      status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'suspended', 'completed', 'left')),
+      is_foreground INTEGER NOT NULL DEFAULT 0 CHECK (is_foreground IN (0, 1)),
+      private_context_json TEXT NOT NULL DEFAULT '{}',
+      joined_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      completed_at TEXT,
+      PRIMARY KEY (loop_id, pet_id)
+    );
+
+    -- Edges are deliberately scene-agnostic in v1. An intersection candidate
+    -- can later be materialized as a Scene without changing Loop identity.
+    CREATE TABLE IF NOT EXISTS world_loop_edges (
+      id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      source_loop_id TEXT NOT NULL REFERENCES world_story_loops(id) ON DELETE CASCADE,
+      target_loop_id TEXT NOT NULL REFERENCES world_story_loops(id) ON DELETE CASCADE,
+      relation_type TEXT NOT NULL
+        CHECK (relation_type IN ('intersection_candidate', 'branches', 'follows', 'blocks')),
+      status TEXT NOT NULL DEFAULT 'proposed'
+        CHECK (status IN ('proposed', 'active', 'resolved', 'dismissed')),
+      visibility TEXT NOT NULL DEFAULT 'participants'
+        CHECK (visibility IN ('participants', 'world', 'managers')),
+      contract_json TEXT NOT NULL DEFAULT '{}',
+      created_by_input_id TEXT REFERENCES world_inputs(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (source_loop_id, target_loop_id, relation_type),
+      CHECK (source_loop_id <> target_loop_id)
+    );
+
+    -- A Scene is a bounded causal intersection between otherwise independent
+    -- Story Loops. Presence alone never creates one. The Scene stores only
+    -- shared-safe framing; participant-private Loop context remains in
+    -- world_loop_participants and is never copied here.
+    CREATE TABLE IF NOT EXISTS world_scenes (
+      id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'forming'
+        CHECK (status IN ('forming', 'active', 'resolved', 'closed')),
+      interaction_policy TEXT NOT NULL DEFAULT 'flexible'
+        CHECK (interaction_policy IN ('sync', 'async', 'flexible')),
+      title TEXT NOT NULL DEFAULT '',
+      shared_context_json TEXT NOT NULL DEFAULT '{}',
+      source_input_id TEXT REFERENCES world_inputs(id) ON DELETE SET NULL,
+      source_event_id TEXT REFERENCES world_events(id) ON DELETE SET NULL,
+      resolved_by_input_id TEXT REFERENCES world_inputs(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL,
+      activated_at TEXT,
+      resolved_at TEXT,
+      closed_at TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS world_scene_participants (
+      scene_id TEXT NOT NULL REFERENCES world_scenes(id) ON DELETE CASCADE,
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+      personal_loop_id TEXT REFERENCES world_story_loops(id) ON DELETE SET NULL,
+      role TEXT NOT NULL DEFAULT 'participant'
+        CHECK (role IN ('initiator', 'target', 'affected', 'participant')),
+      status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('invited', 'active', 'left')),
+      joined_at TEXT NOT NULL,
+      left_at TEXT,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (scene_id, pet_id)
+    );
+
     CREATE TABLE IF NOT EXISTS world_host_turns (
       id TEXT PRIMARY KEY,
       space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
@@ -920,9 +1042,10 @@ export function migrateWorldRuntime(db) {
       ON world_inputs(space_id, status, created_at);
     CREATE INDEX IF NOT EXISTS idx_world_inputs_actor
       ON world_inputs(actor_pet_id, created_at);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_world_interaction_active
-      ON world_interactions(space_id)
-      WHERE status IN ('open', 'ready');
+    CREATE INDEX IF NOT EXISTS idx_world_scenes_space_status
+      ON world_scenes(space_id, status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_world_scene_participants_member
+      ON world_scene_participants(space_id, pet_id, status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_world_interaction_due
       ON world_interactions(space_id, status, closes_at);
     CREATE INDEX IF NOT EXISTS idx_world_judgements_agent
@@ -941,11 +1064,23 @@ export function migrateWorldRuntime(db) {
       ON world_agent_versions(source_build_session_id);
     CREATE INDEX IF NOT EXISTS idx_world_member_journeys_stage
       ON world_member_journeys(space_id, stage, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_world_story_loops_status
+      ON world_story_loops(space_id, status, scope, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_world_story_loops_owner
+      ON world_story_loops(space_id, owner_pet_id, status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_world_loop_participants_member
+      ON world_loop_participants(space_id, pet_id, status, updated_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_world_loop_participant_foreground
+      ON world_loop_participants(space_id, pet_id)
+      WHERE is_foreground = 1 AND status = 'active';
+    CREATE INDEX IF NOT EXISTS idx_world_loop_edges_space_status
+      ON world_loop_edges(space_id, status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_world_host_turns_member
       ON world_host_turns(space_id, pet_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_world_host_turns_input
       ON world_host_turns(causation_input_id, created_at);
   `);
+  migrateWorldDeliveryOutbox(db);
   ensureColumn(
     db,
     "world_build_sessions",
@@ -1073,10 +1208,33 @@ export function migrateWorldRuntime(db) {
     "interaction_id",
     "TEXT REFERENCES world_interactions(id) ON DELETE SET NULL",
   );
+  ensureColumn(
+    db,
+    "world_interactions",
+    "scene_id",
+    "TEXT REFERENCES world_scenes(id) ON DELETE SET NULL",
+  );
+  ensureColumn(
+    db,
+    "world_events",
+    "scene_id",
+    "TEXT REFERENCES world_scenes(id) ON DELETE SET NULL",
+  );
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_world_interaction_one_response
       ON world_inputs(interaction_id, actor_pet_id)
       WHERE interaction_id IS NOT NULL;
+    DROP INDEX IF EXISTS idx_world_interaction_active;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_world_interaction_active_legacy
+      ON world_interactions(space_id)
+      WHERE scene_id IS NULL AND status IN ('open', 'ready');
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_world_interaction_active_scene
+      ON world_interactions(scene_id)
+      WHERE scene_id IS NOT NULL AND status IN ('open', 'ready');
+    CREATE INDEX IF NOT EXISTS idx_world_interaction_scene
+      ON world_interactions(space_id, scene_id, status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_world_events_scene
+      ON world_events(space_id, scene_id, sequence);
   `);
   ensureColumn(
     db,
@@ -1460,10 +1618,11 @@ export function seedOfficialWorlds(db) {
     INSERT OR IGNORE INTO spaces (
       id, kind, name, description, tags_json, visibility, join_policy,
       friend_policy, governance, owner_pet_id, profile_version,
-      current_spec_version, current_rule_version, publication_status,
+      current_spec_version, current_rule_version, delivery_mode,
+      publication_status,
       definition_text, published_at, created_at, updated_at
     ) VALUES (?, 'official', ?, ?, ?, 'public', 'open', 'enabled',
-      'immutable', NULL, 1, ?, ?, 'published', ?, ?, ?, ?)
+      'immutable', NULL, 1, ?, ?, 'relevance_routed', 'published', ?, ?, ?, ?)
   `);
   const insertRules = db.prepare(`
     INSERT OR IGNORE INTO space_rule_versions (
@@ -1475,6 +1634,7 @@ export function seedOfficialWorlds(db) {
     UPDATE spaces
     SET name = ?, description = ?, tags_json = ?, definition_text = ?,
       current_spec_version = ?, current_rule_version = ?,
+      delivery_mode = 'relevance_routed',
       publication_status = 'published', published_at = COALESCE(published_at, ?),
       updated_at = ?
     WHERE id = ? AND kind = 'official'
@@ -1578,7 +1738,7 @@ export function seedOfficialWorlds(db) {
         .prepare(`
           SELECT name, description, tags_json, definition_text,
             current_rule_version, current_spec_version,
-            publication_status, published_at
+            delivery_mode, publication_status, published_at
           FROM spaces WHERE id = ? AND kind = 'official'
         `)
         .get(world.id);
@@ -1694,6 +1854,7 @@ export function seedOfficialWorlds(db) {
         existing.definition_text !== world.definition ||
         Number(existing.current_spec_version) !== world.version ||
         Number(existing.current_rule_version) !== world.version ||
+        existing.delivery_mode !== "relevance_routed" ||
         existing.publication_status !== "published" ||
         existing.published_at == null
       ) {

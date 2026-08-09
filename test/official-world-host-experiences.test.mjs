@@ -8,6 +8,7 @@ import {
   seedOfficialWorlds,
 } from "../src/venue-lab-core/database.js";
 import { SocialService } from "../src/venue-lab-core/social-service.js";
+import { WORLD_DIRECTOR_RUNTIME_VERSION } from "../src/venue-lab-core/world-agent-system.js";
 
 function createCharacter(db, ownerId, name) {
   const service = new SocialService(db, ownerId);
@@ -67,7 +68,7 @@ test("every official World provides an isolated Host and an immediate solo actio
       assert.equal(entered.host_guidance.kind, "welcome");
       assert.equal(entered.host_guidance.host.name, definition.host.name);
       assert.match(entered.host_guidance.message, /没有其他真人在线也可以完成完整玩法循环/);
-      assert.match(entered.host_guidance.message, /本世界已有1名真人成员/u);
+      assert.doesNotMatch(entered.host_guidance.message, /真人成员|实时会话/u);
       assert.equal(entered.host_guidance.live_context.present_count, 1);
       assert.equal(entered.host_guidance.live_context.member_count, 1);
       assert.doesNotMatch(definition.entryPrompt, /Host 直接|内部|Beat/u);
@@ -85,7 +86,7 @@ test("every official World provides an isolated Host and an immediate solo actio
       assert.equal(entered.host_guidance.live_context.currently_alone, true);
       assert.equal(
         entered.host_guidance.participation_context.participation_style,
-        "independent",
+        "independent_until_causal_intersection",
       );
       visitor.leaveWorld({ worldId: definition.id });
     }
@@ -244,7 +245,11 @@ test("all five official Host contracts execute one mechanic-specific turn and re
       assert.ok(work.world_state.value[worldKey], definition.id);
       assert.ok(work.actor_member_state.value[memberKey], definition.id);
       assert.equal(work.contract_version, 2, definition.id);
-      assert.equal(work.director_plan.contract_version, 2, definition.id);
+      assert.equal(
+        work.director_plan.contract_version,
+        WORLD_DIRECTOR_RUNTIME_VERSION,
+        definition.id,
+      );
       assert.equal(
         work.director_plan.family,
         work.host.judgement_policy.world_mechanics.family ?? "general",

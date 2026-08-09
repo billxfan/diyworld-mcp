@@ -151,6 +151,7 @@ export class PetSocialStore {
         pet_id TEXT NOT NULL REFERENCES pets(id),
         event_type TEXT NOT NULL,
         payload_json TEXT NOT NULL,
+        semantic_dedupe_key TEXT,
         created_at INTEGER NOT NULL
       );
 
@@ -253,6 +254,16 @@ export class PetSocialStore {
       CREATE INDEX IF NOT EXISTS idx_characters_owner ON characters(owner_id, status);
       CREATE INDEX IF NOT EXISTS idx_characters_discovery ON characters(status, last_active_at);
       CREATE INDEX IF NOT EXISTS idx_agent_bindings_character ON agent_bindings(character_id, status);
+    `);
+
+    const eventColumns = this.db.prepare("PRAGMA table_info(events)").all();
+    if (!eventColumns.some((column) => column.name === "semantic_dedupe_key")) {
+      this.db.exec("ALTER TABLE events ADD COLUMN semantic_dedupe_key TEXT");
+    }
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_events_semantic_dedupe
+        ON events(pet_id, semantic_dedupe_key)
+        WHERE semantic_dedupe_key IS NOT NULL
     `);
 
     const inviteColumns = this.db.prepare("PRAGMA table_info(invite_codes)").all();
@@ -1397,6 +1408,10 @@ export class PetSocialStore {
               }
             : { id: payload.senderPetId ?? null, name: "未知角色", handle: "" },
           conversationId: message?.conversation_id ?? payload.conversationId ?? null,
+          relevance: payload.relevance ?? "direct",
+          relevanceReason: payload.relevanceReason ?? "private_message_received",
+          deliveryPolicy: payload.deliveryPolicy ?? "action_required",
+          actionRequired: payload.actionRequired ?? true,
           createdAt: row.created_at,
           delivery,
         };
@@ -1426,14 +1441,45 @@ export class PetSocialStore {
         targetCharacterId: payload.targetCharacterId ?? null,
         outcomeEventId: payload.outcomeEventId ?? null,
         outcomeSequence: payload.outcomeSequence ?? null,
-        reply: payload.targetCharacterId === auth.pet_id
+        interactionId: payload.interactionId ?? null,
+        promptEventId: payload.promptEventId ?? null,
+        replyToEventId:
+          row.event_type === "world.interaction_opened"
+            ? payload.promptEventId ?? null
+            : null,
+        sceneId: payload.sceneId ?? null,
+        interactionMode: payload.interactionMode ?? null,
+        interactionQuorum: payload.interactionQuorum ?? null,
+        interactionClosesAt: payload.interactionClosesAt ?? null,
+        relevance:
+          payload.relevance ??
+          (payload.targetCharacterId === auth.pet_id ? "direct" : "legacy"),
+        relevanceReason:
+          payload.relevanceReason ??
+          (payload.targetCharacterId === auth.pet_id
+            ? "directed_speech_target"
+            : "legacy_world_event"),
+        deliveryPolicy: payload.deliveryPolicy ?? "immediate",
+        actionRequired:
+          payload.actionRequired ??
+          (payload.targetCharacterId === auth.pet_id ||
+            row.event_type === "world.interaction_opened"),
+        reply: row.event_type === "world.interaction_opened" && payload.promptEventId
           ? {
+              available: true,
+              tool: "world_act",
+              worldId: payload.worldId,
+              replyToEventId: payload.promptEventId,
+              sceneId: payload.sceneId ?? null,
+            }
+          : payload.targetCharacterId === auth.pet_id
+            ? {
               available: true,
               tool: "world_say",
               worldId: payload.worldId,
               targetCharacterId: payload.actorCharacterId,
             }
-          : { available: false },
+            : { available: false },
         createdAt: row.created_at,
         delivery,
       };

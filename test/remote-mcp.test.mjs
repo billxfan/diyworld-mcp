@@ -40,6 +40,8 @@ test("the Tunnel-ready remote MCP exposes a concise authenticated tool surface",
     assert.equal(initialized.body.result.serverInfo.name, "diyworld");
     assert.equal(initialized.body.result.serverInfo.version, CLIENT_PACKAGE_VERSION);
     assert.match(initialized.body.result.instructions, /world_search once without query/u);
+    assert.match(initialized.body.result.instructions, /without requiring the person to type a “check messages” command/u);
+    assert.match(initialized.body.result.instructions, /resume_bundle and loop_context/u);
 
     const listed = await callMcp(address.url, registration.token, {
       jsonrpc: "2.0",
@@ -86,6 +88,18 @@ test("the Tunnel-ready remote MCP exposes a concise authenticated tool surface",
     );
     assert.equal("form" in updateProfile.inputSchema.properties, false);
     assert.equal("appearance" in updateProfile.inputSchema.properties, false);
+    const worldVisit = listed.body.result.tools.find(
+      (tool) => tool.name === "world_visit",
+    );
+    const worldObserve = listed.body.result.tools.find(
+      (tool) => tool.name === "world_observe",
+    );
+    const worldAct = listed.body.result.tools.find(
+      (tool) => tool.name === "world_act",
+    );
+    assert.match(worldVisit.description, /前台剧情 Loop/u);
+    assert.match(worldObserve.description, /不应要求用户手动/u);
+    assert.match(worldAct.description, /相关未读变化/u);
 
     const profile = await callMcp(address.url, registration.token, {
       jsonrpc: "2.0",

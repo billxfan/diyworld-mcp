@@ -66,3 +66,29 @@ test("release rehearsal refuses to overwrite its source or an existing copy", as
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("release rehearsal treats additive legacy columns as preserved content", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-release-column-"));
+  const sourcePath = join(directory, "pre-outbox.sqlite");
+  try {
+    const store = new PetSocialStore(sourcePath);
+    store.register({
+      recoveryEmail: "release-column@example.test",
+      displayName: "Pre-outbox Character",
+    });
+    store.db.exec(`
+      DROP INDEX idx_events_semantic_dedupe;
+      ALTER TABLE events DROP COLUMN semantic_dedupe_key;
+    `);
+    store.close();
+
+    const result = await rehearseAgentWorldMigration(sourcePath);
+    assert.equal(result.ok, true);
+    assert.equal(
+      result.checks.find((item) => item.name === "legacy_content_preserved").ok,
+      true,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

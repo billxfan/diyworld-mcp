@@ -232,18 +232,19 @@ export const worldTools = [
   {
     name: "world_host_interaction_open",
     description:
-      "为真正需要多人共同决定的事件开启限时响应窗口；打开时会公开可选性、人数或截止、迟到策略、单票不生效和事前分歧协调规则。",
+      "为真正需要多人共同决定的事件开启响应窗口；提供 scene_id 时只邀请该 Scene 参与者并按 sync/async/flexible 策略决定时限，否则是显式 legacy 世界级窗口。",
     inputSchema: objectSchema(
       {
         world_id: worldId,
         client_session_id: text("持有主持权的 Agent 客户端会话 ID。", 200),
-        prompt_text: text("向全体成员提出的共同问题或事件。", 4000),
+        scene_id: text("可选的交汇场景 ID；同一世界的不同场景可并行。", 100),
+        prompt_text: text("向该 Scene 参与者；或在无 scene_id 的 legacy 模式下向世界级受众提出的问题。", 4000),
         event_type: text("集体事件类型。", 80),
         mode: {
           type: "string",
           enum: ["windowed", "quorum"]
         },
-        window_seconds: integer("响应窗口秒数，范围 5-300。", 5, 300),
+        window_seconds: integer("可选响应窗口秒数：sync 最多 300，flexible 最多 86400，async 最多 604800。", 5, 604800),
         quorum: integer("quorum 模式所需的最少回应人数，范围 2-100。", 2, 100),
         late_input_policy: {
           type: "string",
@@ -261,7 +262,6 @@ export const worldTools = [
         "client_session_id",
         "prompt_text",
         "mode",
-        "window_seconds",
         "expected_world_state_version"
       ]
     )
@@ -324,11 +324,9 @@ export const worldTools = [
           enum: ["apply", "rebase", "conflict", "absorbed", "expired"]
         },
         world_state_patch: jsonObject("经主持确认的世界状态变化。"),
-        member_state_patch: jsonObject("经主持确认的成员状态变化。"),
-        target_character_id: text("成员状态变化对应的角色 ID。", 100),
-        target_pet_id: text("兼容字段：成员状态变化对应的旧宠物 ID。", 100),
+        member_state_patch: jsonObject("经主持确认的输入发起者自身成员状态变化。"),
         expected_world_state_version: integer("当前世界状态版本。", 1),
-        expected_member_state_version: integer("目标成员状态版本。", 1),
+        expected_member_state_version: integer("输入发起者的成员状态版本。", 1),
         apply_proposed_state: { type: "boolean" }
       },
       [
@@ -481,7 +479,7 @@ export const worldTools = [
   {
     name: "world_visit",
     description:
-      "推荐的首次进入入口：仅在用户明确要进入此世界并同意当前规则后调用。原子地接受当前规则、加入开放世界并激活主持；不必先读取 rule_version。审核制世界会提交申请并返回状态。",
+      "推荐的首次进入和回归入口：仅在用户明确要进入此世界并同意当前规则后调用。原子地接受当前规则、加入开放世界并激活主持；返回与当前角色相关的恢复摘要、前台剧情 Loop 和待处理变化，无需另行“查看消息”。不必先读取 rule_version。审核制世界会提交申请并返回状态。",
     inputSchema: objectSchema(
       {
         world_id: worldId,
@@ -489,6 +487,7 @@ export const worldTools = [
           type: "boolean",
           description: "用户是否已明确确认进入并接受该世界当前规则。"
         },
+        confirmed_rule_version: integer("用户实际看到并明确接受的规则版本。", 1),
         application_text: text("审核制世界的可选申请说明。", 500),
         client_session_id: text("可选的 Agent 客户端会话 ID。", 200)
       },
@@ -632,7 +631,7 @@ export const worldTools = [
   },
   {
     name: "world_observe",
-    description: "读取已加入世界的最新状态、自己的状态、可见事件和待处理行动；可用于补看离线期间遗漏的世界对话。",
+    description: "高级恢复工具：读取已加入世界的权威状态、自己的状态、可见历史和待处理行动。正常回归应直接使用 world_visit/world_act 返回的相关更新和前台剧情，不应要求用户手动“查看消息”。",
     inputSchema: objectSchema(
       {
         world_id: worldId,
@@ -651,6 +650,7 @@ export const worldTools = [
         world_id: worldId,
         target_character_id: text("同一世界内目标 Character 的准确 ID。", 100),
         body_text: text("要在世界内说的话。", 4000),
+        scene_id: text("可选：本次发言明确延续的当前 Scene ID；有多个交汇时必须使用服务端返回的准确 ID。", 100),
         reply_to_event_id: text("可选：要回应的世界事件 ID。", 100),
         idempotency_key: text("稳定的幂等键；省略时由客户端生成。", 120),
       },
@@ -671,6 +671,7 @@ export const worldTools = [
         event_type: text("世界内的具体事件类型。", 80),
         body_text: text("角色表达的自然语言内容。", 4000),
         data: jsonObject("选择项或行动参数等可选结构化数据。"),
+        scene_id: text("可选：当前角色已加入且本次行动明确发生其中的 Scene ID。", 100),
         correlation_id: text("互动关联 ID。", 120),
         reply_to_event_id: text("回应的世界事件 ID。", 100),
         visibility: {
@@ -713,7 +714,7 @@ export const worldTools = [
   {
     name: "world_act",
     description:
-      "推荐的快速参与入口：在已进入的世界中提交用户明确表达的自然语言发言或行动。服务端会使用最新状态版本并交给世界主持判断；不要先为版本号或工具 schema 额外往返。状态只能由世界主持 Agent 判断后写入。",
+      "推荐的快速参与入口：在已进入的世界中提交用户明确表达的自然语言发言或行动。服务端会先恢复角色当前的前台剧情 Loop 和相关未读变化，再使用最新状态交给世界主持判断；不要先为版本号、消息查询或工具 schema 额外往返。状态只能由世界主持 Agent 判断后写入。",
     inputSchema: objectSchema(
       {
         world_id: worldId,
@@ -724,6 +725,7 @@ export const worldTools = [
         event_type: text("行动类型。", 80),
         body_text: text("角色表达的自然语言意图。", 4000),
         data: jsonObject("可选结构化数据。"),
+        scene_id: text("可选：当前角色已加入且本次行动明确发生其中的 Scene ID。", 100),
         proposed_world_state_patch: jsonObject("世界状态 JSON Merge Patch。"),
         proposed_member_state_patch: jsonObject("自己的成员状态 JSON Merge Patch。"),
         expected_world_state_version: integer("世界状态版本。", 1),
@@ -749,9 +751,7 @@ export const worldTools = [
         decision: { type: "string", enum: ["accepted", "rejected"] },
         outcome_text: text("向参与者说明结果。", 4000),
         world_state_patch: jsonObject("确认写入的世界状态变化。"),
-        member_state_patch: jsonObject("确认写入的成员状态变化。"),
-        target_character_id: text("成员状态变化对应的角色 ID。", 100),
-        target_pet_id: text("兼容字段：成员状态变化对应的宠物 ID。", 100),
+        member_state_patch: jsonObject("确认写入意图发起者自己的成员状态变化。"),
         expected_world_state_version: integer("世界状态版本。", 1),
         expected_member_state_version: integer("成员状态版本。", 1),
         apply_proposed_state: { type: "boolean" }
@@ -959,6 +959,7 @@ export async function callWorldTool(client, name, args = {}) {
       return safe(
         await client.openWorldHostInteraction(args.world_id, {
           clientSessionId: args.client_session_id,
+          sceneId: args.scene_id,
           promptText: args.prompt_text,
           eventType: args.event_type,
           mode: args.mode,
@@ -997,7 +998,6 @@ export async function callWorldTool(client, name, args = {}) {
           resolutionDisposition: args.resolution_disposition,
           worldStatePatch: args.world_state_patch,
           memberStatePatch: args.member_state_patch,
-          targetPetId: args.target_character_id ?? args.target_pet_id,
           expectedWorldStateVersion: args.expected_world_state_version,
           expectedMemberStateVersion: args.expected_member_state_version,
           applyProposedState: args.apply_proposed_state ?? false
@@ -1114,10 +1114,40 @@ export async function callWorldTool(client, name, args = {}) {
         throw new Error("WORLD_VISIT_CONFIRMATION_REQUIRED");
       }
       const world = await client.world(args.world_id);
-      const joined = await client.joinWorld(args.world_id, {
-        ruleVersion: world.rule_version,
-        applicationText: args.application_text ?? ""
-      });
+      const confirmedRuleVersion = Number(args.confirmed_rule_version);
+      const membership = world.membership;
+      if (
+        membership?.status === "active" &&
+        membership.accepted_rule_version === world.rule_version
+      ) {
+        const entered = await client.enterWorld(args.world_id, {
+          clientSessionId: args.client_session_id
+        });
+        return safe({ ...entered, membership, status: "entered" });
+      }
+      if (confirmedRuleVersion !== world.rule_version) {
+        return safe({
+          status: membership ? "rules_changed" : "rules_confirmation_required",
+          world,
+          membership,
+          required_rule_version: world.rule_version,
+          rules_text: world.rules_text,
+          confirmation_required: true,
+        });
+      }
+      const joined = membership?.status === "active"
+        ? await client.acceptWorldRules(args.world_id, {
+            ruleVersion: confirmedRuleVersion,
+          }).then((accepted) => ({
+            membership: {
+              ...membership,
+              accepted_rule_version: accepted.accepted_rule_version,
+            },
+          }))
+        : await client.joinWorld(args.world_id, {
+            ruleVersion: confirmedRuleVersion,
+            applicationText: args.application_text ?? ""
+          });
       if (joined.membership?.status !== "active") {
         return safe({
           world,
@@ -1210,6 +1240,7 @@ export async function callWorldTool(client, name, args = {}) {
           eventType: "speech.directed",
           bodyText: args.body_text,
           data: { target_character_id: args.target_character_id },
+          sceneId: args.scene_id,
           replyToEventId: args.reply_to_event_id,
           visibility: "world",
           idempotencyKey: args.idempotency_key ?? `mcp-${randomUUID()}`,
@@ -1222,6 +1253,7 @@ export async function callWorldTool(client, name, args = {}) {
           eventType: args.event_type ?? args.input_type,
           bodyText: args.body_text,
           data: args.data ?? {},
+          sceneId: args.scene_id,
           correlationId: args.correlation_id,
           replyToEventId: args.reply_to_event_id,
           visibility: args.visibility ?? "world",
@@ -1243,6 +1275,7 @@ export async function callWorldTool(client, name, args = {}) {
           eventType: args.event_type ?? "action",
           bodyText: args.body_text,
           data: args.data ?? {},
+          sceneId: args.scene_id,
           proposedWorldStatePatch: args.proposed_world_state_patch,
           proposedMemberStatePatch: args.proposed_member_state_patch,
           expectedWorldStateVersion: args.expected_world_state_version,
@@ -1260,7 +1293,6 @@ export async function callWorldTool(client, name, args = {}) {
           outcomeText: args.outcome_text ?? "",
           worldStatePatch: args.world_state_patch,
           memberStatePatch: args.member_state_patch,
-          targetPetId: args.target_character_id ?? args.target_pet_id,
           expectedWorldStateVersion: args.expected_world_state_version,
           expectedMemberStateVersion: args.expected_member_state_version,
           applyProposedState: args.apply_proposed_state ?? true

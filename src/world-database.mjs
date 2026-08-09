@@ -23,6 +23,8 @@ export function migrateSharedWorlds(db) {
       profile_version INTEGER NOT NULL DEFAULT 1,
       current_spec_version INTEGER NOT NULL DEFAULT 1,
       current_rule_version INTEGER NOT NULL DEFAULT 1,
+      delivery_mode TEXT NOT NULL DEFAULT 'legacy_broadcast'
+        CHECK (delivery_mode IN ('legacy_broadcast', 'relevance_routed')),
       publication_status TEXT NOT NULL DEFAULT 'published'
         CHECK (publication_status IN ('draft', 'published', 'closed')),
       definition_text TEXT NOT NULL DEFAULT '',

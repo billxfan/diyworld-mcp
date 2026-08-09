@@ -3,6 +3,7 @@ import { setTimeout as wait } from "node:timers/promises";
 import { AgentWorldClient } from "./client.mjs";
 import { CodexAppServerClient } from "./codex-app-server.mjs";
 import { defaultConfigPath, readConfig, updateConfig } from "./config.mjs";
+import { shouldInterruptForEvent } from "./delivery-policy.mjs";
 import { isCodexOpen, showNotification } from "./macos.mjs";
 
 const configPath = defaultConfigPath();
@@ -186,8 +187,10 @@ async function eventLoop() {
 
         const delivery = config.codexDelivery ?? {};
         await client.markEventReceipt(event.eventId, "delivered");
+        const shouldInterrupt = shouldInterruptForEvent(event);
         const deliverInCodex =
           ["message.created", "world.event_committed", "world.interaction_opened"].includes(event.eventType) &&
+          shouldInterrupt &&
           delivery.enabled === true &&
           typeof delivery.threadId === "string" &&
           delivery.threadId.length > 0;
@@ -195,7 +198,7 @@ async function eventLoop() {
 
         if (deliverInCodex) {
           displayed = await deliverMessageToCodex(event, delivery);
-        } else {
+        } else if (shouldInterrupt) {
           const notification = eventMessage(event);
           if (notification && process.env.PET_SOCIAL_NO_NOTIFY !== "1") {
             await showNotification(notification);

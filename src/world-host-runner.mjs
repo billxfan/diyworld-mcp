@@ -3,6 +3,12 @@ import { resolve } from "node:path";
 
 import { CodexAppServerClient } from "./codex-app-server.mjs";
 import { SocialService } from "./venue-lab-core/social-service.js";
+import {
+  WORLD_LOOP_CONTRACT_VERSION,
+  WORLD_LOOP_SCOPES,
+  WORLD_LOOP_TRANSITION_CAPABILITIES,
+  WORLD_LOOP_TRANSITIONS,
+} from "./venue-lab-core/world-agent-system.js";
 
 const DECISIONS = new Set([
   "accepted",
@@ -35,7 +41,236 @@ function string(value, field, { min = 0, max = 4000 } = {}) {
   return normalized;
 }
 
-export function parseWorldHostDecision(text) {
+function array(value, field, { optional = false, min = 0, max = 100 } = {}) {
+  if (value === undefined && optional) return undefined;
+  if (!Array.isArray(value)) throw new Error(`${field} must be a JSON array`);
+  if (value.length < min || value.length > max) {
+    throw new Error(`${field} must contain ${min}-${max} items`);
+  }
+  return value;
+}
+
+const FORBIDDEN_DELIVERY_RESULT_FIELDS = new Set([
+  "recipient",
+  "recipient_id",
+  "recipient_ids",
+  "recipient_character_id",
+  "recipient_character_ids",
+  "recipients",
+  "deliveries",
+  "delivery_decisions",
+  "delivery_state",
+  "audience_pet_id",
+  "target_pet_id",
+]);
+
+function parseLoopResult(result) {
+  for (const key of Object.keys(result)) {
+    if (FORBIDDEN_DELIVERY_RESULT_FIELDS.has(key)) {
+      throw new Error(`result.${key} is outside World Host delivery authority`);
+    }
+  }
+  const transition = object(result.loop_transition, "result.loop_transition", {
+    optional: true,
+  });
+  if (!transition) return null;
+  if (transition.contract_version !== WORLD_LOOP_CONTRACT_VERSION) {
+    throw new Error("Unsupported result.loop_transition contract_version");
+  }
+  const loopId = string(transition.loop_id, "result.loop_transition.loop_id", {
+    min: 1,
+    max: 200,
+  });
+  const scope = string(transition.scope, "result.loop_transition.scope", {
+    min: 1,
+    max: 40,
+  });
+  if (!WORLD_LOOP_SCOPES.includes(scope)) {
+    throw new Error("Unsupported result.loop_transition scope");
+  }
+  const loopTransition = string(
+    transition.transition,
+    "result.loop_transition.transition",
+    { min: 1, max: 40 },
+  );
+  if (!WORLD_LOOP_TRANSITIONS.includes(loopTransition)) {
+    throw new Error("Unsupported result.loop_transition transition");
+  }
+  if (!WORLD_LOOP_TRANSITION_CAPABILITIES[loopTransition]?.includes(scope)) {
+    throw new Error(
+      `result.loop_transition cannot ${loopTransition} a ${scope} Loop in the current runtime`,
+    );
+  }
+  const normalized = {
+    contract_version: WORLD_LOOP_CONTRACT_VERSION,
+    loop_id: loopId,
+    scope,
+    from_phase: string(
+      transition.from_phase,
+      "result.loop_transition.from_phase",
+      { min: 1, max: 100 },
+    ),
+    transition: loopTransition,
+    to_phase: string(
+      transition.to_phase,
+      "result.loop_transition.to_phase",
+      { min: 1, max: 100 },
+    ),
+    reason: string(transition.reason, "result.loop_transition.reason", {
+      min: 1,
+      max: 1000,
+    }),
+  };
+  if (loopTransition === "open") {
+    normalized.title = string(
+      transition.title,
+      "result.loop_transition.title",
+      { min: 1, max: 500 },
+    );
+  }
+  if (loopTransition === "intersect") {
+    normalized.target_loop_id = string(
+      transition.target_loop_id,
+      "result.loop_transition.target_loop_id",
+      { min: 1, max: 200 },
+    );
+  }
+  const effects = array(result.effects, "result.effects", { max: 50 });
+  const affectedEntities = array(
+    result.affected_entities,
+    "result.affected_entities",
+    { max: 100 },
+  );
+  const nextAffordances = array(
+    result.next_affordances,
+    "result.next_affordances",
+    { min: 1, max: 3 },
+  );
+  const impactHints = array(result.impact_hints, "result.impact_hints", {
+    optional: true,
+    max: 50,
+  }) ?? [];
+  for (const [field, items] of [
+    ["effects", effects],
+    ["affected_entities", affectedEntities],
+    ["next_affordances", nextAffordances],
+  ]) {
+    for (const [index, item] of items.entries()) {
+      object(item, `result.${field}[${index}]`);
+    }
+  }
+  for (const [index, hint] of impactHints.entries()) {
+    object(hint, `result.impact_hints[${index}]`);
+    for (const key of Object.keys(hint)) {
+      if (FORBIDDEN_DELIVERY_RESULT_FIELDS.has(key)) {
+        throw new Error(
+          `result.impact_hints[${index}].${key} is outside World Host delivery authority`,
+        );
+      }
+    }
+  }
+  return {
+    transition: normalized,
+    effects,
+    affectedEntities,
+    nextAffordances,
+    impactHints,
+  };
+}
+
+export function validateLoopTransitionAgainstDirectorPlan(
+  loopResult,
+  directorPlan,
+) {
+  if (!loopResult || !directorPlan) return;
+  const contract = directorPlan.loop_transition_contract ?? {};
+  const transition = loopResult.transition;
+  const allowedTransitions = contract.legal_transitions ?? WORLD_LOOP_TRANSITIONS;
+  const allowedScopes = contract.legal_scopes ?? WORLD_LOOP_SCOPES;
+  const capabilities = contract.capabilities ?? WORLD_LOOP_TRANSITION_CAPABILITIES;
+  if (!allowedTransitions.includes(transition.transition)) {
+    throw new Error("result.loop_transition is not legal for this Director plan");
+  }
+  if (!allowedScopes.includes(transition.scope)) {
+    throw new Error("result.loop_transition scope is not legal for this Director plan");
+  }
+  if (!capabilities[transition.transition]?.includes(transition.scope)) {
+    throw new Error(
+      "result.loop_transition scope is not supported for this transition",
+    );
+  }
+
+  const current = directorPlan.loop_context?.current_loop ?? null;
+  if (transition.transition === "open") {
+    if (transition.from_phase !== "none") {
+      throw new Error("An open Loop transition must use from_phase none");
+    }
+  } else if (transition.transition === "resume") {
+    const candidates = directorPlan.loop_context?.suspended_loops ?? [];
+    const selected = candidates.find((loop) => loop?.id === transition.loop_id);
+    if (selected) {
+      if (transition.scope !== selected.scope) {
+        throw new Error(
+          "result.loop_transition.scope must match the suspended Loop",
+        );
+      }
+      if (transition.from_phase !== selected.phase) {
+        throw new Error(
+          "result.loop_transition.from_phase must match the suspended Loop",
+        );
+      }
+    } else if (current) {
+      if (
+        transition.loop_id !== current.id ||
+        transition.scope !== current.scope ||
+        transition.from_phase !== current.phase
+      ) {
+        throw new Error(
+          "A resume transition must match the foreground Loop or an authorized suspended Loop candidate",
+        );
+      }
+    }
+  } else if (current) {
+    if (transition.loop_id !== current.id) {
+      throw new Error(
+        "result.loop_transition.loop_id must match the foreground Loop",
+      );
+    }
+    if (transition.scope !== current.scope) {
+      throw new Error(
+        "result.loop_transition.scope must match the foreground Loop",
+      );
+    }
+    if (transition.from_phase !== current.phase) {
+      throw new Error(
+        "result.loop_transition.from_phase must match the foreground Loop",
+      );
+    }
+  }
+
+  if (transition.transition === "intersect") {
+    const candidates = directorPlan.loop_context?.causal_intersections ?? [];
+    const targetIds = new Set(
+      candidates
+        .map((candidate) => candidate?.target_loop_id)
+        .filter((value) => typeof value === "string" && value),
+    );
+    if (!targetIds.has(transition.target_loop_id)) {
+      throw new Error(
+        "result.loop_transition.target_loop_id is not an authorized causal intersection candidate",
+      );
+    }
+  }
+}
+
+export function parseWorldHostDecision(
+  text,
+  {
+    directorPlan = null,
+    requireLoopContract = null,
+    allowLoopTransition = true,
+  } = {},
+) {
   const raw = String(text ?? "").trim();
   const unfenced = raw.startsWith("```")
     ? raw.replace(/^```(?:json)?\s*/u, "").replace(/\s*```$/u, "")
@@ -70,6 +305,28 @@ export function parseWorldHostDecision(text) {
   if (decision !== "accepted" && (worldStatePatch || memberStatePatch)) {
     throw new Error("Only an accepted World Host decision may include state patches");
   }
+  const result = object(parsed.result ?? {}, "result");
+  const loopResult = parseLoopResult(result);
+  const strictV3 = requireLoopContract ?? (
+    Number(directorPlan?.contract_version ?? 0) >= 3 &&
+    directorPlan?.loop_transition_contract?.required_for_accepted_decision === true
+  );
+  if (strictV3 && decision === "accepted" && !loopResult) {
+    throw new Error(
+      "A Director Runtime v3 accepted decision requires result.loop_transition and structured Loop effects",
+    );
+  }
+  if (decision !== "accepted" && loopResult) {
+    throw new Error(
+      "Only an accepted World Host decision may propose a Loop transition",
+    );
+  }
+  if (!allowLoopTransition && loopResult) {
+    throw new Error(
+      "A collective World Host decision cannot propose an actor Story Loop transition",
+    );
+  }
+  validateLoopTransitionAgainstDirectorPlan(loopResult, directorPlan);
   return {
     decision,
     resolutionDisposition,
@@ -78,7 +335,12 @@ export function parseWorldHostDecision(text) {
       min: 1,
       max: 4000,
     }),
-    result: object(parsed.result ?? {}, "result"),
+    result,
+    loopTransition: loopResult?.transition ?? null,
+    effects: loopResult?.effects ?? [],
+    affectedEntities: loopResult?.affectedEntities ?? [],
+    nextAffordances: loopResult?.nextAffordances ?? [],
+    impactHints: loopResult?.impactHints ?? [],
     worldStatePatch,
     memberStatePatch,
   };
@@ -101,6 +363,18 @@ export function worldHostPrompt(work) {
       ? "input_batch responses and member details are participant-private evidence. Use them only to compute the declared aggregate rule; never quote, attribute, identify, or expose an individual response or private member state in outcome_text, result, or world_state_patch."
       : "Preserve actor-private input and member state at their declared visibility; do not expose them through public World output.",
     "outcome_text may state that speech or action was written into the World, but must never claim it was delivered, displayed, read, heard, or answered by another Character. Delivery receipts are outside Host authority.",
+    "Use director_plan.loop_context as the active narrative frame. Other live members are not scene participants unless director_plan.loop_context.causal_intersections contains explicit overlap evidence. Presence alone must never force multiplayer interaction.",
+    batchMode
+      ? "A collective batch has no single actor Story Loop. Do not include result.loop_transition; settle only the declared collective interaction and public World effects."
+      : `For every accepted Director Runtime v3 decision, result.loop_transition is required and must use contract_version ${WORLD_LOOP_CONTRACT_VERSION}, one persisted Story Loop scope from ${WORLD_LOOP_SCOPES.join(", ")}, and one transition from ${WORLD_LOOP_TRANSITIONS.join(", ")}. Include loop_id, from_phase (use \"none\" when opening), to_phase, and reason. Rejected, clarification, and escalated decisions must not include a Loop transition. Clarification is a decision, not a transition, and cancel is not supported by the current persistence runtime.`,
+    batchMode
+      ? "Relationship changes belong in structured effects and shared encounter lifecycle belongs in scene_transition; do not invent a relationship or scene Story Loop scope."
+      : "Respect director_plan.loop_transition_contract.capabilities exactly. An open transition must include a concise title and may open only an actor-owned personal Loop. Continue, suspend, complete, and intersect must match the foreground loop_id, scope, and from_phase. Resume may instead copy one exact id/scope/phase tuple from loop_context.suspended_loops when the actor clearly chooses to return to that branch. An intersect transition must include target_loop_id copied from an authorized causal intersection candidate in loop_context; never invent or infer another Character's private Loop. Relationship changes belong in structured effects/edges, while shared encounter lifecycle uses scene_transition rather than a fictional relationship or scene Story Loop scope.",
+    batchMode
+      ? "Do not claim an actor Loop changed as part of collective settlement."
+      : "result.loop_transition is a proposal until the server validates and commits it. Do not claim that it was applied merely because the World judgement was accepted. The server must return the applied transition receipt described by director_plan.loop_transition_contract.applied_receipt; only that receipt proves the Loop transition was applied.",
+    "For every accepted decision, result must also include effects, affected_entities, and 1-3 next_affordances arrays. next_affordances describe concrete actions the actor may attempt; they do not decide outcomes.",
+    "result.impact_hints may describe semantic kind, reason, urgency, and relationship to the current Loop. Never provide recipient IDs, recipient lists, delivery decisions, delivery state, displayed state, or read state. The server impact router alone determines recipients and delivery timing from committed facts.",
     "If host.judgement_policy.world_mechanics.state_contract is present, patch only its declared top-level keys and preserve unrelated state. Apply the World-specific loop, tension, progression, and host directives when judging the result.",
     "For an accepted decision, result should include new_facts and opened_hooks arrays plus 2-3 next_actions derived from the actual outcome and current open threads. Each next action uses: label, input_type, event_type, body_text, visibility. Do not repeat generic starter choices when the scene has materially changed.",
     JSON.stringify({
@@ -411,7 +685,11 @@ export class LocalCodexWorldHostRunner {
         resume: this.threadIsolation !== "per_turn",
         ephemeral: this.threadIsolation === "per_turn",
       });
-      const decision = parseWorldHostDecision(turn.text);
+      const decision = parseWorldHostDecision(turn.text, {
+        directorPlan: work.director_plan,
+        requireLoopContract: next.kind !== "interaction",
+        allowLoopTransition: next.kind !== "interaction",
+      });
       if (next.kind === "interaction" && decision.memberStatePatch !== undefined) {
         throw new Error(
           "A collective World Host decision cannot include member_state_patch",

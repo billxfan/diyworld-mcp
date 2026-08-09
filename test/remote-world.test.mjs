@@ -401,6 +401,8 @@ test("the shared MCP registry exposes the complete World runtime surface", () =>
   ]) {
     assert.equal(names.has(name), true, `missing shared MCP tool: ${name}`);
   }
+  const worldSay = worldTools.find((tool) => tool.name === "world_say");
+  assert.ok(worldSay.inputSchema.properties.scene_id);
 });
 
 test("offline World members receive durable directed speech with monotonic receipts", async () => {
@@ -432,6 +434,36 @@ test("offline World members receive durable directed speech with monotonic recei
     assert.equal(spoken.delivery.target_delivery_state, "queued");
     assert.ok(spoken.delivery.notification_event_id);
 
+    const repeatedSpeech = await callWorldTool(owner.client, "world_say", {
+      world_id: world.id,
+      target_character_id: target.registration.pet.id,
+      body_text: "我把桥边的调查结果留给你，回来后可以从旧木桩继续。",
+      idempotency_key: "directed-offline-world-speech",
+    });
+    assert.equal(
+      repeatedSpeech.delivery.notification_event_id,
+      spoken.delivery.notification_event_id,
+    );
+    assert.equal(
+      store.db.prepare(`
+        SELECT COUNT(*) AS count FROM events
+        WHERE pet_id = ? AND event_type = 'world.event_committed'
+          AND json_extract(payload_json, '$.inputId') = ?
+      `).get(target.registration.pet.id, spoken.input.id).count,
+      1,
+    );
+
+    const resumed = await target.client.enterWorld(world.id, {
+      clientSessionId: "target-resumed-with-relevant-updates",
+    });
+    const resumedUpdate = resumed.resume_bundle.relevant_updates.find(
+      (item) => item.event_id === spoken.delivery.notification_event_id,
+    );
+    assert.ok(resumedUpdate);
+    assert.equal(resumedUpdate.relevance, "direct");
+    assert.equal(resumedUpdate.action_required, true);
+    assert.match(resumedUpdate.summary, /桥边|调查结果|旧木桩/u);
+
     const friendship = await owner.client.sendFriendRequest(target.registration.pet.id);
     await target.client.respondFriendRequest(friendship.friendship.id, "accept");
     const privateMessage = await owner.client.sendMessage({
@@ -448,6 +480,10 @@ test("offline World members receive durable directed speech with monotonic recei
     assert.equal(worldItem.reply.available, true);
     assert.equal(worldItem.reply.tool, "world_say");
     assert.equal(worldItem.delivery.state, "queued");
+    assert.equal(worldItem.relevance, "direct");
+    assert.equal(worldItem.relevanceReason, "directed_speech_target");
+    assert.equal(worldItem.deliveryPolicy, "action_required");
+    assert.equal(worldItem.actionRequired, true);
     assert.match(worldItem.summary, /桥边|调查结果|旧木桩/u);
     const privateItem = activity.items.find(
       (item) => item.channel === "private_message" && item.messageId === privateMessage.message.id,
@@ -478,6 +514,14 @@ test("offline World members receive durable directed speech with monotonic recei
         .delivery.state,
       "read",
     );
+    const senderWorldItem = (await owner.client.activity()).items.find(
+      (item) => item.outcomeEventId === spoken.outcome.id,
+    );
+    assert.equal(senderWorldItem.relevance, "self");
+    assert.equal(senderWorldItem.relevanceReason, "own_action_result");
+    assert.equal(senderWorldItem.deliveryPolicy, "digest");
+    assert.equal(senderWorldItem.actionRequired, false);
+    assert.equal(senderWorldItem.delivery.state, "queued");
 
     const observed = await callWorldTool(target.client, "world_observe", {
       world_id: world.id,
@@ -530,6 +574,7 @@ test("the simple MCP flow publishes an open hidden World addressable by ID", asy
     const visited = await callWorldTool(visitor.client, "world_visit", {
       world_id: created.world_id,
       confirmed: true,
+      confirmed_rule_version: exact.worlds[0].rule_version,
     });
     assert.equal(visited.status, "entered");
     assert.equal(visited.membership.status, "active");
@@ -754,6 +799,14 @@ test("shared worlds preserve approval, share, invitation, and rule boundaries", 
       rulesText: "新规则需要所有成员重新确认。"
     });
     assert.equal(reruled.rule_version, 2);
+    const staleVisit = await callWorldTool(visitor.client, "world_visit", {
+      world_id: hidden.id,
+      confirmed: true,
+      confirmed_rule_version: 1,
+    });
+    assert.equal(staleVisit.status, "rules_changed");
+    assert.equal(staleVisit.required_rule_version, 2);
+    assert.equal(staleVisit.membership.accepted_rule_version, 1);
     await assert.rejects(
       () =>
         visitor.client.actInWorld(hidden.id, {
@@ -763,10 +816,13 @@ test("shared worlds preserve approval, share, invitation, and rule boundaries", 
       (error) =>
         error.status === 409 && error.code === "RULE_VERSION_MISMATCH"
     );
-    const acceptedRules = await visitor.client.acceptWorldRules(hidden.id, {
-      ruleVersion: 2
+    const acceptedVisit = await callWorldTool(visitor.client, "world_visit", {
+      world_id: hidden.id,
+      confirmed: true,
+      confirmed_rule_version: 2,
     });
-    assert.equal(acceptedRules.accepted_rule_version, 2);
+    assert.equal(acceptedVisit.status, "entered");
+    assert.equal(acceptedVisit.membership.accepted_rule_version, 2);
   } finally {
     await app.close();
     store.close();

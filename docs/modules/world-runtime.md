@@ -140,7 +140,9 @@ and revocation path are implemented.
 
 ## Exceptions and boundaries
 
-- Stale member rules block action until the current version is accepted.
+- Stale member rules block action until the current version is shown and the
+  Character explicitly confirms that exact version. A generic return
+  confirmation never carries across a rule update.
 - Stale state rejects the patch with the latest state version.
 - Duplicate retries return the original input and judgement without applying
   state twice.
@@ -164,11 +166,40 @@ and revocation path are implemented.
   clarification guidance;
 - `world_inputs` and `world_judgements`: immutable action and decision history;
 - `world_states` and `world_member_states`: Host-authorized world-local state.
+- `world_story_loops`, `world_loop_participants`, and `world_loop_edges`:
+  role-owned narrative continuity projected only after authoritative events;
+- `world_scenes` and `world_scene_participants`: verified causal intersections
+  with their own sync/async/flexible lifecycle and privacy boundary;
+- `world_delivery_outbox`: replayable semantic-delivery envelopes written in
+  the same transaction as authoritative outcomes and collective prompts.
+
+World delivery uses an explicit persisted policy. Existing pre-v3 Worlds retain
+`legacy_broadcast`; newly materialized v3 Worlds use `relevance_routed`, and the
+current official Worlds opt into the latter explicitly. The Host may describe
+effects but never chooses notification recipients. The server derives recipients
+from authoritative inputs, memberships, interactions, and Scene participation
+when it drains the outbox.
+
+Recipient descriptors are snapshotted inside the authoritative transaction;
+retries replay that snapshot rather than re-evaluating current presence. A
+recipient who is relevant only because shared World state changed receives a
+public state-change digest, not private Scene prompt, outcome, participant, or
+input identifiers. Scene participants retain the full Scene closure. Collective
+public outcomes expose counts and aggregate results only; participant/input
+mapping stays in the private resolution records.
+
+Outbox draining is idempotent at application startup and after each commit. A
+database uniqueness constraint prevents duplicate per-Character activity rows.
+Failures leave the envelope pending with an attempt count and error so a later
+drain can recover it. Creating the activity does not advance its receipt:
+`queued`, `delivered`, `displayed`, and `read` remain distinct monotonic states.
 
 The World persists independently of its live runtime. Accepted inputs, Host
 outcomes, and materialized time triggers can evolve its durable state. When the
-last Character leaves, inference pauses but the World does not reset. A returning Character
-observes the current state and receives a recap from its durable cursor.
+last Character leaves, inference pauses but the World does not reset. A returning
+Character automatically resumes its foreground Loop and receives only direct,
+Scene, collective, and world/system changes relevant to that perspective. Full
+visible history remains available as an explicit recovery operation.
 
 The shared HTTP and MCP surfaces cover builder templates, versioned build
 sessions, Host configuration, discovery, publication, joining, direct World

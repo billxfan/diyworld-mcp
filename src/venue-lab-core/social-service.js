@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 import { fail } from "./errors.js";
 import {
@@ -17,6 +17,10 @@ import {
   WORLD_BUILDER_COMPILER_VERSION,
   WORLD_PACKAGE_SCHEMA_VERSION,
 } from "./world-agent-system.js";
+import {
+  enqueueWorldDelivery,
+  refreshWorldDeliveryRecipientSnapshot,
+} from "../world-delivery-outbox.mjs";
 
 const SPACE_VISIBILITIES = new Set(["public", "unlisted", "hidden"]);
 const JOIN_POLICIES = new Set(["open", "approval", "invite_only"]);
@@ -135,6 +139,13 @@ function parseJsonArray(value) {
   } catch {
     return [];
   }
+}
+
+function stableLoopKey(...parts) {
+  return createHash("sha256")
+    .update(JSON.stringify(parts))
+    .digest("hex")
+    .slice(0, 32);
 }
 
 function jsonObject(value, field, { max = 32_000 } = {}) {
@@ -446,6 +457,40 @@ function journeyView(row) {
   };
 }
 
+function storyLoopView(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    world_id: row.space_id,
+    scope: row.scope,
+    owner_pet_id: row.owner_pet_id ?? null,
+    title: row.title,
+    phase: row.phase,
+    status: row.status,
+    visibility: row.visibility,
+    source: {
+      kind: row.source_kind,
+      key: row.source_key,
+    },
+    context: parseJsonObject(row.context_json),
+    intersection_contract: parseJsonObject(row.intersection_contract_json),
+    participation: row.participant_pet_id
+      ? {
+          role: row.participant_role,
+          status: row.participant_status,
+          is_foreground: Number(row.is_foreground) === 1,
+          private_context: parseJsonObject(row.private_context_json),
+          joined_at: row.joined_at,
+        }
+      : null,
+    opened_by_input_id: row.opened_by_input_id ?? null,
+    completed_by_input_id: row.completed_by_input_id ?? null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    completed_at: row.completed_at ?? null,
+  };
+}
+
 function hostGuidanceView(row) {
   if (!row) return null;
   return {
@@ -660,6 +705,7 @@ function spaceView(row) {
     profile_version: row.profile_version ?? 1,
     spec_version: row.current_spec_version ?? row.current_rule_version,
     rule_version: row.current_rule_version,
+    delivery_mode: row.delivery_mode ?? "legacy_broadcast",
     publication_status: row.publication_status,
     definition_text: row.spec_definition_text ?? row.definition_text ?? "",
     entry_prompt: row.entry_prompt ?? "",
@@ -748,6 +794,7 @@ function eventView(row) {
     sequence: Number(row.sequence),
     id: row.id,
     world_id: row.space_id,
+    scene_id: row.scene_id ?? null,
     actor_type: row.actor_type,
     actor:
       row.actor_pet_id && row.actor_name
@@ -1000,7 +1047,10 @@ export class SocialService {
       fail("NOT_FOUND", "World not found.");
     }
     this.reconcileWorldHostRuntime(space.id);
-    return this.spaceDetails(space.id);
+    return {
+      ...this.spaceDetails(space.id),
+      membership: membership ? this.membershipView(membership) : null,
+    };
   }
 
   listWorldBuilderTemplates() {
@@ -1412,6 +1462,16 @@ export class SocialService {
     );
     const worldId = randomUUID();
     const timestamp = now();
+    const packageMetadata = parseJsonObject(artifact.worldPackage);
+    const upgradedFrom = Number(
+      parseJsonObject(packageMetadata.compatibility)
+        .upgraded_from_compiler_version ?? 0,
+    );
+    const deliveryMode =
+      Number(packageMetadata.compiler_version) >= 3 &&
+      !(upgradedFrom > 0 && upgradedFrom < 3)
+        ? "relevance_routed"
+        : "legacy_broadcast";
     withTransaction(this.db, () => {
       this.insertWorldDraft({
         id: worldId,
@@ -1419,6 +1479,7 @@ export class SocialService {
         normalized,
         referee,
         buildSessionId: current.id,
+        deliveryMode,
         timestamp,
       });
       const result = this.db
@@ -2010,12 +2071,16 @@ export class SocialService {
         addExperienceCheck(
           "compiled_world_package",
           artifact.worldPackage.schema_version === WORLD_PACKAGE_SCHEMA_VERSION &&
-            [1, WORLD_BUILDER_COMPILER_VERSION].includes(artifact.worldPackage.compiler_version) &&
+            Number.isInteger(artifact.worldPackage.compiler_version) &&
+            artifact.worldPackage.compiler_version >= 1 &&
+            artifact.worldPackage.compiler_version <= WORLD_BUILDER_COMPILER_VERSION &&
             requiredModules.every((key) => Boolean(mechanics[key]))
             ? "pass"
             : "review",
           artifact.worldPackage.schema_version === WORLD_PACKAGE_SCHEMA_VERSION &&
-            [1, WORLD_BUILDER_COMPILER_VERSION].includes(artifact.worldPackage.compiler_version) &&
+            Number.isInteger(artifact.worldPackage.compiler_version) &&
+            artifact.worldPackage.compiler_version >= 1 &&
+            artifact.worldPackage.compiler_version <= WORLD_BUILDER_COMPILER_VERSION &&
             requiredModules.every((key) => Boolean(mechanics[key]))
             ? "World Package 已通过类型判断、世界组合和 Host 模块编译。"
             : "World Package 缺少编译版本或必要的导演运行模块。",
@@ -2138,6 +2203,7 @@ export class SocialService {
     normalized,
     referee,
     buildSessionId,
+    deliveryMode = "relevance_routed",
     timestamp,
   }) {
     const worldAgentId = `world-agent:${id}`;
@@ -2146,10 +2212,11 @@ export class SocialService {
         INSERT INTO spaces (
           id, kind, name, description, tags_json, visibility, join_policy,
           friend_policy, governance, owner_pet_id, profile_version,
-          current_spec_version, current_rule_version, publication_status,
+          current_spec_version, current_rule_version, delivery_mode,
+          publication_status,
           definition_text, published_at, created_at, updated_at
         ) VALUES (?, 'user', ?, ?, ?, ?, ?, ?, 'owner', ?, 1, 1, 1,
-          'draft', ?, NULL, ?, ?)
+          ?, 'draft', ?, NULL, ?, ?)
       `)
       .run(
         id,
@@ -2160,6 +2227,7 @@ export class SocialService {
         normalized.joinPolicy,
         normalized.friendPolicy,
         actor.id,
+        deliveryMode,
         normalized.definitionText,
         timestamp,
         timestamp,
@@ -3663,14 +3731,18 @@ export class SocialService {
     this.ensureWorldMemberState(world.id, actor.id);
     const worldState = this.worldStateView(world.id);
     const memberState = this.worldMemberStateView(world.id, actor.id);
+    const resumeBundle = this.worldResumeBundle(world.id, actor.id);
     return {
       world: result.space,
       session: result.session,
       host_runtime: result.host_runtime,
       moved_from_world_id: result.moved_from_space_id,
       state_version: worldState.version,
+      world_state: worldState,
       member_state_version: memberState.version,
       last_event_sequence: this.latestAccessibleWorldSequence(world, actor.id),
+      loop_context: resumeBundle.loop_context,
+      resume_bundle: resumeBundle,
       host_guidance: hostGuidance,
       host_response: {
         response_type: "guidance",
@@ -3689,6 +3761,8 @@ export class SocialService {
         state_changes: null,
         next_guidance: hostGuidance,
         live_context: hostGuidance.live_context,
+        loop_context: resumeBundle.loop_context,
+        resume_bundle: resumeBundle,
       },
     };
   }
@@ -3747,10 +3821,25 @@ export class SocialService {
             OR (e.visibility = 'actor' AND e.audience_pet_id = ?)
             OR (e.visibility = 'managers' AND ? = 1)
           )
+          AND (
+            e.scene_id IS NULL OR ? = 1 OR EXISTS (
+              SELECT 1 FROM world_scene_participants scene_member
+              WHERE scene_member.scene_id = e.scene_id
+                AND scene_member.pet_id = ?
+                AND scene_member.status IN ('invited', 'active')
+            )
+          )
         ORDER BY e.sequence ASC
         LIMIT ?
       `)
-      .all(world.id, cursor, ...visibilityArgs, boundedLimit);
+      .all(
+        world.id,
+        cursor,
+        ...visibilityArgs,
+        canManage ? 1 : 0,
+        actor.id,
+        boundedLimit,
+      );
     const latest = this.db
       .prepare(`
         SELECT COALESCE(MAX(e.sequence), 0) AS sequence
@@ -3761,8 +3850,16 @@ export class SocialService {
             OR (e.visibility = 'actor' AND e.audience_pet_id = ?)
             OR (e.visibility = 'managers' AND ? = 1)
           )
+          AND (
+            e.scene_id IS NULL OR ? = 1 OR EXISTS (
+              SELECT 1 FROM world_scene_participants scene_member
+              WHERE scene_member.scene_id = e.scene_id
+                AND scene_member.pet_id = ?
+                AND scene_member.status IN ('invited', 'active')
+            )
+          )
       `)
-      .get(world.id, ...visibilityArgs);
+      .get(world.id, ...visibilityArgs, canManage ? 1 : 0, actor.id);
     if (cursor > Number(latest.sequence)) {
       fail("INVALID_CURSOR", "The world event cursor is ahead of visible events.");
     }
@@ -3776,11 +3873,21 @@ export class SocialService {
             OR (e.visibility = 'actor' AND e.audience_pet_id = ?)
             OR (e.visibility = 'managers' AND ? = 1)
           )
+          AND (
+            e.scene_id IS NULL OR ? = 1 OR EXISTS (
+              SELECT 1 FROM world_scene_participants scene_member
+              WHERE scene_member.scene_id = e.scene_id
+                AND scene_member.pet_id = ?
+                AND scene_member.status IN ('invited', 'active')
+            )
+          )
       `)
       .get(
         world.id,
         Number(membership.last_seen_event_sequence ?? 0),
         ...visibilityArgs,
+        canManage ? 1 : 0,
+        actor.id,
       );
     const pendingRows = this.db
       .prepare(`
@@ -3804,6 +3911,7 @@ export class SocialService {
         ? Number(events[events.length - 1].sequence)
         : cursor;
     const latestGuidance = this.latestWorldHostGuidance(world.id, actor.id);
+    const resumeBundle = this.worldResumeBundle(world.id, actor.id);
     return {
       world: this.spaceDetails(world.id),
       membership: this.membershipView(this.membership(world.id, actor.id)),
@@ -3836,6 +3944,8 @@ export class SocialService {
       latest_sequence: Number(latest.sequence),
       has_more: returnedCursor < Number(latest.sequence),
       unread_count: Number(unread.count),
+      loop_context: resumeBundle.loop_context,
+      resume_bundle: resumeBundle,
       active_interactions: this.activeWorldInteractions(
         world.id,
         actor.id,
@@ -4211,6 +4321,7 @@ export class SocialService {
     expectedMemberStateVersion,
     correlationId,
     replyToEventId,
+    sceneId,
     visibility = "world",
     idempotencyKey,
     requireLive = false,
@@ -4301,6 +4412,10 @@ export class SocialService {
       "event visibility",
       EVENT_VISIBILITIES,
     );
+    let normalizedSceneId =
+      sceneId === undefined
+        ? null
+        : text(sceneId, "scene id", { min: 1, max: 100 });
     const normalizedKey = text(idempotencyKey, "idempotency key", {
       min: 1,
       max: 120,
@@ -4315,9 +4430,96 @@ export class SocialService {
         : text(replyToEventId, "reply event id", { min: 1, max: 100 });
     if (normalizedReply) {
       const replyEvent = this.db
-        .prepare("SELECT id FROM world_events WHERE id = ? AND space_id = ?")
-        .get(normalizedReply, world.id);
+        .prepare(`
+          SELECT event.id, event.scene_id
+          FROM world_events event
+          WHERE event.id = ? AND event.space_id = ?
+            AND (
+              event.actor_pet_id = ?
+              OR (event.visibility = 'actor' AND event.audience_pet_id = ?)
+              OR (
+                event.visibility = 'world'
+                AND (
+                  event.scene_id IS NULL
+                  OR EXISTS (
+                    SELECT 1 FROM world_scene_participants participant
+                    WHERE participant.scene_id = event.scene_id
+                      AND participant.space_id = event.space_id
+                      AND participant.pet_id = ?
+                      AND participant.status IN ('invited', 'active')
+                  )
+                )
+              )
+            )
+        `)
+        .get(normalizedReply, world.id, actor.id, actor.id, actor.id);
       if (!replyEvent) fail("NOT_FOUND", "Reply target event not found.");
+      if (
+        replyEvent.scene_id &&
+        normalizedSceneId &&
+        replyEvent.scene_id !== normalizedSceneId
+      ) {
+        fail(
+          "WORLD_SCENE_REPLY_MISMATCH",
+          "A reply to a Scene event must remain in that same Scene.",
+          {
+            reply_scene_id: replyEvent.scene_id,
+            requested_scene_id: normalizedSceneId,
+          },
+        );
+      }
+      normalizedSceneId = replyEvent.scene_id ?? normalizedSceneId;
+    }
+    if (normalizedSceneId) {
+      const privateCollectiveResponse =
+        normalizedVisibility === "actor" &&
+        normalizedReply &&
+        Boolean(this.db.prepare(`
+          SELECT 1 FROM world_interactions
+          WHERE space_id = ? AND prompt_event_id = ?
+        `).get(world.id, normalizedReply));
+      if (normalizedVisibility !== "world" && !privateCollectiveResponse) {
+        fail(
+          "INVALID_ARGUMENT",
+          "A Scene action must be participant-visible; only a private collective response may stay actor-visible until settlement.",
+        );
+      }
+      const scene = this.db.prepare(`
+        SELECT scene.id, scene.interaction_policy FROM world_scenes scene
+        JOIN world_scene_participants participant
+          ON participant.scene_id = scene.id
+        WHERE scene.id = ? AND scene.space_id = ?
+          AND scene.status IN ('forming', 'active', 'resolved')
+          AND participant.pet_id = ? AND participant.status = 'active'
+      `).get(normalizedSceneId, world.id, actor.id);
+      if (!scene) {
+        fail(
+          "WORLD_SCENE_PARTICIPANT_REQUIRED",
+          "Only an active Scene participant may bind an action to that Scene.",
+          { scene_id: normalizedSceneId },
+        );
+      }
+      if (scene.interaction_policy === "sync") {
+        this.requireLiveWorldPresence(world.id, actor.id);
+      }
+      if (normalizedType === "speech.directed") {
+        const targetCharacterId = normalizedData.target_character_id;
+        const targetInScene = this.db.prepare(`
+          SELECT 1 FROM world_scene_participants
+          WHERE scene_id = ? AND space_id = ? AND pet_id = ?
+            AND status IN ('invited', 'active')
+        `).get(normalizedSceneId, world.id, targetCharacterId);
+        if (!targetInScene) {
+          fail(
+            "WORLD_SCENE_TARGET_MISMATCH",
+            "Directed speech bound to a Scene must target a participant of that Scene. Omit scene_id to start a separate causal encounter.",
+            {
+              scene_id: normalizedSceneId,
+              target_character_id: targetCharacterId,
+            },
+          );
+        }
+      }
     }
     const existing = this.db
       .prepare(`
@@ -4337,6 +4539,20 @@ export class SocialService {
         `)
         .get(world.id, normalizedReply);
       if (interaction?.status === "open") {
+        if (interaction.scene_id) {
+          const sceneParticipant = this.db.prepare(`
+            SELECT 1 FROM world_scene_participants
+            WHERE scene_id = ? AND space_id = ? AND pet_id = ?
+              AND status IN ('invited', 'active')
+          `).get(interaction.scene_id, world.id, actor.id);
+          if (!sceneParticipant) {
+            fail(
+              "WORLD_SCENE_PARTICIPANT_REQUIRED",
+              "Only Scene participants may respond to this interaction.",
+              { scene_id: interaction.scene_id },
+            );
+          }
+        }
         const priorResponse = this.db
           .prepare(`
             SELECT id FROM world_inputs
@@ -4472,6 +4688,7 @@ export class SocialService {
       this.insertWorldEvent({
         id: intentId,
         spaceId: world.id,
+        sceneId: normalizedSceneId,
         actorType: "pet",
         actorPetId: actor.id,
         eventClass: "intent",
@@ -4514,6 +4731,7 @@ export class SocialService {
           normalizedBody,
           JSON.stringify({
             data: normalizedData,
+            scene_id: normalizedSceneId,
             proposed_world_state_patch: worldPatch,
             proposed_member_state_patch: memberPatch,
           }),
@@ -4532,6 +4750,17 @@ export class SocialService {
           intentId,
           timestamp,
         );
+      if (normalizedType === "speech.directed") {
+        const storedInput = this.db.prepare(
+          "SELECT * FROM world_inputs WHERE id = ?",
+        ).get(intentId);
+        this.materializeWorldSceneFromJudgement({
+          world,
+          input: storedInput,
+          judgementResult: {},
+          timestamp,
+        });
+      }
       if (
         !interaction &&
         spec.resolution_mode === "direct" &&
@@ -6018,6 +6247,13 @@ export class SocialService {
       world_id: row.space_id,
       host_agent_id: row.world_agent_id,
       prompt_event_id: row.prompt_event_id,
+      scene_id: row.scene_id ?? null,
+      scene: row.scene_id
+        ? this.worldSceneView(
+            this.db.prepare("SELECT * FROM world_scenes WHERE id = ?").get(row.scene_id),
+            actorPetId,
+          )
+        : null,
       prompt_text: promptText,
       coordination_rule: promptPayload.coordination_rule ?? "",
       mode: row.mode,
@@ -6036,13 +6272,27 @@ export class SocialService {
 
   activeWorldInteractions(spaceId, actorPetId = null, timestamp = now()) {
     this.refreshWorldInteractions(spaceId, timestamp);
-    return this.db
-      .prepare(`
-        SELECT * FROM world_interactions
-        WHERE space_id = ? AND status IN ('open', 'ready')
-        ORDER BY created_at ASC
-      `)
-      .all(spaceId)
+    const rows = actorPetId
+      ? this.db.prepare(`
+          SELECT interaction.* FROM world_interactions interaction
+          WHERE interaction.space_id = ?
+            AND interaction.status IN ('open', 'ready')
+            AND (
+              interaction.scene_id IS NULL OR EXISTS (
+                SELECT 1 FROM world_scene_participants participant
+                WHERE participant.scene_id = interaction.scene_id
+                  AND participant.pet_id = ?
+                  AND participant.status IN ('invited', 'active')
+              )
+            )
+          ORDER BY interaction.created_at ASC
+        `).all(spaceId, actorPetId)
+      : this.db.prepare(`
+          SELECT * FROM world_interactions
+          WHERE space_id = ? AND status IN ('open', 'ready')
+          ORDER BY created_at ASC
+        `).all(spaceId);
+    return rows
       .map((row) => this.worldInteractionView(row, actorPetId));
   }
 
@@ -6052,11 +6302,12 @@ export class SocialService {
     promptText,
     eventType = "host.collective_prompt",
     mode = "windowed",
-    windowSeconds = 60,
+    windowSeconds,
     quorum,
     lateInputPolicy = "follow_up",
     coordinationRule,
     expectedWorldStateVersion,
+    sceneId,
   }) {
     const actor = this.requirePet();
     const world = this.requireSpace(worldId);
@@ -6077,10 +6328,26 @@ export class SocialService {
       "interaction mode",
       WORLD_INTERACTION_MODES,
     );
-    const boundedWindow = integer(windowSeconds, "window seconds", {
-      min: 5,
-      max: 300,
-    });
+    const normalizedSceneId =
+      sceneId === undefined || sceneId === null
+        ? null
+        : text(sceneId, "scene id", { min: 1, max: 100 });
+    const sceneInteractionPolicy = normalizedSceneId
+      ? this.db.prepare(`
+          SELECT interaction_policy FROM world_scenes
+          WHERE id = ? AND space_id = ?
+        `).get(normalizedSceneId, world.id)?.interaction_policy ?? null
+      : null;
+    const windowContract = sceneInteractionPolicy === "async"
+      ? { defaultValue: 86_400, min: 60, max: 604_800 }
+      : sceneInteractionPolicy === "flexible"
+        ? { defaultValue: 300, min: 5, max: 86_400 }
+        : { defaultValue: 60, min: 5, max: 300 };
+    const boundedWindow = integer(
+      windowSeconds ?? windowContract.defaultValue,
+      "window seconds",
+      { min: windowContract.min, max: windowContract.max },
+    );
     const normalizedQuorum =
       normalizedMode === "quorum"
         ? integer(quorum, "interaction quorum", { min: 2, max: 100 })
@@ -6132,12 +6399,30 @@ export class SocialService {
           current_world_state_version: currentState.version,
         });
       }
+      if (normalizedSceneId) {
+        const scene = this.db.prepare(`
+          SELECT scene.id FROM world_scenes scene
+          WHERE scene.id = ? AND scene.space_id = ?
+            AND scene.status IN ('forming', 'active')
+            AND (SELECT COUNT(*) FROM world_scene_participants participant
+                 WHERE participant.scene_id = scene.id
+                   AND participant.status = 'active') >= 2
+        `).get(normalizedSceneId, world.id);
+        if (!scene) {
+          fail(
+            "WORLD_SCENE_NOT_ACTIVE",
+            "Collective interaction requires an active Scene with at least two participants.",
+          );
+        }
+      }
       const active = this.db
-        .prepare(`
-          SELECT id FROM world_interactions
-          WHERE space_id = ? AND status IN ('open', 'ready')
-        `)
-        .get(world.id);
+        .prepare(normalizedSceneId
+          ? `SELECT id FROM world_interactions
+             WHERE scene_id = ? AND status IN ('open', 'ready')`
+          : `SELECT id FROM world_interactions
+             WHERE space_id = ? AND scene_id IS NULL
+               AND status IN ('open', 'ready')`)
+        .get(normalizedSceneId ?? world.id);
       if (active) {
         fail(
           "WORLD_INTERACTION_ACTIVE",
@@ -6154,6 +6439,7 @@ export class SocialService {
         bodyText: publicPrompt,
         payload: {
           interaction_id: interactionId,
+          scene_id: normalizedSceneId,
           mode: normalizedMode,
           quorum: normalizedQuorum,
           closes_at: closesAt,
@@ -6161,6 +6447,7 @@ export class SocialService {
           coordination_rule: normalizedCoordinationRule,
         },
         correlationId: interactionId,
+        sceneId: normalizedSceneId,
         visibility: "world",
         specVersion: spec.version,
         timestamp,
@@ -6168,14 +6455,15 @@ export class SocialService {
       this.db
         .prepare(`
           INSERT INTO world_interactions (
-            id, space_id, world_agent_id, prompt_event_id, mode, status,
+            id, space_id, scene_id, world_agent_id, prompt_event_id, mode, status,
             base_world_state_version, quorum, late_input_policy, closes_at,
             created_by_pet_id, created_at
-          ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)
         `)
         .run(
           interactionId,
           world.id,
+          normalizedSceneId,
           worldAgent.id,
           promptEventId,
           normalizedMode,
@@ -6186,6 +6474,22 @@ export class SocialService {
           actor.id,
           timestamp,
         );
+      enqueueWorldDelivery(this.db, {
+        worldId: world.id,
+        sourceWorldEventId: promptEventId,
+        sourceInteractionId: interactionId,
+        eventType: "world.interaction_opened",
+        dedupeKey: `world:${world.id}:interaction-opened:${promptEventId}`,
+        envelope: {
+          interactionId,
+          sceneId: normalizedSceneId,
+          promptEventId,
+          closesAt,
+          visibility: "world",
+          actorPetId: actor.id,
+        },
+        timestamp,
+      });
     });
     this.touchWorldHostRuntime(world.id, timestamp);
     const interaction = this.db
@@ -6202,8 +6506,55 @@ export class SocialService {
   }
 
   worldHostContextPack(world, inputActorPetId) {
-    const recentEvents = this.db
-      .prepare(`
+    const recentEvents = (inputActorPetId
+      ? this.db
+          .prepare(`
+        SELECT event.*, pet.${this.petNameColumn} AS actor_name
+        FROM world_events event
+        LEFT JOIN pets pet ON pet.id = event.actor_pet_id
+        WHERE event.space_id = ?
+          AND (
+            event.actor_pet_id = ?
+            OR (event.visibility = 'actor' AND event.audience_pet_id = ?)
+            OR (
+              event.actor_type IN ('world', 'system')
+              AND event.visibility = 'world'
+              AND event.scene_id IS NULL
+              AND (
+                event.causation_event_id IS NULL
+                OR EXISTS (
+                  SELECT 1 FROM world_events cause
+                  WHERE cause.id = event.causation_event_id
+                    AND (
+                      cause.actor_pet_id = ?
+                      OR cause.actor_type IN ('world', 'system')
+                    )
+                )
+              )
+            )
+            OR (
+              event.scene_id IS NOT NULL
+              AND event.visibility = 'world'
+              AND EXISTS (
+                SELECT 1 FROM world_scene_participants scene_member
+                WHERE scene_member.scene_id = event.scene_id
+                  AND scene_member.pet_id = ?
+                  AND scene_member.status IN ('invited', 'active')
+              )
+            )
+          )
+        ORDER BY event.sequence DESC
+        LIMIT 12
+      `)
+          .all(
+            world.id,
+            inputActorPetId,
+            inputActorPetId,
+            inputActorPetId,
+            inputActorPetId,
+          )
+      : this.db
+          .prepare(`
         SELECT event.*, pet.${this.petNameColumn} AS actor_name
         FROM world_events event
         LEFT JOIN pets pet ON pet.id = event.actor_pet_id
@@ -6213,21 +6564,26 @@ export class SocialService {
             OR event.visibility = 'managers'
             OR (event.visibility = 'actor' AND event.audience_pet_id = ?)
           )
+          AND (
+            event.scene_id IS NULL
+            OR (? <> '' AND EXISTS (
+              SELECT 1 FROM world_scene_participants scene_member
+              WHERE scene_member.scene_id = event.scene_id
+                AND scene_member.pet_id = ?
+                AND scene_member.status IN ('invited', 'active')
+            ))
+          )
         ORDER BY event.sequence DESC
         LIMIT 12
       `)
-      .all(world.id, inputActorPetId ?? "")
+          .all(world.id, "", "", ""))
       .reverse()
       .map(eventView);
     const liveMembers = this.db
       .prepare(`
-        SELECT pet.id, pet.${this.petNameColumn} AS name,
-          journey.stage, journey.current_role, journey.participation_intent,
-          journey.multiplayer_consent, journey.last_meaningful_at
+        SELECT pet.id, pet.${this.petNameColumn} AS name, live.entered_at
         FROM presence live
         JOIN pets pet ON pet.id = live.pet_id
-        LEFT JOIN world_member_journeys journey
-          ON journey.space_id = live.space_id AND journey.pet_id = live.pet_id
         WHERE live.space_id = ?
         ORDER BY live.entered_at ASC, pet.id ASC
       `)
@@ -6235,13 +6591,7 @@ export class SocialService {
       .map((row) => ({
         pet_id: row.id,
         name: row.name,
-        stage: row.stage ?? "new",
-        current_role: row.current_role ?? "",
-        participation_intent: row.participation_intent ?? "",
-        multiplayer_consent: "not_required",
-        direct_interaction_preference:
-          row.multiplayer_consent === "declined" ? "independent" : "open",
-        last_meaningful_at: row.last_meaningful_at ?? null,
+        present_since: row.entered_at,
       }));
     const pendingInputCount = Number(
       this.db
@@ -6259,13 +6609,16 @@ export class SocialService {
       actor_journey: inputActorPetId
         ? this.worldMemberJourney(world.id, inputActorPetId)
         : null,
+      actor_loop_context: inputActorPetId
+        ? this.worldLoopContext(world.id, inputActorPetId)
+        : null,
       pending_input_count: pendingInputCount,
       latest_event_sequence:
         recentEvents.length > 0
           ? recentEvents[recentEvents.length - 1].sequence
           : 0,
       privacy_scope:
-        "world and manager-visible events, plus actor-visible events only for the current input actor",
+        "world and manager-visible events, actor-private context only for the current input actor, and public-safe identity/presence fields for other live members",
     };
   }
 
@@ -7250,6 +7603,7 @@ export class SocialService {
       this.insertWorldEvent({
         id: aggregateOutcomeId,
         spaceId: world.id,
+        sceneId: interaction.scene_id ?? null,
         actorType: "world",
         eventClass: "outcome",
         eventType: `outcome.collective_${normalizedDecision}`,
@@ -7266,12 +7620,10 @@ export class SocialService {
         ].filter(Boolean).join("\n\n"),
         payload: {
           interaction_id: interaction.id,
+          scene_id: interaction.scene_id ?? null,
           decision: normalizedDecision,
           resolution_disposition: disposition,
           response_count: lockedInputs.length,
-          participant_pet_ids: lockedInputs.map((input) => input.actor_pet_id),
-          participant_character_ids: lockedInputs.map((input) => input.actor_pet_id),
-          input_ids: lockedInputs.map((input) => input.id),
           result: normalizedResult,
           coordination_rule: coordinationRule,
           world_state_before_version: lockedWorldState.version,
@@ -7306,6 +7658,23 @@ export class SocialService {
           platformHostAuthorized ? "platform" : "creator_review",
           timestamp,
         );
+      // Snapshot recipients only after the authoritative resolution row exists,
+      // so a shared-world state change can be derived without trusting Host hints.
+      enqueueWorldDelivery(this.db, {
+        worldId: world.id,
+        sourceWorldEventId: aggregateOutcomeId,
+        sourceInteractionId: interaction.id,
+        eventType: "world.event_committed",
+        dedupeKey: `world:${world.id}:event-committed:${aggregateOutcomeId}`,
+        envelope: {
+          interactionId: interaction.id,
+          sceneId: interaction.scene_id ?? null,
+          outcomeEventId: aggregateOutcomeId,
+          visibility: "world",
+          actorPetId: null,
+        },
+        timestamp,
+      });
       this.db
         .prepare(`
           UPDATE world_interactions
@@ -7313,6 +7682,15 @@ export class SocialService {
           WHERE id = ? AND status = 'ready'
         `)
         .run(timestamp, interaction.id);
+      if (interaction.scene_id && lockedInputs[0]) {
+        this.applyWorldSceneTransition({
+          world,
+          input: lockedInputs[0],
+          judgementResult: normalizedResult,
+          fallbackSceneId: interaction.scene_id,
+          timestamp,
+        });
+      }
       for (const input of lockedInputs) {
         this.createInputHostGuidance(world, input.id, timestamp);
       }
@@ -7791,6 +8169,1275 @@ export class SocialService {
     return journeyView(this.ensureWorldMemberJourney(spaceId, petId));
   }
 
+  insertWorldStoryLoop({
+    spaceId,
+    ownerPetId = null,
+    scope = "personal",
+    title,
+    phase = "open",
+    visibility = "actor",
+    sourceKind,
+    sourceKey,
+    context = {},
+    intersectionContract = {},
+    openedByInputId = null,
+    timestamp = now(),
+  }) {
+    const id = `loop:${stableLoopKey(spaceId, sourceKind, sourceKey)}`;
+    this.db.prepare(`
+      INSERT OR IGNORE INTO world_story_loops (
+        id, space_id, scope, owner_pet_id, title, phase, status,
+        visibility, source_kind, source_key, context_json,
+        intersection_contract_json, opened_by_input_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      spaceId,
+      scope,
+      ownerPetId,
+      title.trim().slice(0, 500),
+      phase.trim().slice(0, 120) || "open",
+      visibility,
+      sourceKind,
+      sourceKey,
+      JSON.stringify(context),
+      JSON.stringify(intersectionContract),
+      openedByInputId,
+      timestamp,
+      timestamp,
+    );
+    return this.db
+      .prepare("SELECT * FROM world_story_loops WHERE id = ?")
+      .get(id);
+  }
+
+  ensureWorldStoryLoops(spaceId, petId, timestamp = now()) {
+    const journey = this.ensureWorldMemberJourney(spaceId, petId, timestamp);
+    const memberLoopTitles = [
+      ...new Set(
+        parseJsonArray(journey.open_loops_json)
+          .filter((item) => typeof item === "string" && item.trim())
+          .map((item) => item.trim().slice(0, 500)),
+      ),
+    ];
+    for (const title of memberLoopTitles) {
+      const hostLoop = this.db.prepare(`
+        SELECT loop.id FROM world_story_loops loop
+        JOIN world_loop_participants participant ON participant.loop_id = loop.id
+        WHERE loop.space_id = ? AND loop.owner_pet_id = ?
+          AND loop.source_kind = 'host' AND loop.title = ?
+          AND participant.pet_id = ?
+        LIMIT 1
+      `).get(spaceId, petId, title, petId);
+      if (hostLoop) continue;
+      const sourceKey = `${petId}:${stableLoopKey(title)}`;
+      const loop = this.insertWorldStoryLoop({
+        spaceId,
+        ownerPetId: petId,
+        title,
+        sourceKind: "journey_open_loop",
+        sourceKey,
+        context: { migrated_from: "world_member_journeys.open_loops_json" },
+        intersectionContract: {
+          version: 1,
+          materialize_as: "scene",
+          requires_causal_overlap: true,
+          automatic_presence_intersection: false,
+        },
+        timestamp,
+      });
+      this.db.prepare(`
+        INSERT OR IGNORE INTO world_loop_participants (
+          loop_id, space_id, pet_id, role, status, is_foreground,
+          private_context_json, joined_at, updated_at
+        ) VALUES (?, ?, ?, 'owner', 'active', 0, '{}', ?, ?)
+      `).run(loop.id, spaceId, petId, timestamp, timestamp);
+    }
+
+    // World-state threads are safe to expose only as public opportunities.
+    // They do not make every member a participant and therefore cannot turn
+    // mere co-presence into a multiplayer Scene.
+    const worldState = this.worldStateView(spaceId).value;
+    const worldThreads = Array.isArray(worldState.world_progress?.open_threads)
+      ? worldState.world_progress.open_threads.slice(0, 100)
+      : [];
+    for (const [index, thread] of worldThreads.entries()) {
+      const threadObject =
+        thread && typeof thread === "object" && !Array.isArray(thread)
+          ? thread
+          : {};
+      const titleCandidate =
+        typeof thread === "string"
+          ? thread
+          : threadObject.title ??
+            threadObject.name ??
+            threadObject.premise ??
+            threadObject.objective ??
+            threadObject.id;
+      if (typeof titleCandidate !== "string" || !titleCandidate.trim()) continue;
+      const declaredId =
+        typeof threadObject.id === "string" && threadObject.id.trim()
+          ? threadObject.id.trim()
+          : null;
+      const sourceKey = declaredId
+        ? `thread:${declaredId}`
+        : `thread:${stableLoopKey(thread)}`;
+      this.insertWorldStoryLoop({
+        spaceId,
+        scope: "public",
+        title: titleCandidate.trim(),
+        visibility: "world",
+        sourceKind: "world_open_thread",
+        sourceKey,
+        context: { migrated_thread: thread },
+        intersectionContract: {
+          version: 1,
+          materialize_as: "scene",
+          requires_causal_overlap: true,
+          automatic_presence_intersection: false,
+        },
+        timestamp,
+      });
+    }
+
+    let resumable = Number(
+      this.db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM world_loop_participants participant
+        JOIN world_story_loops loop ON loop.id = participant.loop_id
+        WHERE participant.space_id = ? AND participant.pet_id = ?
+          AND participant.status = 'active'
+          AND loop.status = 'active'
+      `).get(spaceId, petId).count,
+    );
+    if (resumable === 0) {
+      const completedCount = Number(
+        this.db.prepare(`
+          SELECT COUNT(*) AS count FROM world_loop_participants
+          WHERE space_id = ? AND pet_id = ? AND status = 'completed'
+        `).get(spaceId, petId).count,
+      );
+      const title = journey.participation_intent?.trim()
+        ? journey.participation_intent.trim().slice(0, 500)
+        : journey.current_role?.trim()
+          ? `继续“${journey.current_role.trim().slice(0, 160)}”的个人旅程`
+          : "继续你的个人旅程";
+      const loop = this.insertWorldStoryLoop({
+        spaceId,
+        ownerPetId: petId,
+        title,
+        sourceKind: "continuity",
+        sourceKey: `${petId}:${completedCount}`,
+        context: { migrated_from: "world_member_journeys" },
+        intersectionContract: {
+          version: 1,
+          materialize_as: "scene",
+          requires_causal_overlap: true,
+          automatic_presence_intersection: false,
+        },
+        timestamp,
+      });
+      this.db.prepare(`
+        INSERT OR IGNORE INTO world_loop_participants (
+          loop_id, space_id, pet_id, role, status, is_foreground,
+          private_context_json, joined_at, updated_at
+        ) VALUES (?, ?, ?, 'owner', 'active', 0, '{}', ?, ?)
+      `).run(loop.id, spaceId, petId, timestamp, timestamp);
+      resumable = 1;
+    }
+
+    const foreground = this.db.prepare(`
+      SELECT loop_id FROM world_loop_participants
+      WHERE space_id = ? AND pet_id = ? AND status = 'active'
+        AND is_foreground = 1
+      LIMIT 1
+    `).get(spaceId, petId);
+    if (!foreground && resumable > 0) {
+      const candidate = this.db.prepare(`
+        SELECT participant.loop_id
+        FROM world_loop_participants participant
+        JOIN world_story_loops loop ON loop.id = participant.loop_id
+        WHERE participant.space_id = ? AND participant.pet_id = ?
+          AND participant.status = 'active' AND loop.status = 'active'
+        ORDER BY
+          CASE loop.source_kind WHEN 'journey_open_loop' THEN 0 ELSE 1 END,
+          participant.joined_at ASC, participant.loop_id ASC
+        LIMIT 1
+      `).get(spaceId, petId);
+      if (candidate) {
+        this.setForegroundWorldStoryLoop(spaceId, petId, candidate.loop_id, timestamp);
+      }
+    }
+  }
+
+  setForegroundWorldStoryLoop(spaceId, petId, loopId, timestamp = now()) {
+    const participant = this.db.prepare(`
+      SELECT participant.loop_id
+      FROM world_loop_participants participant
+      JOIN world_story_loops loop ON loop.id = participant.loop_id
+      WHERE participant.loop_id = ? AND participant.space_id = ?
+        AND participant.pet_id = ? AND participant.status = 'active'
+        AND loop.status = 'active'
+    `).get(loopId, spaceId, petId);
+    if (!participant) return false;
+    this.db.prepare(`
+      UPDATE world_loop_participants
+      SET is_foreground = 0, updated_at = ?
+      WHERE space_id = ? AND pet_id = ? AND is_foreground = 1
+    `).run(timestamp, spaceId, petId);
+    this.db.prepare(`
+      UPDATE world_loop_participants
+      SET is_foreground = 1, updated_at = ?
+      WHERE loop_id = ? AND pet_id = ?
+    `).run(timestamp, loopId, petId);
+    return true;
+  }
+
+  foregroundPersonalLoopId(spaceId, petId, timestamp = now()) {
+    this.ensureWorldStoryLoops(spaceId, petId, timestamp);
+    return this.db.prepare(`
+      SELECT loop.id
+      FROM world_loop_participants participant
+      JOIN world_story_loops loop ON loop.id = participant.loop_id
+      WHERE participant.space_id = ? AND participant.pet_id = ?
+        AND participant.status = 'active' AND participant.is_foreground = 1
+        AND loop.status = 'active' AND loop.scope = 'personal'
+        AND loop.owner_pet_id = ?
+      LIMIT 1
+    `).get(spaceId, petId, petId)?.id ?? null;
+  }
+
+  worldSceneView(row, actorPetId = null) {
+    if (!row) return null;
+    const participants = this.db.prepare(`
+      SELECT participant.pet_id, participant.role, participant.status,
+        participant.joined_at, participant.left_at,
+        pet.${this.petNameColumn} AS name
+      FROM world_scene_participants participant
+      JOIN pets pet ON pet.id = participant.pet_id
+      WHERE participant.scene_id = ?
+      ORDER BY participant.joined_at ASC, participant.pet_id ASC
+    `).all(row.id).map((participant) => ({
+      pet_id: participant.pet_id,
+      name: participant.name,
+      role: participant.role,
+      status: participant.status,
+      joined_at: participant.joined_at,
+      left_at: participant.left_at ?? null,
+      is_self: actorPetId === participant.pet_id,
+    }));
+    return {
+      id: row.id,
+      world_id: row.space_id,
+      status: row.status,
+      interaction_policy: row.interaction_policy,
+      title: row.title,
+      shared_context: parseJsonObject(row.shared_context_json),
+      source_input_id: row.source_input_id ?? null,
+      source_event_id: row.source_event_id ?? null,
+      participants,
+      created_at: row.created_at,
+      activated_at: row.activated_at ?? null,
+      resolved_at: row.resolved_at ?? null,
+      closed_at: row.closed_at ?? null,
+      updated_at: row.updated_at,
+      privacy_scope:
+        "shared-safe Scene framing and participant identity only; personal Loop context is excluded",
+    };
+  }
+
+  activeWorldScenes(spaceId, actorPetId = null) {
+    const rows = actorPetId
+      ? this.db.prepare(`
+          SELECT scene.* FROM world_scenes scene
+          JOIN world_scene_participants participant
+            ON participant.scene_id = scene.id
+          WHERE scene.space_id = ? AND participant.pet_id = ?
+            AND participant.status IN ('invited', 'active')
+            AND scene.status IN ('forming', 'active', 'resolved')
+          ORDER BY scene.updated_at DESC, scene.id ASC
+        `).all(spaceId, actorPetId)
+      : this.db.prepare(`
+          SELECT * FROM world_scenes
+          WHERE space_id = ? AND status IN ('forming', 'active', 'resolved')
+          ORDER BY updated_at DESC, id ASC
+        `).all(spaceId);
+    return rows.map((row) => this.worldSceneView(row, actorPetId));
+  }
+
+  sceneTargetPetIds(world, input, judgementResult) {
+    const targets = new Map();
+    const authorizedTargets = new Map();
+    const addTarget = (candidate, role, evidence) => {
+      if (typeof candidate !== "string" || !candidate.trim()) return;
+      const petId = candidate.trim();
+      if (petId === input.actor_pet_id) return;
+      const active = this.db.prepare(`
+        SELECT 1 FROM space_memberships
+        WHERE space_id = ? AND pet_id = ? AND status = 'active'
+      `).get(world.id, petId);
+      if (!active) return;
+      const prior = targets.get(petId);
+      if (!prior || role === "target") targets.set(petId, { petId, role, evidence });
+    };
+    const authorizeTarget = (candidate, evidence) => {
+      if (typeof candidate !== "string" || !candidate.trim()) return;
+      const petId = candidate.trim();
+      if (petId === input.actor_pet_id) return;
+      const active = this.db.prepare(`
+        SELECT 1 FROM space_memberships
+        WHERE space_id = ? AND pet_id = ? AND status = 'active'
+      `).get(world.id, petId);
+      if (active) authorizedTargets.set(petId, evidence);
+    };
+
+    const storedData = parseJsonObject(input.data_json).data ?? {};
+    if (input.event_type === "speech.directed") {
+      const directedTarget =
+        storedData.target_character_id ?? storedData.target_pet_id;
+      authorizeTarget(directedTarget, "directed_behavior");
+      addTarget(directedTarget, "target", "directed_behavior");
+    }
+    if (input.reply_to_event_id) {
+      const replied = this.db.prepare(`
+        SELECT actor_pet_id FROM world_events
+        WHERE id = ? AND space_id = ? AND visibility = 'world'
+          AND actor_pet_id IS NOT NULL
+      `).get(input.reply_to_event_id, world.id);
+      authorizeTarget(replied?.actor_pet_id, "causal_reply");
+    }
+    const transitions = Array.isArray(judgementResult.loop_transitions)
+      ? judgementResult.loop_transitions
+      : judgementResult.loop_transition &&
+          typeof judgementResult.loop_transition === "object" &&
+          !Array.isArray(judgementResult.loop_transition)
+        ? [judgementResult.loop_transition]
+        : [];
+    for (const transition of transitions.slice(0, 20)) {
+      if (!transition || typeof transition !== "object") continue;
+      if ((transition.transition ?? transition.action) !== "intersect") continue;
+      let targetPetId =
+        transition.target_character_id ?? transition.target_pet_id ?? null;
+      if (!targetPetId && typeof transition.target_loop_id === "string") {
+        const targetLoop = this.db.prepare(`
+          SELECT owner_pet_id FROM world_story_loops
+          WHERE id = ? AND space_id = ? AND scope = 'personal'
+            AND status = 'active' AND owner_pet_id IS NOT NULL
+        `).get(transition.target_loop_id.trim(), world.id);
+        targetPetId = targetLoop?.owner_pet_id ?? null;
+      }
+      if (authorizedTargets.has(targetPetId)) {
+        addTarget(
+          targetPetId,
+          "participant",
+          authorizedTargets.get(targetPetId) === "causal_reply"
+            ? "host_causal_intersection"
+            : authorizedTargets.get(targetPetId),
+        );
+      }
+    }
+    for (const [petId, evidence] of authorizedTargets) {
+      if (!targets.has(petId) && evidence === "causal_reply") {
+        addTarget(petId, "participant", "host_causal_intersection");
+      }
+    }
+    return [...targets.values()];
+  }
+
+  materializeWorldSceneFromJudgement({
+    world,
+    input,
+    judgementResult,
+    timestamp = now(),
+  }) {
+    if (!input.actor_pet_id || input.visibility !== "world") return null;
+    const declaredTransitions = Array.isArray(judgementResult.loop_transitions)
+      ? judgementResult.loop_transitions
+      : judgementResult.loop_transition &&
+          typeof judgementResult.loop_transition === "object"
+        ? [judgementResult.loop_transition]
+        : [];
+    const declaredPolicy =
+      judgementResult.scene_policy ??
+      declaredTransitions.find((item) => item?.scene_policy)?.scene_policy;
+    const validatedPolicy = ["sync", "async", "flexible"].includes(
+      declaredPolicy,
+    ) ? declaredPolicy : null;
+    const boundScene = this.db.prepare(`
+      SELECT scene.* FROM world_events intent
+      JOIN world_scenes scene ON scene.id = intent.scene_id
+      JOIN world_scene_participants participant
+        ON participant.scene_id = scene.id
+      WHERE intent.id = ? AND intent.space_id = ?
+        AND scene.space_id = ? AND scene.status IN ('forming', 'active', 'resolved')
+        AND participant.pet_id = ? AND participant.status = 'active'
+      LIMIT 1
+    `).get(
+      input.intent_event_id,
+      world.id,
+      world.id,
+      input.actor_pet_id,
+    );
+    if (boundScene) {
+      if (validatedPolicy && boundScene.interaction_policy !== validatedPolicy) {
+        this.db.prepare(`
+          UPDATE world_scenes SET interaction_policy = ?, updated_at = ?
+          WHERE id = ?
+        `).run(validatedPolicy, timestamp, boundScene.id);
+        boundScene.interaction_policy = validatedPolicy;
+      }
+      return boundScene;
+    }
+    const targets = this.sceneTargetPetIds(world, input, judgementResult);
+    if (targets.length === 0) return null;
+    const actorLoopId = this.foregroundPersonalLoopId(
+      world.id,
+      input.actor_pet_id,
+      timestamp,
+    );
+    const targetBindings = targets.flatMap((target) => {
+      const personalLoopId = this.foregroundPersonalLoopId(
+        world.id,
+        target.petId,
+        timestamp,
+      );
+      return personalLoopId ? [{ ...target, personalLoopId }] : [];
+    });
+    if (!actorLoopId || targetBindings.length === 0) return null;
+
+    // Continue an already active causal encounter instead of creating one
+    // Scene per turn between the same participants.
+    const reusableScenes = this.db.prepare(`
+      SELECT scene.* FROM world_scenes scene
+      JOIN world_scene_participants self ON self.scene_id = scene.id
+      WHERE scene.space_id = ? AND scene.status IN ('forming', 'active')
+        AND self.pet_id = ? AND self.status = 'active'
+      ORDER BY scene.updated_at DESC, scene.id ASC
+    `).all(world.id, input.actor_pet_id);
+    const reusable = reusableScenes.find((scene) => {
+      const members = new Set(
+        this.db.prepare(`
+          SELECT pet_id FROM world_scene_participants
+          WHERE scene_id = ? AND status = 'active'
+        `).all(scene.id).map((row) => row.pet_id),
+      );
+      return targetBindings.every((target) => members.has(target.petId));
+    });
+    if (reusable) {
+      this.db.prepare(`
+        UPDATE world_events SET scene_id = ?
+        WHERE space_id = ? AND (id = ? OR causation_event_id = ?)
+      `).run(
+        reusable.id,
+        world.id,
+        input.intent_event_id,
+        input.intent_event_id,
+      );
+      this.db.prepare(`
+        UPDATE world_scenes
+        SET interaction_policy = COALESCE(?, interaction_policy), updated_at = ?
+        WHERE id = ?
+      `).run(validatedPolicy, timestamp, reusable.id);
+      if (validatedPolicy) reusable.interaction_policy = validatedPolicy;
+      return reusable;
+    }
+    const interactionPolicy = validatedPolicy ?? "flexible";
+    const sceneId = `scene:${stableLoopKey(world.id, input.id)}`;
+    const actorName = this.db.prepare(
+      `SELECT ${this.petNameColumn} AS name FROM pets WHERE id = ?`,
+    ).get(input.actor_pet_id)?.name ?? "世界成员";
+    const targetNames = targetBindings.map((target) =>
+      this.db.prepare(
+        `SELECT ${this.petNameColumn} AS name FROM pets WHERE id = ?`,
+      ).get(target.petId)?.name ?? "世界成员"
+    );
+    this.db.prepare(`
+      INSERT OR IGNORE INTO world_scenes (
+        id, space_id, status, interaction_policy, title,
+        shared_context_json, source_input_id, source_event_id,
+        created_at, activated_at, updated_at
+      ) VALUES (?, ?, 'forming', ?, ?, ?, ?, ?, ?, NULL, ?)
+    `).run(
+      sceneId,
+      world.id,
+      interactionPolicy,
+      `${actorName}与${targetNames.join("、")}的交汇`,
+      JSON.stringify({
+        contract_version: 1,
+        trigger_kinds: [...new Set(targetBindings.map((item) => item.evidence))],
+        event_type: input.event_type,
+        automatic_presence_intersection: false,
+      }),
+      input.id,
+      input.intent_event_id,
+      timestamp,
+      timestamp,
+    );
+    this.db.prepare(`
+      INSERT OR IGNORE INTO world_scene_participants (
+        scene_id, space_id, pet_id, personal_loop_id, role, status,
+        joined_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'initiator', 'active', ?, ?)
+    `).run(
+      sceneId,
+      world.id,
+      input.actor_pet_id,
+      actorLoopId,
+      timestamp,
+      timestamp,
+    );
+    for (const target of targetBindings) {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO world_scene_participants (
+          scene_id, space_id, pet_id, personal_loop_id, role, status,
+          joined_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+      `).run(
+        sceneId,
+        world.id,
+        target.petId,
+        target.personalLoopId,
+        target.role,
+        timestamp,
+        timestamp,
+      );
+      const [sourceLoopId, targetLoopId] =
+        actorLoopId < target.personalLoopId
+          ? [actorLoopId, target.personalLoopId]
+          : [target.personalLoopId, actorLoopId];
+      const edgeId = `loop-edge:${stableLoopKey(
+        world.id,
+        sourceLoopId,
+        targetLoopId,
+        "intersection_candidate",
+      )}`;
+      this.db.prepare(`
+        INSERT INTO world_loop_edges (
+          id, space_id, source_loop_id, target_loop_id, relation_type,
+          status, visibility, contract_json, created_by_input_id,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'intersection_candidate', 'active',
+          'participants', ?, ?, ?, ?)
+        ON CONFLICT(source_loop_id, target_loop_id, relation_type) DO UPDATE SET
+          status = 'active', contract_json = excluded.contract_json,
+          created_by_input_id = excluded.created_by_input_id,
+          updated_at = excluded.updated_at
+      `).run(
+        edgeId,
+        world.id,
+        sourceLoopId,
+        targetLoopId,
+        JSON.stringify({
+          contract_version: 1,
+          materialized_as: "scene",
+          scene_id: sceneId,
+          scene_policy: interactionPolicy,
+          automatic_presence_intersection: false,
+        }),
+        input.id,
+        timestamp,
+        timestamp,
+      );
+    }
+    this.db.prepare(`
+      UPDATE world_scenes
+      SET status = 'active', activated_at = COALESCE(activated_at, ?),
+        updated_at = ?
+      WHERE id = ? AND status = 'forming'
+        AND (SELECT COUNT(*) FROM world_scene_participants
+             WHERE scene_id = ? AND status = 'active') >= 2
+    `).run(timestamp, timestamp, sceneId, sceneId);
+    this.db.prepare(`
+      UPDATE world_events SET scene_id = ?
+      WHERE space_id = ? AND (id = ? OR causation_event_id = ?)
+    `).run(sceneId, world.id, input.intent_event_id, input.intent_event_id);
+    return this.db.prepare("SELECT * FROM world_scenes WHERE id = ?").get(sceneId);
+  }
+
+  applyWorldSceneTransition({
+    world,
+    input,
+    judgementResult,
+    fallbackSceneId = null,
+    timestamp = now(),
+  }) {
+    const transition = judgementResult.scene_transition;
+    if (transition === undefined || transition === null) return null;
+    const reject = (message, details = {}) =>
+      fail("INVALID_SCENE_TRANSITION", message, {
+        input_id: input.id,
+        requested_transition: transition,
+        ...details,
+      });
+    if (typeof transition !== "object" || Array.isArray(transition)) {
+      reject("Scene transition must be an object.");
+    }
+    const declaredSceneId =
+      typeof transition.scene_id === "string" && transition.scene_id.trim()
+        ? transition.scene_id.trim()
+        : null;
+    const inputSceneId = parseJsonObject(input.data_json).scene_id ?? null;
+    const authorizedSceneId = inputSceneId ?? fallbackSceneId;
+    if (!authorizedSceneId) {
+      reject("A Scene transition requires a server-validated Scene binding.");
+    }
+    if (declaredSceneId && declaredSceneId !== authorizedSceneId) {
+      reject("The requested Scene does not match the input's validated Scene.", {
+        authorized_scene_id: authorizedSceneId,
+      });
+    }
+    const sceneId = authorizedSceneId;
+    const nextStatus = transition.to_status ?? transition.status;
+    if (!["forming", "active", "resolved", "closed"].includes(nextStatus)) {
+      reject("Scene transition has an unsupported target status.");
+    }
+    const scene = this.db.prepare(`
+      SELECT scene.* FROM world_scenes scene
+      JOIN world_scene_participants participant ON participant.scene_id = scene.id
+      WHERE scene.id = ? AND scene.space_id = ? AND participant.pet_id = ?
+    `).get(sceneId, world.id, input.actor_pet_id);
+    if (!scene) reject("The validated Scene is not available to this actor.");
+    const allowed = {
+      forming: new Set(["active", "resolved", "closed"]),
+      active: new Set(["resolved", "closed"]),
+      resolved: new Set(["closed"]),
+      closed: new Set(),
+    };
+    if (scene.status === nextStatus || !allowed[scene.status]?.has(nextStatus)) {
+      reject("Scene transition is not a legal monotonic lifecycle step.", {
+        current_status: scene.status,
+        requested_status: nextStatus,
+      });
+    }
+    const updated = this.db.prepare(`
+      UPDATE world_scenes SET status = ?,
+        activated_at = CASE WHEN ? = 'active' THEN COALESCE(activated_at, ?) ELSE activated_at END,
+        resolved_by_input_id = CASE WHEN ? IN ('resolved', 'closed') THEN ? ELSE resolved_by_input_id END,
+        resolved_at = CASE WHEN ? IN ('resolved', 'closed') THEN COALESCE(resolved_at, ?) ELSE resolved_at END,
+        closed_at = CASE WHEN ? = 'closed' THEN COALESCE(closed_at, ?) ELSE closed_at END,
+        updated_at = ?
+      WHERE id = ? AND status = ?
+    `).run(
+      nextStatus,
+      nextStatus,
+      timestamp,
+      nextStatus,
+      input.id,
+      nextStatus,
+      timestamp,
+      nextStatus,
+      timestamp,
+      timestamp,
+      scene.id,
+      scene.status,
+    );
+    if (updated.changes !== 1) {
+      reject("Scene changed before the requested transition could be applied.");
+    }
+    return {
+      status: "applied",
+      requested_transition: transition,
+      applied_scene_id: scene.id,
+      from_status: scene.status,
+      to_status: nextStatus,
+      reason: "validated_and_committed",
+    };
+  }
+
+  worldLoopContext(spaceId, petId, timestamp = now()) {
+    this.ensureWorldStoryLoops(spaceId, petId, timestamp);
+    const memberRows = this.db.prepare(`
+      SELECT loop.*,
+        participant.pet_id AS participant_pet_id,
+        participant.role AS participant_role,
+        participant.status AS participant_status,
+        participant.is_foreground,
+        participant.private_context_json,
+        participant.joined_at
+      FROM world_loop_participants participant
+      JOIN world_story_loops loop ON loop.id = participant.loop_id
+      WHERE participant.space_id = ? AND participant.pet_id = ?
+      ORDER BY participant.is_foreground DESC, loop.updated_at DESC, loop.id ASC
+    `).all(spaceId, petId);
+    const memberLoops = memberRows.map(storyLoopView);
+    const foregroundLoop =
+      memberLoops.find(
+        (loop) =>
+          loop.participation?.is_foreground &&
+          loop.status === "active" &&
+          loop.participation.status === "active",
+      ) ?? null;
+    const publicRows = this.db.prepare(`
+      SELECT loop.* FROM world_story_loops loop
+      WHERE loop.space_id = ? AND loop.visibility = 'world'
+        AND loop.scope IN ('public', 'world') AND loop.status = 'active'
+        AND NOT EXISTS (
+          SELECT 1 FROM world_loop_participants participant
+          WHERE participant.loop_id = loop.id AND participant.pet_id = ?
+        )
+      ORDER BY loop.updated_at DESC, loop.id ASC
+      LIMIT 12
+    `).all(spaceId, petId);
+    const visibleLoopIds = new Set(memberLoops.map((loop) => loop.id));
+    const edgeRows = visibleLoopIds.size === 0
+      ? []
+      : this.db.prepare(`
+          SELECT edge.* FROM world_loop_edges edge
+          WHERE edge.space_id = ?
+            AND edge.source_loop_id IN (${[...visibleLoopIds].map(() => "?").join(",")})
+            AND edge.target_loop_id IN (${[...visibleLoopIds].map(() => "?").join(",")})
+          ORDER BY edge.updated_at DESC, edge.id ASC
+          LIMIT 20
+        `).all(spaceId, ...visibleLoopIds, ...visibleLoopIds);
+    return {
+      contract_version: 1,
+      foreground_loop: foregroundLoop,
+      active_loops: memberLoops.filter(
+        (loop) =>
+          loop.status === "active" && loop.participation?.status === "active",
+      ),
+      suspended_loops: memberLoops.filter(
+        (loop) =>
+          loop.status === "suspended" ||
+          loop.participation?.status === "suspended",
+      ),
+      completed_loops: memberLoops
+        .filter(
+          (loop) =>
+            loop.status === "completed" ||
+            loop.participation?.status === "completed",
+        )
+        .slice(0, 8),
+      public_opportunities: publicRows.map(storyLoopView),
+      current_scenes: this.activeWorldScenes(spaceId, petId),
+      intersection: {
+        contract_version: 1,
+        materialize_as: "scene",
+        automatic_presence_intersection: false,
+        candidates: edgeRows.map((edge) => ({
+          id: edge.id,
+          source_loop_id: edge.source_loop_id,
+          target_loop_id: edge.target_loop_id,
+          relation_type: edge.relation_type,
+          status: edge.status,
+          contract: parseJsonObject(edge.contract_json),
+          created_by_input_id: edge.created_by_input_id ?? null,
+        })),
+      },
+      privacy_scope:
+        "actor-owned and actor-participating Loops, plus world-visible public opportunities; other Characters' private Loops are excluded",
+    };
+  }
+
+  worldResumeBundle(spaceId, petId, timestamp = now()) {
+    const journey = this.worldMemberJourney(spaceId, petId);
+    const loopContext = this.worldLoopContext(spaceId, petId, timestamp);
+    return {
+      contract_version: 1,
+      resume_kind: loopContext.foreground_loop ? "continue" : "choose",
+      foreground_loop: loopContext.foreground_loop,
+      context_summary: journey.context_summary,
+      suggested_actions: journey.suggested_actions,
+      active_branch_count: Math.max(0, loopContext.active_loops.length - 1),
+      suspended_branch_count: loopContext.suspended_loops.length,
+      relevant_updates: this.worldRelevantUpdates(spaceId, petId),
+      automatic_context: true,
+      loop_context: loopContext,
+    };
+  }
+
+  worldRelevantUpdates(spaceId, petId, limit = 20) {
+    const available = Number(
+      this.db.prepare(`
+        SELECT COUNT(*) AS count FROM sqlite_master
+        WHERE type = 'table' AND name IN ('events', 'event_receipts')
+      `).get().count,
+    ) === 2;
+    if (!available) return [];
+    const deliveryMode = this.db.prepare(`
+      SELECT delivery_mode FROM spaces WHERE id = ?
+    `).get(spaceId)?.delivery_mode ?? "legacy_broadcast";
+    const rows = this.db.prepare(`
+      SELECT event.*, receipt.delivered_at, receipt.displayed_at, receipt.read_at
+      FROM events event
+      LEFT JOIN event_receipts receipt
+        ON receipt.event_id = event.id AND receipt.device_id = ?
+      WHERE event.pet_id = ?
+        AND event.event_type IN ('world.event_committed', 'world.interaction_opened')
+        AND json_extract(event.payload_json, '$.worldId') = ?
+        AND COALESCE(json_extract(event.payload_json, '$.relevance'), '')
+          IN ('direct', 'contextual', 'collective',
+            CASE WHEN ? = 'legacy_broadcast' THEN 'legacy' ELSE '' END)
+        AND receipt.displayed_at IS NULL
+        AND receipt.read_at IS NULL
+      ORDER BY event.id ASC
+      LIMIT ?
+    `).all(
+      this.principalSessionId,
+      petId,
+      spaceId,
+      deliveryMode,
+      Math.max(1, Math.min(limit, 50)),
+    );
+    return rows.map((row) => {
+      const payload = parseJsonObject(row.payload_json);
+      const directed =
+        payload.targetCharacterId === petId && payload.inputBodyText;
+      return {
+        event_id: `evt_${row.id}`,
+        event_type: row.event_type,
+        summary: directed
+          ? `${payload.actorName ?? "世界成员"}对你说：${payload.inputBodyText}`
+          : payload.outcomeText ??
+            payload.promptText ??
+            payload.inputBodyText ??
+            "与你当前经历相关的世界发生了变化。",
+        relevance: payload.relevance,
+        relevance_reason: payload.relevanceReason ?? "world_story_update",
+        delivery_policy: payload.deliveryPolicy ?? "ambient",
+        action_required: payload.actionRequired === true,
+        actor: payload.actorCharacterId
+          ? {
+              id: payload.actorCharacterId,
+              name: payload.actorName ?? "世界成员",
+            }
+          : null,
+        target_character_id: payload.targetCharacterId ?? null,
+        input_id: payload.inputId ?? null,
+        outcome_event_id: payload.outcomeEventId ?? null,
+        world_state_version: payload.worldStateVersion ?? null,
+        interaction_id: payload.interactionId ?? null,
+        prompt_event_id: payload.promptEventId ?? null,
+        reply_to_event_id:
+          row.event_type === "world.interaction_opened"
+            ? payload.promptEventId ?? null
+            : null,
+        scene_id: payload.sceneId ?? null,
+        interaction_mode: payload.interactionMode ?? null,
+        interaction_quorum: payload.interactionQuorum ?? null,
+        interaction_closes_at: payload.interactionClosesAt ?? null,
+        created_at: row.created_at,
+        delivery: {
+          state: row.read_at != null
+            ? "read"
+            : row.displayed_at != null
+              ? "displayed"
+              : row.delivered_at != null
+                ? "delivered"
+                : "queued",
+        },
+      };
+    });
+  }
+
+  applyAuthoritativeWorldLoopTransitions({
+    world,
+    input,
+    judgement,
+    judgementResult,
+    openedHooks = [],
+    timestamp = now(),
+  }) {
+    if (!judgement || judgement.decision !== "accepted" || !input.actor_pet_id) {
+      return;
+    }
+    const petId = input.actor_pet_id;
+    const openedByTitle = new Map();
+    for (const title of openedHooks) {
+      const normalizedTitle = title.trim().slice(0, 500);
+      const loop = this.insertWorldStoryLoop({
+        spaceId: world.id,
+        ownerPetId: petId,
+        title: normalizedTitle,
+        sourceKind: "host",
+        sourceKey: `${input.id}:hook:${stableLoopKey(normalizedTitle)}`,
+        context: { opened_by_host: true },
+        intersectionContract: {
+          version: 1,
+          materialize_as: "scene",
+          requires_causal_overlap: true,
+          automatic_presence_intersection: false,
+        },
+        openedByInputId: input.id,
+        timestamp,
+      });
+      this.db.prepare(`
+        INSERT OR IGNORE INTO world_loop_participants (
+          loop_id, space_id, pet_id, role, status, is_foreground,
+          private_context_json, joined_at, updated_at
+        ) VALUES (?, ?, ?, 'owner', 'active', 0, '{}', ?, ?)
+      `).run(loop.id, world.id, petId, timestamp, timestamp);
+      openedByTitle.set(normalizedTitle, loop.id);
+    }
+    this.ensureWorldStoryLoops(world.id, petId, timestamp);
+
+    // Materialize only server-authorized Scene participants first. The whole
+    // caller transaction rolls this back if the declared Loop transition is
+    // invalid, so a rejected Host contract cannot leave a partial Scene.
+    const materializedScene = this.materializeWorldSceneFromJudgement({
+      world,
+      input,
+      judgementResult,
+      timestamp,
+    });
+    if (judgement.outcome_event_id) {
+      refreshWorldDeliveryRecipientSnapshot(
+        this.db,
+        judgement.outcome_event_id,
+      );
+    }
+
+    const declared = Array.isArray(judgementResult.loop_transitions)
+      ? judgementResult.loop_transitions
+      : judgementResult.loop_transition &&
+          typeof judgementResult.loop_transition === "object" &&
+          !Array.isArray(judgementResult.loop_transition)
+        ? [judgementResult.loop_transition]
+        : [];
+    if (declared.length > 20) {
+      fail("INVALID_LOOP_TRANSITION", "A judgement may apply at most 20 Loop transitions.");
+    }
+    if (declared.length === 0) {
+      const sceneReceipt = this.applyWorldSceneTransition({
+        world,
+        input,
+        judgementResult,
+        fallbackSceneId: materializedScene?.id ?? null,
+        timestamp,
+      });
+      this.ensureWorldStoryLoops(world.id, petId, timestamp);
+      return { status: "not_requested", receipts: [], sceneReceipt };
+    }
+    const receipts = [];
+    const rejectTransition = (message, index, candidate) =>
+      fail("INVALID_LOOP_TRANSITION", message, {
+        input_id: input.id,
+        transition_index: index,
+        requested_transition: candidate,
+      });
+    const allowedActions = new Set([
+      "continue",
+      "open",
+      "suspend",
+      "resume",
+      "complete",
+      "intersect",
+    ]);
+    const memberLoop = (loopId) =>
+      this.db.prepare(`
+        SELECT loop.* FROM world_story_loops loop
+        JOIN world_loop_participants participant ON participant.loop_id = loop.id
+        WHERE loop.id = ? AND loop.space_id = ? AND participant.pet_id = ?
+      `).get(loopId, world.id, petId);
+    const sceneRelatedLoop = (loopId) =>
+      this.db.prepare(`
+        SELECT target_loop.*
+        FROM world_scene_participants self
+        JOIN world_scene_participants peer ON peer.scene_id = self.scene_id
+        JOIN world_scenes scene ON scene.id = self.scene_id
+        JOIN world_story_loops target_loop ON target_loop.id = peer.personal_loop_id
+        WHERE self.space_id = ? AND self.pet_id = ?
+          AND self.status = 'active' AND peer.status = 'active'
+          AND scene.status IN ('forming', 'active', 'resolved')
+          AND target_loop.id = ? AND target_loop.space_id = ?
+        LIMIT 1
+      `).get(world.id, petId, loopId, world.id);
+    const foregroundId = () =>
+      this.db.prepare(`
+        SELECT loop_id FROM world_loop_participants
+        WHERE space_id = ? AND pet_id = ? AND status = 'active'
+          AND is_foreground = 1
+        LIMIT 1
+      `).get(world.id, petId)?.loop_id ?? null;
+
+    for (const [index, candidate] of declared.slice(0, 20).entries()) {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+        rejectTransition("Loop transition must be an object.", index, candidate);
+      }
+      if (candidate.contract_version !== 1) {
+        rejectTransition("Unsupported Loop transition contract version.", index, candidate);
+      }
+      const declaredScope = candidate.scope;
+      if (
+        !["personal", "public", "world"].includes(declaredScope)
+      ) rejectTransition("Unsupported persisted Story Loop scope.", index, candidate);
+      const declaredAction = candidate.transition ?? candidate.action;
+      const action = typeof declaredAction === "string"
+        ? declaredAction.trim()
+        : "";
+      if (!allowedActions.has(action)) {
+        rejectTransition("Unsupported Story Loop transition.", index, candidate);
+      }
+      const fromPhase =
+        typeof candidate.from_phase === "string" ? candidate.from_phase.trim() : "";
+      const toPhase =
+        typeof (candidate.to_phase ?? candidate.phase) === "string"
+          ? (candidate.to_phase ?? candidate.phase).trim().slice(0, 120)
+          : "";
+      const reason =
+        typeof candidate.reason === "string" ? candidate.reason.trim().slice(0, 500) : "";
+      if (!fromPhase || !toPhase || !reason) {
+        rejectTransition(
+          "Loop transition requires from_phase, to_phase, and reason.",
+          index,
+          candidate,
+        );
+      }
+      let loopId =
+        typeof candidate.loop_id === "string" ? candidate.loop_id.trim() : "";
+
+      if (action === "open") {
+        if (declaredScope !== "personal") {
+          rejectTransition("Only personal Story Loops can be opened by an actor turn.", index, candidate);
+        }
+        const title =
+          typeof candidate.title === "string"
+            ? candidate.title.trim().slice(0, 500)
+            : typeof candidate.reason === "string"
+              ? candidate.reason.trim().slice(0, 500)
+              : "";
+        if (!title) rejectTransition("Opening a Loop requires a title.", index, candidate);
+        loopId = openedByTitle.get(title) ?? "";
+        if (!loopId) {
+          loopId = this.db.prepare(`
+            SELECT loop.id FROM world_story_loops loop
+            JOIN world_loop_participants participant
+              ON participant.loop_id = loop.id
+            WHERE loop.space_id = ? AND loop.owner_pet_id = ?
+              AND loop.scope = 'personal' AND loop.title = ?
+              AND loop.status = 'active' AND participant.pet_id = ?
+              AND participant.status = 'active'
+            ORDER BY loop.updated_at DESC, loop.id ASC
+            LIMIT 1
+          `).get(world.id, petId, title, petId)?.id ?? "";
+        }
+        if (!loopId) {
+          const loop = this.insertWorldStoryLoop({
+            spaceId: world.id,
+            ownerPetId: petId,
+            title,
+            phase: toPhase,
+            sourceKind: "host",
+            sourceKey: `${input.id}:transition:${index}:${stableLoopKey(title)}`,
+            context:
+              candidate.context &&
+              typeof candidate.context === "object" &&
+              !Array.isArray(candidate.context)
+                ? candidate.context
+                : {},
+            intersectionContract: {
+              version: 1,
+              materialize_as: "scene",
+              requires_causal_overlap: true,
+              automatic_presence_intersection: false,
+            },
+            openedByInputId: input.id,
+            timestamp,
+          });
+          loopId = loop.id;
+          this.db.prepare(`
+            INSERT OR IGNORE INTO world_loop_participants (
+              loop_id, space_id, pet_id, role, status, is_foreground,
+              private_context_json, joined_at, updated_at
+            ) VALUES (?, ?, ?, 'owner', 'active', 0, '{}', ?, ?)
+          `).run(loop.id, world.id, petId, timestamp, timestamp);
+        }
+        this.db.prepare(`
+          UPDATE world_story_loops SET phase = ?, updated_at = ? WHERE id = ?
+        `).run(toPhase, timestamp, loopId);
+        if (candidate.foreground === true || !foregroundId()) {
+          this.setForegroundWorldStoryLoop(world.id, petId, loopId, timestamp);
+        }
+        receipts.push({
+          status: "applied",
+          requested_transition: candidate,
+          applied_loop_id: loopId,
+          applied_transition: action,
+          reason: "validated_and_committed",
+        });
+        continue;
+      }
+
+      if (!loopId) rejectTransition("Loop transition requires loop_id.", index, candidate);
+      const loop = loopId ? memberLoop(loopId) : null;
+      if (!loop) rejectTransition("The requested Loop is not available to this actor.", index, candidate);
+      if (declaredScope !== loop.scope) {
+        rejectTransition("The requested Loop scope does not match persisted state.", index, candidate);
+      }
+      if (fromPhase !== loop.phase) {
+        rejectTransition("The requested Loop phase is stale.", index, candidate);
+      }
+
+      if (action === "continue") {
+        const currentContext = parseJsonObject(loop.context_json);
+        const nextContext =
+          candidate.context &&
+          typeof candidate.context === "object" &&
+          !Array.isArray(candidate.context)
+            ? { ...currentContext, ...candidate.context }
+            : currentContext;
+        this.db.prepare(`
+          UPDATE world_story_loops
+          SET phase = ?, context_json = ?, updated_at = ?
+          WHERE id = ?
+        `).run(toPhase, JSON.stringify(nextContext), timestamp, loop.id);
+        this.setForegroundWorldStoryLoop(world.id, petId, loop.id, timestamp);
+        receipts.push({ status: "applied", requested_transition: candidate, applied_loop_id: loop.id, applied_transition: action, reason: "validated_and_committed" });
+        continue;
+      }
+
+      if (action === "suspend") {
+        this.db.prepare(`
+          UPDATE world_loop_participants
+          SET status = 'suspended', is_foreground = 0, updated_at = ?
+          WHERE loop_id = ? AND pet_id = ?
+        `).run(timestamp, loop.id, petId);
+        if (loop.scope === "personal" && loop.owner_pet_id === petId) {
+          this.db.prepare(`
+            UPDATE world_story_loops
+            SET status = 'suspended', phase = ?, updated_at = ? WHERE id = ?
+          `).run(
+            toPhase,
+            timestamp,
+            loop.id,
+          );
+        }
+        receipts.push({ status: "applied", requested_transition: candidate, applied_loop_id: loop.id, applied_transition: action, reason: "validated_and_committed" });
+        continue;
+      }
+
+      if (action === "resume") {
+        if (loop.scope === "personal" && loop.owner_pet_id === petId) {
+          this.db.prepare(`
+            UPDATE world_story_loops
+            SET status = 'active', completed_by_input_id = NULL,
+              completed_at = NULL, phase = ?, updated_at = ?
+            WHERE id = ?
+          `).run(
+            toPhase,
+            timestamp,
+            loop.id,
+          );
+        }
+        this.db.prepare(`
+          UPDATE world_loop_participants
+          SET status = 'active', completed_at = NULL, updated_at = ?
+          WHERE loop_id = ? AND pet_id = ?
+        `).run(timestamp, loop.id, petId);
+        this.setForegroundWorldStoryLoop(world.id, petId, loop.id, timestamp);
+        receipts.push({ status: "applied", requested_transition: candidate, applied_loop_id: loop.id, applied_transition: action, reason: "validated_and_committed" });
+        continue;
+      }
+
+      if (action === "complete") {
+        this.db.prepare(`
+          UPDATE world_loop_participants
+          SET status = 'completed', is_foreground = 0,
+            completed_at = COALESCE(completed_at, ?), updated_at = ?
+          WHERE loop_id = ? AND pet_id = ?
+        `).run(timestamp, timestamp, loop.id, petId);
+        if (loop.scope === "personal" && loop.owner_pet_id === petId) {
+          this.db.prepare(`
+            UPDATE world_story_loops
+            SET status = 'completed', completed_by_input_id = ?,
+              completed_at = COALESCE(completed_at, ?), phase = ?, updated_at = ?
+            WHERE id = ?
+          `).run(
+            input.id,
+            timestamp,
+            toPhase,
+            timestamp,
+            loop.id,
+          );
+        }
+        receipts.push({ status: "applied", requested_transition: candidate, applied_loop_id: loop.id, applied_transition: action, reason: "validated_and_committed" });
+        continue;
+      }
+
+      if (action === "intersect") {
+        const targetLoopId =
+          typeof candidate.target_loop_id === "string"
+            ? candidate.target_loop_id.trim()
+            : "";
+        if (!targetLoopId || targetLoopId === loop.id) {
+          rejectTransition("Intersection requires a distinct target_loop_id.", index, candidate);
+        }
+        let target = memberLoop(targetLoopId) ?? sceneRelatedLoop(targetLoopId);
+        if (!target) {
+          target = this.db.prepare(`
+            SELECT * FROM world_story_loops
+            WHERE id = ? AND space_id = ? AND visibility = 'world'
+              AND scope IN ('public', 'world') AND status = 'active'
+          `).get(targetLoopId, world.id);
+          if (target) {
+            this.db.prepare(`
+              INSERT OR IGNORE INTO world_loop_participants (
+                loop_id, space_id, pet_id, role, status, is_foreground,
+                private_context_json, joined_at, updated_at
+              ) VALUES (?, ?, ?, 'participant', 'active', 0, '{}', ?, ?)
+            `).run(target.id, world.id, petId, timestamp, timestamp);
+          }
+        }
+        if (!target) {
+          rejectTransition("Intersection target is not related by a verified Scene or public opportunity.", index, candidate);
+        }
+        const matchingEntities = Array.isArray(candidate.matching_entities)
+          ? candidate.matching_entities
+              .filter((item) => typeof item === "string" && item.trim())
+              .map((item) => item.trim().slice(0, 160))
+              .slice(0, 20)
+          : [];
+        const scenePolicy = ["async", "sync", "flexible"].includes(
+          candidate.scene_policy,
+        )
+          ? candidate.scene_policy
+          : "flexible";
+        const sourceLoopId = loop.id;
+        const edgeId = `loop-edge:${stableLoopKey(
+          world.id,
+          sourceLoopId,
+          target.id,
+          "intersection_candidate",
+        )}`;
+        this.db.prepare(`
+          INSERT OR IGNORE INTO world_loop_edges (
+            id, space_id, source_loop_id, target_loop_id, relation_type,
+            status, visibility, contract_json, created_by_input_id,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, 'intersection_candidate', 'proposed',
+            'participants', ?, ?, ?, ?)
+        `).run(
+          edgeId,
+          world.id,
+          sourceLoopId,
+          target.id,
+          JSON.stringify({
+            contract_version: 1,
+            materialize_as: "scene",
+            scene_creation: "deferred",
+            requires_world_host_authority: true,
+            reason,
+            matching_entities: matchingEntities,
+            scene_policy: scenePolicy,
+          }),
+          input.id,
+          timestamp,
+          timestamp,
+        );
+        receipts.push({ status: "applied", requested_transition: candidate, applied_loop_id: loop.id, applied_transition: action, target_loop_id: target.id, reason: "validated_and_committed" });
+      }
+    }
+    const sceneReceipt = this.applyWorldSceneTransition({
+      world,
+      input,
+      judgementResult,
+      fallbackSceneId: materializedScene?.id ?? null,
+      timestamp,
+    });
+    this.ensureWorldStoryLoops(world.id, petId, timestamp);
+    return { status: "applied", receipts, sceneReceipt };
+  }
+
   normalizeStoredHostChoices(value) {
     if (!Array.isArray(value)) return [];
     return value.slice(0, 6).flatMap((item, index) => {
@@ -7834,6 +9481,10 @@ export class SocialService {
           item.data && typeof item.data === "object" && !Array.isArray(item.data)
             ? JSON.parse(JSON.stringify(item.data))
             : {},
+        scene_id:
+          typeof item.scene_id === "string" && item.scene_id.trim()
+            ? item.scene_id.trim().slice(0, 100)
+            : null,
         visibility: EVENT_VISIBILITIES.has(item.visibility)
           ? item.visibility
           : "world",
@@ -7895,7 +9546,8 @@ export class SocialService {
       configured_mode: policy.mode,
       current_mode: currentMode,
       world_state_scope: "shared",
-      participation_style: multiplayerPresent ? "co_present" : "independent",
+      // Presence is a transport hint, not evidence that two stories intersect.
+      participation_style: "independent_until_causal_intersection",
       present_count: liveContext.present_count,
       member_count: liveContext.member_count,
       solo_enabled: policy.solo_enabled,
@@ -7908,7 +9560,7 @@ export class SocialService {
       response_optional: true,
       consenting_peer_count: 0,
       consent_required: false,
-      multiplayer_ready: directInteractionAvailable,
+      multiplayer_ready: false,
       multiplayer_available:
         multiplayerPresent && policy.multiplayer_enabled,
       blocked_waiting_for_members: currentMode === "waiting",
@@ -7965,8 +9617,50 @@ export class SocialService {
       0,
       Number(normalizedOptions.afterSequence) || 0,
     );
-    const events = this.db
-      .prepare(`
+    const events = (petId
+      ? this.db
+          .prepare(`
+        SELECT body_text
+        FROM world_events event
+        WHERE event.space_id = ? AND event.sequence > ?
+          AND (event.event_class = 'outcome' OR event.event_type = 'trigger.fired')
+          AND event.body_text <> ''
+          AND (
+            event.actor_pet_id = ?
+            OR (event.visibility = 'actor' AND event.audience_pet_id = ?)
+            OR (
+              event.actor_type IN ('world', 'system')
+              AND event.visibility = 'world'
+              AND event.scene_id IS NULL
+              AND (
+                event.causation_event_id IS NULL
+                OR EXISTS (
+                  SELECT 1 FROM world_events cause
+                  WHERE cause.id = event.causation_event_id
+                    AND (
+                      cause.actor_pet_id = ?
+                      OR cause.actor_type IN ('world', 'system')
+                    )
+                )
+              )
+            )
+            OR (
+              event.scene_id IS NOT NULL
+              AND event.visibility = 'world'
+              AND EXISTS (
+                SELECT 1 FROM world_scene_participants scene_member
+                WHERE scene_member.scene_id = event.scene_id
+                  AND scene_member.pet_id = ?
+                  AND scene_member.status IN ('invited', 'active')
+              )
+            )
+          )
+        ORDER BY event.sequence DESC
+        LIMIT ?
+      `)
+          .all(spaceId, afterSequence, petId, petId, petId, petId, bounded)
+      : this.db
+          .prepare(`
         SELECT body_text
         FROM world_events
         WHERE space_id = ? AND sequence > ?
@@ -7979,7 +9673,7 @@ export class SocialService {
         ORDER BY sequence DESC
         LIMIT ?
       `)
-      .all(spaceId, afterSequence, petId, bounded)
+          .all(spaceId, afterSequence, null, bounded))
       .map((row) => row.body_text.trim())
       .filter(Boolean)
       .reverse();
@@ -8072,7 +9766,7 @@ export class SocialService {
     );
     const objective =
       config.facilitation_policy.objective_text ||
-      "完成一次双方自愿的实时互动。";
+      "继续自己的剧情；只有出现明确邀请或因果交汇时，才进入共同场景。";
     for (const member of waitingMembers) {
       const latest = this.latestWorldHostGuidance(world.id, member.pet_id);
       if (latest?.kind !== "waiting") continue;
@@ -8093,7 +9787,7 @@ export class SocialService {
         petId: member.pet_id,
         kind: "setup",
         stage: "setup",
-        message: `${config.name}提示：${enteringPet.name}已经进入${world.name}，现在可以开始实时互动。`,
+        message: `${config.name}提示：世界中出现了可能与你产生交汇的角色。在线并不等于已经相遇；你可以继续自己的方向，或在收到明确邀请、发现因果联系后再回应。`,
         objective,
         contextSummary: this.worldContextSummary(
           world.id,
@@ -8105,7 +9799,7 @@ export class SocialService {
         choices,
         freeInputPrompt:
           config.onboarding_policy.free_input_prompt ||
-          "也可以直接开始你愿意进行的交流。",
+          "也可以直接继续你自己的行动。",
         timestamp,
       });
     }
@@ -8120,19 +9814,12 @@ export class SocialService {
       (item) => typeof item === "string" && item.trim(),
     );
     const worldState = this.worldStateView(world.id).value;
-    const unresolvedHooks =
-      worldState.tavern?.unresolved_hooks ?? worldState.unresolved_hooks ?? {};
-    const sharedOpenLoops =
-      unresolvedHooks &&
-      typeof unresolvedHooks === "object" &&
-      !Array.isArray(unresolvedHooks)
-        ? Object.values(unresolvedHooks)
-            .map((hook) =>
-              typeof hook === "string" ? hook : hook?.question,
-            )
-            .filter((item) => typeof item === "string" && item.trim())
-        : [];
-    const openLoops = [...new Set([...memberOpenLoops, ...sharedOpenLoops])];
+    const entryLoopContext = this.worldLoopContext(world.id, petId, timestamp);
+    const foregroundTitle = entryLoopContext.foreground_loop?.title;
+    const openLoops = [...new Set([
+      ...(foregroundTitle ? [foregroundTitle] : []),
+      ...memberOpenLoops,
+    ])];
     const onboarding = config.onboarding_policy;
     const facilitation = config.facilitation_policy;
     const recap = config.recap_policy;
@@ -8147,9 +9834,12 @@ export class SocialService {
     const independentVisit =
       liveContext.other_present_count === 0 &&
       config.participation_policy.solo_enabled;
-    const populationSummary = independentVisit
-      ? `当前只检测到你一个实时会话；本世界已有${liveContext.member_count}名真人成员。其他成员未保持实时心跳不代表他们没有加入。`
-      : `当前检测到${liveContext.present_count}个实时会话；本世界已有${liveContext.member_count}名真人成员。`;
+    const currentScenes = Array.isArray(entryLoopContext.current_scenes)
+      ? entryLoopContext.current_scenes
+      : [];
+    const intersectionSummary = currentScenes.length > 0
+      ? `你有${currentScenes.length}个尚可继续的交汇场景；只有当你明确回应其中一个场景时，才会推进共同剧情。`
+      : "";
     const stage = firstVisit ? "setup" : "returning";
     const kind = waitingForOthers
       ? "waiting"
@@ -8175,7 +9865,7 @@ export class SocialService {
       ? [
           `${config.name}${firstVisit ? "欢迎你来到" : "欢迎你回到"}${world.name}。`,
           firstVisit ? onboarding.welcome_text : "",
-          populationSummary,
+          intersectionSummary,
           onboarding.solo_message || "你可以先选择参与方向。",
           firstVisit ? spec.entry_prompt : "",
         ]
@@ -8189,7 +9879,7 @@ export class SocialService {
             openLoops.length > 0
               ? `当前未解目标：${openLoops.slice(-3).join("；")}`
               : "",
-            populationSummary,
+            intersectionSummary,
             independentVisit ? onboarding.solo_message : "",
             spec.entry_prompt,
           ]
@@ -8199,7 +9889,7 @@ export class SocialService {
             openLoops.length > 0
               ? `仍未解决：${openLoops.slice(-2).join("；")}`
               : "",
-            populationSummary,
+            intersectionSummary,
           ];
     const baseChoices = waitingForOthers
       ? this.normalizeStoredHostChoices(
@@ -8222,7 +9912,7 @@ export class SocialService {
       "也可以直接说你现在想做什么。";
     const objective = waitingForOthers
       ? onboarding.waiting_objective_text ||
-        "选择参与方向并等待其他实时在线成员。"
+        "先建立自己的方向；出现明确邀请或因果交汇时再决定是否回应。"
       : independentVisit && onboarding.solo_objective_text
         ? onboarding.solo_objective_text
       : facilitation.objective_text || "找到一个适合自己的参与方式。";
@@ -8272,6 +9962,7 @@ export class SocialService {
       ...guidance,
       host: config,
       journey: this.worldMemberJourney(world.id, petId),
+      loop_context: entryLoopContext,
       live_context: liveContext,
       participation_context: participationContext,
       director_plan: directorPlan,
@@ -8552,6 +10243,28 @@ export class SocialService {
         world.id,
         input.actor_pet_id,
       );
+    const loopApplication = this.applyAuthoritativeWorldLoopTransitions({
+      world,
+      input,
+      judgement,
+      judgementResult,
+      openedHooks,
+      timestamp,
+    });
+    if (
+      judgement &&
+      (loopApplication?.receipts?.length > 0 || loopApplication?.sceneReceipt)
+    ) {
+      const resultWithReceipt = {
+        ...judgementResult,
+        loop_transition_receipt: loopApplication.receipts[0],
+        loop_transition_receipts: loopApplication.receipts,
+        scene_transition_receipt: loopApplication.sceneReceipt ?? null,
+      };
+      this.db.prepare(`
+        UPDATE world_judgements SET result_json = ? WHERE id = ?
+      `).run(JSON.stringify(resultWithReceipt), judgement.id);
+    }
     const guidance = this.recordWorldHostTurn({
       world,
       petId: input.actor_pet_id,
@@ -8574,6 +10287,7 @@ export class SocialService {
       ...guidance,
       host: config,
       journey: this.worldMemberJourney(world.id, input.actor_pet_id),
+      loop_context: this.worldLoopContext(world.id, input.actor_pet_id),
       live_context: this.worldLiveContext(world.id, input.actor_pet_id),
       participation_context: this.worldParticipationContext(
         config,
@@ -8788,6 +10502,16 @@ export class SocialService {
     const normalizedResult = jsonObject(result, "judgement result");
     const targetId = targetPetId ?? input.actor_pet_id;
     if (targetId) this.requireActiveMembership(world.id, targetId);
+    if (targetId !== input.actor_pet_id) {
+      fail(
+        "CROSS_CHARACTER_STATE_FORBIDDEN",
+        "A World input may change only its own Character member state. Mutual or public consequences must be represented through World state, relationship effects, or a verified Scene.",
+        {
+          input_actor_pet_id: input.actor_pet_id,
+          requested_target_pet_id: targetId,
+        },
+      );
+    }
     const beforeWorld = this.worldStateView(world.id);
     const beforeMember = targetId
       ? this.worldMemberStateView(world.id, targetId)
@@ -8869,6 +10593,7 @@ export class SocialService {
     this.insertWorldEvent({
       id: outcomeId,
       spaceId: world.id,
+      sceneId: intent.scene_id ?? null,
       actorType: "world",
       eventClass: "outcome",
       eventType: `outcome.${normalizedDecision}`,
@@ -8894,6 +10619,22 @@ export class SocialService {
       specVersion: input.spec_version,
       timestamp,
     });
+    if (!input.interaction_id) {
+      enqueueWorldDelivery(this.db, {
+        worldId: world.id,
+        sourceWorldEventId: outcomeId,
+        eventType: "world.event_committed",
+        dedupeKey: `world:${world.id}:event-committed:${outcomeId}`,
+        envelope: {
+          inputId: input.id,
+          sceneId: intent.scene_id ?? null,
+          outcomeEventId: outcomeId,
+          visibility: normalizedOutcomeVisibility,
+          actorPetId: input.actor_pet_id,
+        },
+        timestamp,
+      });
+    }
     const judgementId = randomUUID();
     this.db
       .prepare(`
@@ -8977,6 +10718,7 @@ export class SocialService {
   insertWorldEvent({
     id = randomUUID(),
     spaceId,
+    sceneId = null,
     actorType,
     actorPetId = null,
     eventClass,
@@ -8994,14 +10736,15 @@ export class SocialService {
     this.db
       .prepare(`
         INSERT INTO world_events (
-          id, space_id, actor_type, actor_pet_id, event_class, event_type,
+          id, space_id, scene_id, actor_type, actor_pet_id, event_class, event_type,
           body_text, payload_json, causation_event_id, correlation_id,
           visibility, audience_pet_id, spec_version, idempotency_key, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         id,
         spaceId,
+        sceneId,
         actorType,
         actorPetId,
         eventClass,
@@ -9039,6 +10782,7 @@ export class SocialService {
       event_type: row.event_type,
       body_text: row.body_text,
       data: inputData.data ?? {},
+      scene_id: inputData.scene_id ?? null,
       reply_to_event_id: row.reply_to_event_id ?? null,
       interaction_id: row.interaction_id ?? null,
       correlation_id: row.correlation_id ?? null,
@@ -9181,6 +10925,9 @@ export class SocialService {
       : null;
     const journey = intent.actor_pet_id
       ? this.worldMemberJourney(intent.space_id, intent.actor_pet_id)
+      : null;
+    const resumeBundle = intent.actor_pet_id
+      ? this.worldResumeBundle(intent.space_id, intent.actor_pet_id)
       : null;
     const liveContext = intent.actor_pet_id
       ? this.worldLiveContext(intent.space_id, intent.actor_pet_id)
@@ -9369,6 +11116,8 @@ export class SocialService {
       world_state: worldState,
       member_state: memberState,
       journey,
+      loop_context: resumeBundle?.loop_context ?? null,
+      resume_bundle: resumeBundle,
       interaction: interactionView,
       delivery,
       host_guidance: effectiveGuidance,
@@ -9409,6 +11158,15 @@ export class SocialService {
         opened_hooks: Array.isArray(judgementResult.opened_hooks)
           ? judgementResult.opened_hooks
           : [],
+        loop_transition_receipt:
+          judgementResult.loop_transition_receipt ?? null,
+        loop_transition_receipts: Array.isArray(
+          judgementResult.loop_transition_receipts,
+        )
+          ? judgementResult.loop_transition_receipts
+          : [],
+        scene_transition_receipt:
+          judgementResult.scene_transition_receipt ?? null,
         concurrency:
           judgementResult.concurrency ?? {
             resolution_disposition:
@@ -9449,6 +11207,8 @@ export class SocialService {
         },
         next_guidance: effectiveGuidance,
         live_context: liveContext,
+        loop_context: resumeBundle?.loop_context ?? null,
+        resume_bundle: resumeBundle,
       },
       host_runtime: this.worldHostRuntimeDetails(world, actor),
     };
@@ -9466,8 +11226,22 @@ export class SocialService {
             OR (visibility = 'actor' AND audience_pet_id = ?)
             OR (visibility = 'managers' AND ? = 1)
           )
+          AND (
+            scene_id IS NULL OR ? = 1 OR EXISTS (
+              SELECT 1 FROM world_scene_participants scene_member
+              WHERE scene_member.scene_id = world_events.scene_id
+                AND scene_member.pet_id = ?
+                AND scene_member.status IN ('invited', 'active')
+            )
+          )
       `)
-      .get(world.id, petId, canManage ? 1 : 0);
+      .get(
+        world.id,
+        petId,
+        canManage ? 1 : 0,
+        canManage ? 1 : 0,
+        petId,
+      );
     return Number(row.sequence);
   }
 

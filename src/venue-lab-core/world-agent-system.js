@@ -1,6 +1,34 @@
 export const WORLD_PACKAGE_SCHEMA_VERSION = 1;
-export const WORLD_BUILDER_COMPILER_VERSION = 2;
-export const WORLD_DIRECTOR_RUNTIME_VERSION = 2;
+export const WORLD_BUILDER_COMPILER_VERSION = 3;
+export const WORLD_DIRECTOR_RUNTIME_VERSION = 3;
+export const WORLD_LOOP_CONTRACT_VERSION = 1;
+
+export const WORLD_LOOP_SCOPES = [
+  "personal",
+  "public",
+  "world",
+];
+
+export const WORLD_LOOP_TRANSITIONS = [
+  "open",
+  "continue",
+  "suspend",
+  "resume",
+  "intersect",
+  "complete",
+];
+
+// This matrix describes transitions the persistence runtime can apply today.
+// Relationship state is represented by effects/edges and a shared encounter is
+// represented by world_scenes; neither is a world_story_loops scope yet.
+export const WORLD_LOOP_TRANSITION_CAPABILITIES = Object.freeze({
+  open: Object.freeze(["personal"]),
+  continue: Object.freeze(["personal", "public", "world"]),
+  suspend: Object.freeze(["personal", "public", "world"]),
+  resume: Object.freeze(["personal", "public", "world"]),
+  intersect: Object.freeze(["personal"]),
+  complete: Object.freeze(["personal", "public", "world"]),
+});
 
 const BASE_PLAYER_EXPERIENCE_POLICY = {
   principle: "先让玩家理解并在意眼前事件，再逐步解释世界和规则。",
@@ -30,6 +58,135 @@ const BASE_COLLECTIVE_DECISION_POLICY = {
   collective: "影响全体成员、长期公共资产或不可逆方向的决定，使用有截止、法定人数和分歧处理的集体窗口。",
   fallback: "人数不足时只允许临时、可逆的维持方案，并保留正式议题。",
 };
+
+const INTERACTION_DENSITY_BY_FAMILY = {
+  general: { mode: "balanced", intersection_threshold: 1, ambient_visibility: "contextual" },
+  social: { mode: "dense", intersection_threshold: 1, ambient_visibility: "contextual" },
+  quest: { mode: "balanced", intersection_threshold: 1, ambient_visibility: "digest" },
+  mystery: { mode: "sparse", intersection_threshold: 2, ambient_visibility: "silent" },
+  survival: { mode: "balanced", intersection_threshold: 1, ambient_visibility: "digest" },
+  anomaly: { mode: "sparse", intersection_threshold: 2, ambient_visibility: "silent" },
+};
+
+const BASE_LOOP_TEMPLATES = [
+  {
+    id: "personal-loop",
+    scope: "personal",
+    phases: ["offered", "active", "suspended", "completed"],
+    purpose: "让每个角色始终拥有可独立推进的目标和即时反馈。",
+  },
+  {
+    id: "public-loop",
+    scope: "public",
+    phases: ["proposed", "open", "coordinating", "resolved", "archived"],
+    purpose: "处理影响公共资产或需要真人集体决定的议题。",
+  },
+  {
+    id: "world-loop",
+    scope: "world",
+    phases: ["scheduled", "active", "settling", "paused", "completed"],
+    purpose: "按世界规则结算全局演化；无人在线时不得自由施加个人风险。",
+  },
+];
+
+function loopRuntimePolicy(family, familyThreadTemplates = []) {
+  const interactionDensity = clone(
+    INTERACTION_DENSITY_BY_FAMILY[family] ?? INTERACTION_DENSITY_BY_FAMILY.general,
+  );
+  return {
+    contract_version: WORLD_LOOP_CONTRACT_VERSION,
+    principle: "共享同一世界，但默认推进个人剧情；只有显式因果交叉才建立共享场景。",
+    interaction_density: interactionDensity,
+    loop_templates: clone(BASE_LOOP_TEMPLATES),
+    family_archetypes: clone(familyThreadTemplates),
+    intersection_policy: {
+      presence_alone_is_evidence: false,
+      causal_signals: [
+        "same_world_entity",
+        "same_location_and_material_consequence",
+        "direct_address_or_reply",
+        "shared_goal_or_resource",
+        "one_loop_changes_another_loop_precondition",
+      ],
+      minimum_signals: interactionDensity.intersection_threshold,
+      below_threshold: "keep_personal_loops_independent",
+      at_threshold: "open_or_join_scene_loop",
+      scene_exit: "write_effects_back_then_resume_or_complete_source_loops",
+      consent_required_for: [
+        "another_character_behavior_or_agreement",
+        "irreversible_relationship_commitment",
+        "irreversible_public_decision",
+      ],
+    },
+    recovery_policy: {
+      returning: "自动合并直接、待回应和当前 Loop 相关变化，然后从最近可行动阶段恢复。",
+      waiting_for_member: "暂停共享场景或提供可逆旁路，不永久阻塞个人 Loop。",
+      deadlock: "降级目标、换路、重试或打开低门槛 Beat，但保留已获得事实。",
+      offline: "保留确定后果和异步痕迹，不伪造离线角色行动、感知或答复。",
+    },
+    delivery_policy: {
+      authority: "server_impact_router",
+      host_role: "emit_structured_effects_and_semantic_impact_hints_only",
+      host_must_not_choose_recipients: true,
+      immediate: ["direct_address", "action_required", "current_scene_material_change"],
+      contextual: ["current_loop_precondition_change", "perceivable_local_trace"],
+      digest: ["non_urgent_public_change", "background_world_progress"],
+      silent: ["unrelated_character_action", "imperceptible_or_private_change"],
+      auto_resume_includes: ["unseen_direct", "unseen_action_required", "unseen_current_loop_impact"],
+    },
+    transition_contract: {
+      legal_transitions: clone(WORLD_LOOP_TRANSITIONS),
+      legal_scopes: clone(WORLD_LOOP_SCOPES),
+      capabilities: clone(WORLD_LOOP_TRANSITION_CAPABILITIES),
+      accepted_requires: ["loop_transition", "effects", "affected_entities", "next_affordances"],
+      non_accepted: "leave_loop_unchanged; clarification_is_a_decision_not_a_loop_transition",
+      atomicity: "world_effects_and_loop_transition_commit_together",
+      persistence_boundary: {
+        story_loop_scopes: clone(WORLD_LOOP_SCOPES),
+        relationship: "structured_effects_and_world_loop_edges_only",
+        scene: "world_scenes_and_scene_transition_only",
+      },
+      applied_receipt: {
+        authority: "server",
+        required_after_commit: true,
+        statuses: ["applied"],
+        invalid_transition:
+          "raise INVALID_LOOP_TRANSITION and roll back judgement, state, Scene, and Loop writes",
+        required_fields: [
+          "status",
+          "requested_transition",
+          "applied_loop_id",
+          "applied_transition",
+          "reason",
+        ],
+      },
+    },
+  };
+}
+
+function effectiveLoopRuntimePolicy(mechanics = {}) {
+  const defaults = loopRuntimePolicy(
+    mechanics.family ?? "general",
+    mechanics.thread_templates ?? [],
+  );
+  const merged = deepMerge(defaults, mechanics.loop_runtime_policy ?? {});
+  // Runtime capabilities are platform facts, not creator-configurable fiction.
+  // A World may customize phases and policies, but may not advertise a scope or
+  // transition that the persistence layer cannot apply atomically.
+  merged.loop_templates = (merged.loop_templates ?? []).filter((template) =>
+    WORLD_LOOP_SCOPES.includes(template?.scope)
+  );
+  merged.transition_contract = deepMerge(
+    merged.transition_contract ?? {},
+    {
+      legal_transitions: clone(WORLD_LOOP_TRANSITIONS),
+      legal_scopes: clone(WORLD_LOOP_SCOPES),
+      capabilities: clone(WORLD_LOOP_TRANSITION_CAPABILITIES),
+      non_accepted: "leave_loop_unchanged; clarification_is_a_decision_not_a_loop_transition",
+    },
+  );
+  return merged;
+}
 
 const FAMILY_MODULES = {
   general: {
@@ -222,6 +379,9 @@ export function compileWorldPackage({
   source = "builder",
 } = {}) {
   const supplied = clone(suppliedArtifact) ?? {};
+  const previousWorldPackage = clone(
+    supplied.worldPackage ?? baseArtifact?.worldPackage,
+  );
   if (supplied.host === undefined && supplied.referee !== undefined) {
     supplied.host = supplied.referee;
     delete supplied.referee;
@@ -232,16 +392,25 @@ export function compileWorldPackage({
   artifact.host.judgementPolicy ??= {};
   artifact.host.facilitationPolicy ??= {};
   const existingMechanics = artifact.host.judgementPolicy.world_mechanics ?? {};
+  const familyModules = directorFamilyModules(family);
   artifact.host.judgementPolicy.world_mechanics = deepMerge(
     {
       family,
       player_experience_policy: BASE_PLAYER_EXPERIENCE_POLICY,
       async_continuity_policy: BASE_ASYNC_CONTINUITY_POLICY,
       collective_decision_policy: BASE_COLLECTIVE_DECISION_POLICY,
-      ...directorFamilyModules(family),
+      ...familyModules,
+      loop_runtime_policy: loopRuntimePolicy(
+        family,
+        familyModules.thread_templates,
+      ),
     },
     existingMechanics,
   );
+  artifact.host.judgementPolicy.world_mechanics.loop_runtime_policy =
+    effectiveLoopRuntimePolicy(
+      artifact.host.judgementPolicy.world_mechanics,
+    );
   artifact.host.facilitationPolicy.content_loop = deepMerge(
     {
       maintain_open_threads: true,
@@ -255,11 +424,22 @@ export function compileWorldPackage({
   );
   if (source !== "legacy") {
     artifact.world.initialWorldState = deepMerge(
-      { world_progress: { phase: "起步", public_progress: 0, open_threads: [], recent_changes: [], next_event_seeds: [] } },
+      {
+        world_progress: { phase: "起步", public_progress: 0, open_threads: [], recent_changes: [], next_event_seeds: [] },
+        loop_runtime: { active_world_loops: [], active_public_loops: [], active_scene_refs: [] },
+      },
       artifact.world.initialWorldState ?? {},
     );
     artifact.world.initialMemberState = deepMerge(
-      { journey: { stage: "new", completed_actions: 0, discoveries: [], open_goals: [], last_thread_id: null } },
+      {
+        journey: { stage: "new", completed_actions: 0, discoveries: [], open_goals: [], last_thread_id: null },
+        loop_runtime: {
+          active_personal_loop_id: null,
+          suspended_loop_ids: [],
+          active_scene_refs: [],
+          last_resume_at: null,
+        },
+      },
       artifact.world.initialMemberState ?? {},
     );
   }
@@ -272,6 +452,7 @@ export function compileWorldPackage({
   artifact.worldPackage = {
     schema_version: WORLD_PACKAGE_SCHEMA_VERSION,
     compiler_version: WORLD_BUILDER_COMPILER_VERSION,
+    loop_contract_version: WORLD_LOOP_CONTRACT_VERSION,
     template_id: templateId,
     primary_family: family,
     source,
@@ -285,10 +466,24 @@ export function compileWorldPackage({
         "host.judgementPolicy.world_mechanics.player_experience_policy",
         "host.judgementPolicy.world_mechanics.async_continuity_policy",
         "host.judgementPolicy.world_mechanics.collective_decision_policy",
+        "host.judgementPolicy.world_mechanics.loop_runtime_policy",
       ].filter((path) => !creatorPaths.includes(path)),
       defaulted_paths: source === "legacy"
         ? ["host.facilitationPolicy.content_loop"]
-        : ["world.initialWorldState.world_progress", "world.initialMemberState.journey", "host.facilitationPolicy.content_loop"],
+        : [
+            "world.initialWorldState.world_progress",
+            "world.initialWorldState.loop_runtime",
+            "world.initialMemberState.journey",
+            "world.initialMemberState.loop_runtime",
+            "host.facilitationPolicy.content_loop",
+          ],
+    },
+    compatibility: {
+      readable_compiler_versions: [1, 2, WORLD_BUILDER_COMPILER_VERSION],
+      upgraded_from_compiler_version:
+        previousWorldPackage?.compiler_version ?? null,
+      legacy_thread_adapter:
+        "open_threads and journey.last_thread_id are projected as Loop context until first-class Loop persistence is available",
     },
     unresolved,
     brief: String(briefText ?? "").slice(0, 4000),
@@ -300,6 +495,7 @@ export function simulateWorldPackage(artifact) {
   const world = artifact?.world ?? {};
   const host = artifact?.host ?? artifact?.referee ?? {};
   const mechanics = host.judgementPolicy?.world_mechanics ?? {};
+  const loops = effectiveLoopRuntimePolicy(mechanics);
   const population = host.judgementPolicy?.population_policy ?? host.facilitationPolicy?.population_policy ?? {};
   const choices = host.onboardingPolicy?.starter_choices ?? [];
   const checks = [
@@ -312,12 +508,130 @@ export function simulateWorldPackage(artifact) {
     ["authority", Boolean(mechanics.settlement?.authority) && host.judgementPolicy?.state_writes === "referee_only", "结算权威和状态写入边界明确"],
     ["async_continuity", Object.keys(mechanics.async_continuity_policy?.layers ?? {}).length === 3 && mechanics.async_continuity_policy?.requirements?.length > 0, "公共行动具有痕迹、状态或叙事异步影响"],
     ["collective_boundary", Boolean(mechanics.collective_decision_policy?.npc_role) && Boolean(mechanics.collective_decision_policy?.collective), "NPC 与真人集体决策边界明确"],
+    [
+      "independent_multiplayer",
+      loops.intersection_policy?.presence_alone_is_evidence === false &&
+        loops.intersection_policy?.below_threshold === "keep_personal_loops_independent",
+      "多人同时在线但没有因果交涉时，各自 Loop 独立推进",
+    ],
+    [
+      "causal_intersection",
+      loops.intersection_policy?.causal_signals?.length > 0 &&
+        loops.intersection_policy?.at_threshold === "open_or_join_scene_loop",
+      "共享实体、地点后果、直接回应或共同目标可建立交汇场景",
+    ],
+    [
+      "async_return",
+      Boolean(loops.recovery_policy?.returning) &&
+        loops.delivery_policy?.auto_resume_includes?.includes("unseen_direct"),
+      "异步回归自动合并直接、待回应和当前剧情相关变化",
+    ],
+    [
+      "loop_scope_coverage",
+      WORLD_LOOP_SCOPES.every((scope) =>
+        loops.loop_templates?.some((template) => template.scope === scope),
+      ),
+      "编译器只声明当前运行时可持久化的个人、公共和世界 Story Loop scope",
+    ],
+    [
+      "loop_capability_truthfulness",
+      JSON.stringify(loops.transition_contract?.capabilities) ===
+        JSON.stringify(WORLD_LOOP_TRANSITION_CAPABILITIES) &&
+        !loops.transition_contract?.legal_transitions?.includes("cancel") &&
+        !loops.transition_contract?.legal_transitions?.includes("clarify"),
+      "Loop 转移能力矩阵与服务端当前可应用能力一致，不把裁决 clarification 或未实现 cancel 宣称为转移",
+    ],
+    [
+      "delivery_authority",
+      loops.delivery_policy?.authority === "server_impact_router" &&
+        loops.delivery_policy?.host_must_not_choose_recipients === true,
+      "Host 只提供语义影响提示，实际收件人由服务端影响路由决定",
+    ],
   ];
   return {
     valid: checks.every(([, passed]) => passed),
     scenarios: checks.map(([id, passed, message]) => ({ id, status: passed ? "pass" : "review", message })),
     family: mechanics.family ?? artifact?.worldPackage?.primary_family ?? "general",
     world_name: world.name ?? "",
+  };
+}
+
+function legacyLoopScope(scope) {
+  if (["member", "member_only"].includes(scope)) return "personal";
+  if (["member_or_party", "member_and_world"].includes(scope)) return "personal";
+  if (scope === "relationship") return "relationship";
+  if (scope === "scene") return "scene";
+  if (scope === "public") return "public";
+  return "world";
+}
+
+function deriveLoopContext({ context, journey, selectedThread, loops }) {
+  const suppliedContext = context.loop_context ?? context.actor_loop_context;
+  const supplied = suppliedContext && typeof suppliedContext === "object"
+    ? clone(suppliedContext)
+    : {};
+  const hasRuntimeCurrentLoop = Boolean(
+    supplied.current_loop ?? supplied.foreground_loop,
+  );
+  const currentLoop = supplied.current_loop ?? supplied.foreground_loop ?? (selectedThread
+    ? {
+        id: selectedThread.id ?? "legacy-open-thread",
+        scope: selectedThread.scope
+          ? legacyLoopScope(selectedThread.scope)
+          : journey.last_thread_id === selectedThread.id
+            ? "personal"
+            : "world",
+        phase: selectedThread.state ?? "active",
+        source: "legacy_thread_adapter",
+      }
+    : {
+        id: journey.last_thread_id ?? "implicit-personal-loop",
+        scope: "personal",
+        phase: journey.stage === "returning" ? "suspended" : "active",
+        source: "journey_adapter",
+      });
+  const causalIntersections = Array.isArray(supplied.causal_intersections)
+    ? supplied.causal_intersections
+    : Array.isArray(supplied.intersection?.candidates)
+      ? supplied.intersection.candidates
+      : [];
+  const intersectionThreshold = Number(
+    loops.intersection_policy?.minimum_signals ??
+      loops.interaction_density?.intersection_threshold ??
+      1,
+  );
+  const intersectionState = causalIntersections.length >= intersectionThreshold
+    ? "causal_overlap_detected"
+    : causalIntersections.length > 0
+      ? "causal_overlap_below_threshold"
+      : "independent";
+  return {
+    contract_version: WORLD_LOOP_CONTRACT_VERSION,
+    origin: hasRuntimeCurrentLoop ? "runtime_context" : "compatibility_adapter",
+    current_loop: currentLoop,
+    loop_stack: Array.isArray(supplied.loop_stack)
+      ? supplied.loop_stack
+      : Array.isArray(supplied.active_loops)
+        ? supplied.active_loops
+        : [currentLoop],
+    suspended_loops: Array.isArray(supplied.suspended_loops)
+      ? supplied.suspended_loops.map((loop) => ({
+          id: loop.id,
+          scope: loop.scope,
+          phase: loop.phase,
+          title: loop.title,
+          status: loop.status,
+        }))
+      : [],
+    causal_entities: Array.isArray(supplied.causal_entities)
+      ? supplied.causal_entities
+      : [],
+    causal_intersections: causalIntersections,
+    intersection_state: intersectionState,
+    intersection_threshold: intersectionThreshold,
+    resume_bundle: supplied.resume_bundle ?? context.resume_bundle ?? null,
+    interaction_density: loops.interaction_density,
+    note: "live member presence alone never creates a scene Loop",
   };
 }
 
@@ -360,37 +674,99 @@ export function buildDirectorTurnPlan({ host, worldState, memberState, context =
   const memberValue = memberState?.value ?? memberState ?? {};
   const journey = context.actor_journey ?? memberValue.journey ?? {};
   const scenario = populationScenario(context, journey);
+  const loops = effectiveLoopRuntimePolicy(mechanics);
+  const foregroundContext = deriveLoopContext({
+    context,
+    journey,
+    selectedThread: null,
+    loops,
+  });
+  const hasPersistedForeground = foregroundContext.origin === "runtime_context";
+  const persistedForeground = foregroundContext.current_loop;
+  const isBootstrapForeground = Boolean(
+    hasPersistedForeground &&
+      persistedForeground?.source?.kind === "continuity" &&
+      persistedForeground?.context?.migrated_from === "world_member_journeys",
+  );
   const openThreads = Array.isArray(stateValue.world_progress?.open_threads)
     ? stateValue.world_progress.open_threads.filter((thread) => thread && !["archived", "closed"].includes(thread.state))
     : [];
   const inputText = `${input.event_type ?? ""} ${input.body_text ?? ""}`.toLocaleLowerCase();
-  const scoredThreads = openThreads.map((thread, index) => {
+  const scoredThreads = hasPersistedForeground && !isBootstrapForeground ? [] : openThreads.map((thread, index) => {
     const signature = `${thread.id ?? ""} ${thread.state ?? ""} ${thread.beat ?? ""}`.toLocaleLowerCase();
     const tokens = signature.split(/[^\p{L}\p{N}_-]+/u).filter((token) => token.length > 2);
     const score = tokens.reduce((sum, token) => sum + (inputText.includes(token) ? 2 : 0), 0) + (journey.last_thread_id === thread.id ? 1 : 0) - index * 0.01;
     return { thread, score };
   }).sort((left, right) => right.score - left.score);
-  const selectedThread = scoredThreads[0]?.thread ?? null;
+  // A persisted foreground Loop is the authoritative narrative frame. Global
+  // legacy open_threads are only a compatibility fallback when no runtime
+  // foreground exists; they must never hijack an actor's current story.
+  const supportingLegacyThread = scoredThreads[0]?.thread ?? null;
+  const selectedThread = hasPersistedForeground
+    ? isBootstrapForeground && supportingLegacyThread
+      ? {
+          ...persistedForeground,
+          beat: supportingLegacyThread.beat ?? null,
+          bootstrap_thread_id: supportingLegacyThread.id ?? null,
+        }
+      : persistedForeground
+    : supportingLegacyThread;
+  const loopContext = hasPersistedForeground
+    ? foregroundContext
+    : deriveLoopContext({ context, journey, selectedThread, loops });
   const beats = Array.isArray(mechanics.beat_library) ? mechanics.beat_library : [];
+  const explicitForegroundBeatIds = hasPersistedForeground
+    ? [
+        loopContext.current_loop?.beat_id,
+        loopContext.current_loop?.beat,
+        loopContext.current_loop?.context?.beat_id,
+        isBootstrapForeground ? supportingLegacyThread?.beat : null,
+      ].filter(Boolean)
+    : [];
   const matchedBeats = beats.filter((beat) => {
     const signature = `${beat.id ?? ""} ${beat.trigger ?? ""}`.toLocaleLowerCase();
-    return selectedThread && [selectedThread.id, selectedThread.beat].filter(Boolean).some((token) => signature.includes(String(token).toLocaleLowerCase()));
+    const tokens = hasPersistedForeground
+      ? explicitForegroundBeatIds
+      : [selectedThread?.id, selectedThread?.beat].filter(Boolean);
+    return tokens.some((token) =>
+      signature.includes(String(token).toLocaleLowerCase())
+    );
   });
-  const beatPool = matchedBeats.length > 0 ? matchedBeats : beats;
+  const beatPool = hasPersistedForeground
+    ? matchedBeats
+    : matchedBeats.length > 0
+      ? matchedBeats
+      : beats;
   const selectedBeat = beatPool[stableIndex(input.id ?? input.event_type ?? input.body_text, beatPool.length)] ?? null;
   const cast = Array.isArray(npcPolicy.cast) ? npcPolicy.cast : Array.isArray(mechanics.npc_cast) ? mechanics.npc_cast : [];
   const selectedNpc = cast[stableIndex(`${input.id ?? "entry"}:npc`, cast.length)] ?? null;
   const generatorInputs = Object.fromEntries(
     (mechanics.event_generator?.inputs ?? []).map((key) => [key, findStateValue(stateValue, key) ?? findStateValue(memberValue, key) ?? null]),
   );
-  const recoveryReason = openThreads.length === 0
-    ? "no_open_thread"
-    : selectedBeat === null
-      ? "no_compatible_beat"
-      : null;
+  const recoveryReason = hasPersistedForeground
+    ? null
+    : openThreads.length === 0
+      ? "no_open_thread"
+      : selectedBeat === null
+        ? "no_compatible_beat"
+        : null;
   const playerExperiencePolicy = mechanics.player_experience_policy ?? {};
   const asyncContinuityPolicy = mechanics.async_continuity_policy ?? {};
   const collectiveDecisionPolicy = mechanics.collective_decision_policy ?? {};
+  const hasAuthorizedIntersectionTarget = loopContext.causal_intersections.some(
+    (candidate) =>
+      typeof candidate?.target_loop_id === "string" &&
+      candidate.target_loop_id.length > 0,
+  );
+  const defaultLoopTransition =
+    loopContext.intersection_state === "causal_overlap_detected" &&
+    hasAuthorizedIntersectionTarget
+    ? "intersect"
+    : journey.stage === "returning"
+      ? "resume"
+      : loopContext.origin === "runtime_context" || selectedThread
+        ? "continue"
+        : "open";
   return {
     contract_version: WORLD_DIRECTOR_RUNTIME_VERSION,
     family: mechanics.family ?? "general",
@@ -399,9 +775,73 @@ export function buildDirectorTurnPlan({ host, worldState, memberState, context =
       thread: selectedThread,
       beat: selectedBeat,
       npc: selectedNpc,
-      source: selectedBeat ? (matchedBeats.length > 0 ? "thread_beat_match" : "deterministic_beat_rotation") : "bounded_generator",
+      source: hasPersistedForeground
+        ? isBootstrapForeground && selectedBeat
+          ? "foreground_loop_bootstrap_beat"
+          : "foreground_loop"
+        : selectedBeat
+          ? (matchedBeats.length > 0 ? "thread_beat_match" : "deterministic_beat_rotation")
+          : "bounded_generator",
+      foreground_precedence: hasPersistedForeground
+        ? isBootstrapForeground
+          ? "authoritative bootstrap; one legacy Beat may initialize the empty foreground Loop"
+          : "authoritative; global open_threads and unrelated Beats excluded"
+        : "legacy_thread_adapter",
       generator_inputs: generatorInputs,
       recovery_reason: recoveryReason,
+    },
+    loop_context: loopContext,
+    loop_transition_contract: {
+      contract_version: WORLD_LOOP_CONTRACT_VERSION,
+      required_for_accepted_decision: true,
+      output_path: "result.loop_transition",
+      legal_transitions: loops.transition_contract?.legal_transitions ?? WORLD_LOOP_TRANSITIONS,
+      legal_scopes: loops.transition_contract?.legal_scopes ?? WORLD_LOOP_SCOPES,
+      capabilities: loops.transition_contract?.capabilities ?? WORLD_LOOP_TRANSITION_CAPABILITIES,
+      expected_default: defaultLoopTransition,
+      required_fields: [
+        "contract_version",
+        "loop_id",
+        "scope",
+        "from_phase",
+        "transition",
+        "to_phase",
+        "reason",
+      ],
+      atomicity: loops.transition_contract?.atomicity,
+      precommit_validation: {
+        required: true,
+        current_loop_id: loopContext.current_loop?.id ?? null,
+        current_scope: loopContext.current_loop?.scope ?? null,
+        current_phase: loopContext.current_loop?.phase ?? null,
+        intersect_target_loop_ids: loopContext.causal_intersections
+          .map((candidate) => candidate?.target_loop_id)
+          .filter((value) => typeof value === "string" && value),
+        resume_candidates: loopContext.suspended_loops.map((loop) => ({
+          loop_id: loop.id,
+          scope: loop.scope,
+          from_phase: loop.phase,
+        })),
+      },
+      applied_receipt: loops.transition_contract?.applied_receipt,
+    },
+    effects_contract: {
+      output_paths: {
+        effects: "result.effects",
+        affected_entities: "result.affected_entities",
+        semantic_impact_hints: "result.impact_hints",
+        next_affordances: "result.next_affordances",
+      },
+      effect_requirement: "描述实际改变的世界、角色自有状态、关系、场景或 Loop 事实；不得把尝试写成已发生效果。",
+      recipient_authority: loops.delivery_policy?.authority ?? "server_impact_router",
+      host_role: loops.delivery_policy?.host_role ?? "emit_structured_effects_and_semantic_impact_hints_only",
+      forbidden_host_decisions: [
+        "recipient_id",
+        "recipient_character_id",
+        "delivery_state",
+        "displayed",
+        "read",
+      ],
     },
     scene_contract: {
       required: ["location", "present_characters", "perceivable_details", "immediate_objective", "pressure_or_cost", "exit_or_refusal"],
@@ -421,14 +861,20 @@ export function buildDirectorTurnPlan({ host, worldState, memberState, context =
       layers: asyncContinuityPolicy.layers ?? {},
       idle: asyncContinuityPolicy.idle ?? population.zero_players ?? "无人时暂停自由推进。",
       collective_decision: collectiveDecisionPolicy,
+      loop_recovery: loops.recovery_policy,
+      delivery: loops.delivery_policy,
     },
     pacing: mechanics.pacing_model ?? {},
     recovery: recoveryReason ? mechanics.recovery_model?.deadlock ?? mechanics.recovery_model?.failure ?? "提供低门槛替代行动" : null,
     settlement: mechanics.settlement ?? { authority: "host" },
     state_contract: mechanics.state_contract ?? null,
     instructions: [
-      "先使用选中的线程或 Beat；只有不适用时才调用有边界的事件生成器。",
+      "若 loop_context.origin 为 runtime_context，必须以 current_loop 为前台叙事框架；不得用全局 open_threads、无关 Beat 或事件生成器替换它。只有兼容适配器没有持久化前台 Loop 时，才从旧线程或 Beat 选择入口。",
       "玩家描述是尝试，不是既成结果；不得替其他真人决定。",
+      "每轮必须基于 loop_context 产生一个能力矩阵允许的 Loop 转移；clarification 是裁决结果而不是 Loop 转移，当前运行时不支持 cancel 转移。接受行动时同时给出结构化 effects、affected_entities 和 next_affordances。",
+      "Host 输出的 loop_transition 是待服务端预提交验证的提议；只有服务端返回 applied_receipt 后才可称为已经应用，不能把世界裁决已写入等同于 Loop 转移已落库。",
+      "只有 loop_context.causal_intersections 中的显式因果证据才能建立共享场景；不能因为其他成员在线就强行合流。",
+      "Host 只能给出影响语义和紧迫度提示，不能指定实际收件人，也不能宣称任何投递、展示或已读状态。",
       "裁决必须说明依据、代价、新事实、状态变化和后续钩子。",
       "无论单人还是多人，提交行动后都要立即说明是否接住、眼前反馈和下一步；需要异步结算时也要先返回可理解的受理反馈。",
       asyncContinuityPolicy.requirements?.[0] ?? "被接受的公共行动必须至少留下痕迹、状态或叙事影响中的一种。",

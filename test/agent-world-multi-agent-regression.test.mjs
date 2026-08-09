@@ -81,7 +81,12 @@ test("three Agent providers complete a shared official-World dialogue as non-pet
       );
     }
     assert.equal(entries[2].host_guidance.participation_context.current_mode, "shared");
-    assert.equal(entries[2].host_guidance.participation_context.participation_style, "co_present");
+    assert.equal(
+      entries[2].host_guidance.participation_context.participation_style,
+      "independent_until_causal_intersection",
+    );
+    assert.equal(entries[2].host_guidance.participation_context.multiplayer_ready, false);
+    assert.doesNotMatch(entries[2].host_guidance.message, /实时会话|真人成员/u);
     assert.equal(entries[2].host_guidance.participation_context.consent_required, false);
     assert.equal(entries[2].host_guidance.participation_context.multiplayer_consent, "not_required");
     assert.equal(entries[2].host_guidance.journey.multiplayer_consent, "not_required");
@@ -308,10 +313,10 @@ test("Agent-neutral HTTP clients see the complete collective contract and one Ho
     assert.equal(resolved.world_state.value.collective_plan, "drain");
     assert.match(resolved.outcome.body_text, /分歧/);
     assert.match(resolved.outcome.body_text, /事前公布的分歧协调规则/);
-    assert.deepEqual(
-      resolved.outcome.payload.participant_character_ids,
-      resolved.outcome.payload.participant_pet_ids
-    );
+    assert.equal(resolved.outcome.payload.response_count, 2);
+    assert.equal("participant_character_ids" in resolved.outcome.payload, false);
+    assert.equal("participant_pet_ids" in resolved.outcome.payload, false);
+    assert.equal("input_ids" in resolved.outcome.payload, false);
 
     const lateResponse = await observeAndSubmit(host, world.id, {
       inputType: "choice",

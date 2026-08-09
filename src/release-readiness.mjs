@@ -45,8 +45,16 @@ function tableCounts(db) {
   return Object.fromEntries(tableNames(db).map((table) => [table, countRows(db, table)]));
 }
 
-function tableFingerprint(db, table) {
-  const rows = db.prepare(`SELECT * FROM ${quoteIdentifier(table)}`).all();
+function tableColumns(db, table) {
+  return db.prepare(`PRAGMA table_info(${quoteIdentifier(table)})`).all()
+    .map((column) => column.name);
+}
+
+function tableFingerprint(db, table, columns = tableColumns(db, table)) {
+  const projection = columns.map(quoteIdentifier).join(", ") || "*";
+  const rows = db
+    .prepare(`SELECT ${projection} FROM ${quoteIdentifier(table)}`)
+    .all();
   const encoded = rows
     .map((row) =>
       JSON.stringify(row, (_, value) =>
@@ -57,9 +65,12 @@ function tableFingerprint(db, table) {
   return createHash("sha256").update(encoded.join("\n")).digest("hex");
 }
 
-function tableFingerprints(db) {
+function tableFingerprints(db, preservedColumns = {}) {
   return Object.fromEntries(
-    tableNames(db).map((table) => [table, tableFingerprint(db, table)])
+    tableNames(db).map((table) => [
+      table,
+      tableFingerprint(db, table, preservedColumns[table]),
+    ])
   );
 }
 
@@ -67,8 +78,11 @@ function pragmaRows(db, name) {
   return db.prepare(`PRAGMA ${name}`).all();
 }
 
-function inspectDatabase(db) {
+function inspectDatabase(db, preservedColumns = {}) {
   const counts = tableCounts(db);
+  const columns = Object.fromEntries(
+    tableNames(db).map((table) => [table, tableColumns(db, table)]),
+  );
   const has = (table) => Object.hasOwn(counts, table);
   const scalar = (sql) => Number(db.prepare(sql).get().count);
   const integrityRows = pragmaRows(db, "integrity_check");
@@ -76,7 +90,9 @@ function inspectDatabase(db) {
 
   return {
     tableCounts: counts,
+    tableColumns: columns,
     tableFingerprints: tableFingerprints(db),
+    preservedTableFingerprints: tableFingerprints(db, preservedColumns),
     integrityOk:
       integrityRows.length === 1 &&
       String(integrityRows[0].integrity_check ?? "").toLowerCase() === "ok",
@@ -163,7 +179,7 @@ export async function rehearseAgentWorldMigration(sourceDatabase, options = {}) 
     beforeDb.close();
 
     firstStore = new PetSocialStore(copyPath);
-    const afterFirst = inspectDatabase(firstStore.db);
+    const afterFirst = inspectDatabase(firstStore.db, before.tableColumns);
     firstStore.close();
     firstStore = null;
 
@@ -179,7 +195,8 @@ export async function rehearseAgentWorldMigration(sourceDatabase, options = {}) 
       .filter((table) => Object.hasOwn(before.tableFingerprints, table))
       .every(
         (table) =>
-          before.tableFingerprints[table] === afterFirst.tableFingerprints[table]
+          before.tableFingerprints[table] ===
+            afterFirst.preservedTableFingerprints[table]
       );
     const changedOnSecondPass = Object.keys(afterFirst.tableFingerprints).filter(
       (table) =>

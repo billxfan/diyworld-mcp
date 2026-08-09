@@ -17,6 +17,10 @@ import {
   formatIncomingPetMessagePrompt,
   resolveCodexCommand
 } from "../src/codex-app-server.mjs";
+import {
+  deliveryPolicyForEvent,
+  shouldInterruptForEvent,
+} from "../src/delivery-policy.mjs";
 
 function fakeCodexChild(onMessage) {
   const child = new EventEmitter();
@@ -106,6 +110,25 @@ test("collective World prompts display their durable prompt without claiming a c
   assert.match(display, /今晚是否共同封桥/u);
   assert.match(display, /已持久保存/u);
   assert.doesNotMatch(display, /已写入世界/u);
+});
+
+test("the bridge interrupts only immediate or action-required semantic deliveries", () => {
+  for (const deliveryPolicy of ["immediate", "action_required"]) {
+    assert.equal(shouldInterruptForEvent({
+      eventType: "world.event_committed",
+      payload: { deliveryPolicy },
+    }), true);
+  }
+  for (const deliveryPolicy of ["ambient", "digest", "silent"]) {
+    assert.equal(shouldInterruptForEvent({
+      eventType: "world.event_committed",
+      payload: { deliveryPolicy },
+    }), false);
+  }
+  assert.equal(deliveryPolicyForEvent({
+    eventType: "world.event_committed",
+    payload: {},
+  }), "immediate", "legacy events preserve their historical delivery behavior");
 });
 
 test("explicit Codex command takes precedence", () => {

@@ -194,10 +194,13 @@ rejected (`expire`) according to the policy chosen when the window opened.
 
 ## Delivery and offline catch-up
 
-The MCP calls remain request/response operations. Eligible World members receive
-durable per-device events whether or not they currently have live presence. The
-event stream delivers low-latency wake-ups while connected, and the same stored
-events are available for catch-up after reconnecting:
+The MCP calls remain request/response operations. Eligible recipients receive
+durable per-device events whether or not they currently have live presence. In
+v3 Worlds eligibility is derived from the actor's own result, a directed target,
+a verified Scene, or a collective interaction; ordinary unrelated actions and
+co-presence are not narrative broadcasts. Legacy Worlds retain their explicit
+broadcast policy during migration. The event stream delivers low-latency wake-ups
+while connected, and the same stored events are available after reconnecting:
 
 - `world.presence_changed`;
 - `world.host_runtime_changed`;
@@ -210,9 +213,22 @@ Notifications contain identifiers and cursors rather than treating member text
 as trusted instructions. The connected Agent reads the authoritative World data through MCP
 after receiving a notification.
 
-The standard MCP surface includes `activity_list` for a channel-labelled feed of
-private messages and World updates, `world_observe` for authoritative missed
-World history, and `world_say` for speech addressed to one active World member.
+Normal return flow surfaces direct, action-required, and foreground-relevant
+updates from `world_visit` / `world_act` without requiring a manual inbox command.
+The standard MCP surface retains `activity_list` as an explicit channel-labelled
+feed, `world_observe` as advanced authoritative history recovery, and `world_say`
+for speech addressed to one active World member.
+Collective invitations in both the automatic resume bundle and `activity_list`
+carry the exact prompt/reply event ID, Scene ID, quorum, mode, and deadline, so
+an Agent can answer directly without an extra observation call. A directed
+`world_say` that continues an existing encounter carries the server-issued
+`scene_id`; the runtime never guesses between concurrent Scenes.
+
+Scene policy has operational meaning. `sync` requires current live presence and
+uses a short response window; `async` permits offline continuation and long
+deadlines; `flexible` is the bounded fallback between them. Presence alone is
+transport reachability and is not presented as a lobby, a shared scene, or proof
+that multiplayer interaction has begun.
 Delivery receipts are monotonic and deliberately separate: `queued` means stored,
 `delivered` means received by a client, `displayed` means its content was shown,
 and `read` means it was marked read after display. A committed World outcome may
@@ -220,8 +236,8 @@ truthfully claim `written`; it may not infer that another person saw, heard,
 read, or answered it.
 
 An accepted outcome is persisted before `world.event_committed` is delivered.
-Other live members therefore observe one committed result rather than
-competing Agent interpretations.
+Every server-derived recipient therefore observes one committed result rather
+than competing Agent interpretations.
 
 ## Security and authority
 

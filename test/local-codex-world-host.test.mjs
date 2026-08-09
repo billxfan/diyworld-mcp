@@ -10,6 +10,8 @@ import { PetSocialStore } from "../src/store.mjs";
 import {
   LocalCodexWorldHostRunner,
   parseWorldHostDecision,
+  validateLoopTransitionAgainstDirectorPlan,
+  worldHostPrompt,
 } from "../src/world-host-runner.mjs";
 
 class FakeCodexWorldHosts {
@@ -26,6 +28,32 @@ class FakeCodexWorldHosts {
 
   async runWorldHostTurn({ threadId, prompt, resume }) {
     this.turns.push({ threadId, prompt, resume });
+    const contextEnvelope = JSON.parse(prompt.split("\n\n").at(-1));
+    const work = contextEnvelope.context_pack;
+    const plan = work.director_plan;
+    const current = plan?.loop_context?.current_loop;
+    const transitionName = plan?.loop_transition_contract?.expected_default;
+    const causalTarget = plan?.loop_context?.causal_intersections?.find(
+      (candidate) => candidate?.target_loop_id,
+    )?.target_loop_id;
+    const loopTransition = work.batch_mode
+      ? null
+      : {
+          contract_version: 1,
+          loop_id:
+            transitionName === "open"
+              ? `proposed:${work.input?.id ?? "loop"}`
+              : current.id,
+          scope: transitionName === "open" ? "personal" : current.scope,
+          from_phase: transitionName === "open" ? "none" : current.phase,
+          transition: transitionName,
+          to_phase: transitionName === "open" ? "active" : current.phase,
+          reason: "测试 Host 遵守 Director Runtime v3 Loop 契约。",
+          ...(transitionName === "open" ? { title: "继续当前个人经历" } : {}),
+          ...(transitionName === "intersect"
+            ? { target_loop_id: causalTarget }
+            : {}),
+        };
     return {
       threadId,
       turnId: `turn:${this.turns.length}`,
@@ -34,7 +62,23 @@ class FakeCodexWorldHosts {
         resolution_disposition: "apply",
         reason_text: "输入符合当前 World 规则。",
         outcome_text: `${threadId} 已处理该输入。`,
-        result: { resolution: "full_success" },
+        result: {
+          resolution: "full_success",
+          ...(loopTransition ? { loop_transition: loopTransition } : {}),
+          ...(work.batch_mode
+            ? {}
+            : {
+                effects: [],
+                affected_entities: [],
+                next_affordances: [
+                  {
+                    label: "继续",
+                    event_type: "host.continue",
+                    body_text: "继续",
+                  },
+                ],
+              }),
+        },
       }),
     };
   }
@@ -517,4 +561,252 @@ test("World Host decisions require a bounded structured contract", () => {
     })),
     /Only an accepted/u,
   );
+});
+
+test("World Host decisions accept the v1 Loop result contract", () => {
+  const parsed = parseWorldHostDecision(JSON.stringify({
+    decision: "accepted",
+    resolution_disposition: "apply",
+    reason_text: "行动推进当前个人剧情。",
+    outcome_text: "你修好了自己花圃边的篱笆。",
+    result: {
+      loop_transition: {
+        contract_version: 1,
+        loop_id: "personal:garden",
+        scope: "personal",
+        from_phase: "active",
+        transition: "continue",
+        to_phase: "active",
+        reason: "完成一次可逆的个人维护行动。",
+      },
+      effects: [
+        { kind: "entity_state", entity_ref: "garden:a", summary: "篱笆已修复" },
+      ],
+      affected_entities: [
+        { entity_type: "garden", entity_id: "garden:a", effect_kind: "repaired" },
+      ],
+      impact_hints: [
+        { kind: "current_loop_change", urgency: "contextual", reason: "个人目标推进" },
+      ],
+      next_affordances: [
+        { label: "检查花苗", event_type: "garden.inspect", body_text: "检查花苗" },
+      ],
+    },
+  }));
+  assert.equal(parsed.loopTransition.transition, "continue");
+  assert.equal(parsed.effects.length, 1);
+  assert.equal(parsed.nextAffordances.length, 1);
+});
+
+test("Director Runtime authorizes resume only from the actor's suspended Loop candidates", () => {
+  const directorPlan = {
+    loop_context: {
+      current_loop: { id: "personal:current", scope: "personal", phase: "active" },
+      suspended_loops: [
+        { id: "personal:old-branch", scope: "personal", phase: "suspended" },
+      ],
+    },
+    loop_transition_contract: {
+      legal_transitions: ["open", "continue", "suspend", "resume", "intersect", "complete"],
+      legal_scopes: ["personal", "public", "world"],
+      capabilities: {
+        open: ["personal"], continue: ["personal", "public", "world"],
+        suspend: ["personal", "public", "world"], resume: ["personal", "public", "world"],
+        intersect: ["personal", "public", "world"], complete: ["personal", "public", "world"],
+      },
+    },
+  };
+  assert.doesNotThrow(() => validateLoopTransitionAgainstDirectorPlan({
+    transition: {
+      loop_id: "personal:old-branch",
+      scope: "personal",
+      from_phase: "suspended",
+      transition: "resume",
+      to_phase: "active",
+    },
+  }, directorPlan));
+  assert.throws(() => validateLoopTransitionAgainstDirectorPlan({
+    transition: {
+      loop_id: "personal:invented",
+      scope: "personal",
+      from_phase: "suspended",
+      transition: "resume",
+      to_phase: "active",
+    },
+  }, directorPlan), /authorized suspended Loop candidate/u);
+});
+
+test("Director Runtime v3 rejects an accepted legacy-shaped result before commit", () => {
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({
+      decision: "accepted",
+      resolution_disposition: "apply",
+      reason_text: "旧 Host 未返回 Loop 契约。",
+      outcome_text: "不应进入提交阶段。",
+      result: { resolution: "full_success" },
+    }), {
+      directorPlan: {
+        contract_version: 3,
+        loop_transition_contract: {
+          required_for_accepted_decision: true,
+        },
+      },
+    }),
+    /v3 accepted decision requires result\.loop_transition/u,
+  );
+
+  // The same shape remains readable when no v3 plan is attached, preserving
+  // already-running v1/v2 Hosts during migration.
+  assert.equal(
+    parseWorldHostDecision(JSON.stringify({
+      decision: "accepted",
+      resolution_disposition: "apply",
+      reason_text: "旧 Host 兼容读取。",
+      outcome_text: "按旧契约返回。",
+      result: { resolution: "full_success" },
+    })).loopTransition,
+    null,
+  );
+});
+
+test("Loop parser rejects advertised-but-unimplemented transitions and scopes", () => {
+  const base = {
+    decision: "accepted",
+    resolution_disposition: "apply",
+    reason_text: "测试假能力。",
+    outcome_text: "不应提交。",
+    result: {
+      effects: [],
+      affected_entities: [],
+      next_affordances: [{ label: "继续" }],
+    },
+  };
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({
+      ...base,
+      result: {
+        ...base.result,
+        loop_transition: {
+          contract_version: 1,
+          loop_id: "personal:test",
+          scope: "personal",
+          from_phase: "active",
+          transition: "cancel",
+          to_phase: "cancelled",
+          reason: "运行时未实现。",
+        },
+      },
+    })),
+    /Unsupported result\.loop_transition transition/u,
+  );
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({
+      ...base,
+      result: {
+        ...base.result,
+        loop_transition: {
+          contract_version: 1,
+          loop_id: "relationship:test",
+          scope: "relationship",
+          from_phase: "active",
+          transition: "continue",
+          to_phase: "active",
+          reason: "运行时未持久化 relationship Loop。",
+        },
+      },
+    })),
+    /Unsupported result\.loop_transition scope/u,
+  );
+});
+
+test("v3 precommit validation binds the proposal to the foreground Loop", () => {
+  const decision = {
+    decision: "accepted",
+    resolution_disposition: "apply",
+    reason_text: "尝试切换错误 Loop。",
+    outcome_text: "不应提交。",
+    result: {
+      loop_transition: {
+        contract_version: 1,
+        loop_id: "loop:global",
+        scope: "world",
+        from_phase: "open",
+        transition: "continue",
+        to_phase: "progressing",
+        reason: "全局线程试图覆盖个人前台剧情。",
+      },
+      effects: [],
+      affected_entities: [],
+      next_affordances: [{ label: "继续" }],
+    },
+  };
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify(decision), {
+      directorPlan: {
+        contract_version: 3,
+        loop_context: {
+          current_loop: {
+            id: "loop:personal",
+            scope: "personal",
+            phase: "active",
+          },
+          causal_intersections: [],
+        },
+        loop_transition_contract: {
+          required_for_accepted_decision: true,
+          legal_transitions: ["continue"],
+          legal_scopes: ["personal", "public", "world"],
+          capabilities: {
+            continue: ["personal", "public", "world"],
+          },
+        },
+      },
+    }),
+    /loop_id must match the foreground Loop/u,
+  );
+});
+
+test("World Host cannot select semantic delivery recipients", () => {
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({
+      decision: "accepted",
+      resolution_disposition: "apply",
+      reason_text: "尝试越权投递。",
+      outcome_text: "行动已结算。",
+      result: {
+        loop_transition: {
+          contract_version: 1,
+          loop_id: "personal:well",
+          scope: "personal",
+          from_phase: "active",
+          transition: "intersect",
+          to_phase: "active",
+          reason: "共享水井发生因果交叉。",
+          target_loop_id: "loop:shared-well",
+        },
+        effects: [],
+        affected_entities: [],
+        impact_hints: [
+          { kind: "direct", recipient_id: "character:b", reason: "Host 指定" },
+        ],
+        next_affordances: [{ label: "继续", body_text: "继续" }],
+      },
+    })),
+    /outside World Host delivery authority/u,
+  );
+});
+
+test("World Host prompt treats causal overlap, not presence, as multiplayer evidence", () => {
+  const prompt = worldHostPrompt({
+    bound_world_id: "world-loop",
+    director_plan: {
+      loop_context: {
+        intersection_state: "independent",
+        causal_intersections: [],
+      },
+    },
+  });
+  assert.match(prompt, /Presence alone must never force multiplayer interaction/u);
+  assert.match(prompt, /server impact router alone determines recipients/u);
+  assert.match(prompt, /result\.loop_transition is required/u);
 });

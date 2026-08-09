@@ -92,6 +92,8 @@ with:
 - `decision`, `reason_text`, and `outcome_text`;
 - additive V2 detail: `resolution`, `interpretation`, `new_facts`, `costs`,
   and `opened_hooks`;
+- additive V3 continuity: the actor's `loop_context`, automatic
+  `resume_bundle`, and an applied `loop_transition_receipt` after commit;
 - world and member state version changes;
 - live member context;
 - `next_guidance` using the same `host_guidance` structure.
@@ -110,16 +112,21 @@ accepted public actions affect the same state. Each Character may keep acting
 independently, invite a peer to interact, respond, or ignore an invitation.
 Consent is still required for actions whose meaning is inherently mutual, but
 it belongs to that specific interaction rather than to World participation.
+Default entry guidance therefore centers the Character's foreground Loop and
+relevant updates, not online-session or member counts. It mentions a shared
+encounter only when a verified Scene or explicit invitation already exists.
 
 ## Current implementation boundary
 
 During validation, the default platform executor is the creator's local Codex
-app-server. Every logical Host receives one persistent Codex task on demand,
-bound immutably to a single World. Ordinary inputs and ready collective batches
-are serialized within that World; each turn receives only a freshly assembled
-World-local context pack and has no external tools. Structured decisions still
-pass through server-side authority, visibility, version, and atomic state-commit
-checks. A failed or invalid turn leaves its input pending.
+app-server. Every Host turn runs in a fresh ephemeral Codex task; no model thread
+is reused across Characters or turns. Ordinary inputs and ready collective
+batches are serialized within their authority boundary. Each actor turn receives
+only a freshly assembled role-perspective context pack; a collective turn receives
+only its verified interaction batch. Neither has external tools. Structured
+decisions still pass through server-side authority, visibility, version, Loop,
+Scene, and atomic state-commit checks. A failed or invalid turn leaves its input
+pending with no partial World or Loop write.
 
 Creators can bind their own current Agent session as the temporary executor
 through a short-lived lease; direct inputs wait for that Agent until it resolves
