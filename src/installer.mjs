@@ -12,13 +12,19 @@ import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { PetSocialClient } from "./client.mjs";
 import { writeConfig } from "./config.mjs";
+import {
+  CLIENT_PACKAGE_VERSION,
+  DIYWORLD_PROTOCOL_VERSION,
+  clientUpdateStatus,
+  pinnedMcpConfig,
+} from "./release.mjs";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
 // The beta service is intentionally the default so new users do not need to
 // know any infrastructure details. --server remains available for local
 // development, staging, and a future endpoint migration.
 export const DEFAULT_AGENT_WORLD_SERVER_URL =
-  "https://internal-host.invalid";
+  "https://api.diyworld.ai";
 
 export function normalizeServerUrl(value) {
   let url;
@@ -70,6 +76,15 @@ export async function checkPetSocialHealth(serverUrl, fetchImpl = globalThis.fet
   ) {
     throw new Error(`The server at ${serverUrl} is not a healthy Agent World Social service.`);
   }
+  if (
+    body.versions &&
+    clientUpdateStatus(CLIENT_PACKAGE_VERSION, body.versions) === "required"
+  ) {
+    throw new Error(
+      `DIYworld client ${CLIENT_PACKAGE_VERSION} is no longer supported by ${serverUrl}. ` +
+      `Upgrade to ${body.versions.minimum_supported_client_version} or newer.`,
+    );
+  }
   return body;
 }
 
@@ -106,6 +121,8 @@ function deliveryDefaults() {
 function registrationConfig(serverUrl, registration) {
   return {
     serverUrl,
+    clientVersion: CLIENT_PACKAGE_VERSION,
+    protocolVersion: DIYWORLD_PROTOCOL_VERSION,
     token: registration.token,
     ownerId: registration.owner.id,
     deviceId: registration.device.id,
@@ -231,6 +248,15 @@ export async function installPetSocial(options = {}, dependencies = {}) {
 
   if (!reused || options.recoveryCode) {
     writeConfig(registrationConfig(serverUrl, registration), configPath);
+  } else if (
+    existing.clientVersion !== CLIENT_PACKAGE_VERSION ||
+    existing.protocolVersion !== DIYWORLD_PROTOCOL_VERSION
+  ) {
+    writeConfig({
+      ...existing,
+      clientVersion: CLIENT_PACKAGE_VERSION,
+      protocolVersion: DIYWORLD_PROTOCOL_VERSION,
+    }, configPath);
   }
 
   const exec = dependencies.execFileSync ?? execFileSync;
@@ -267,9 +293,10 @@ export async function installPetSocial(options = {}, dependencies = {}) {
       ], { stdio: "ignore" });
     } catch {}
     try {
+      const mcp = pinnedMcpConfig(configPath);
       exec("codex", [
         "mcp", "add", "diyworld", "--", "npx", "-y",
-        "@diyworld/mcp@latest", "mcp", "--config", configPath
+        mcp.args[1], "mcp", "--config", configPath
       ], { stdio: "inherit" });
     } catch {
       warnings.push("Could not register the MCP server automatically. Run the command shown in README.md.");

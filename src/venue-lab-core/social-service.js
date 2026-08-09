@@ -14,6 +14,8 @@ import {
   buildDirectorTurnPlan,
   compileWorldPackage,
   simulateWorldPackage,
+  WORLD_BUILDER_COMPILER_VERSION,
+  WORLD_PACKAGE_SCHEMA_VERSION,
 } from "./world-agent-system.js";
 
 const SPACE_VISIBILITIES = new Set(["public", "unlisted", "hidden"]);
@@ -2007,13 +2009,13 @@ export class SocialService {
         ];
         addExperienceCheck(
           "compiled_world_package",
-          artifact.worldPackage.schema_version === 1 &&
-            artifact.worldPackage.compiler_version === 1 &&
+          artifact.worldPackage.schema_version === WORLD_PACKAGE_SCHEMA_VERSION &&
+            [1, WORLD_BUILDER_COMPILER_VERSION].includes(artifact.worldPackage.compiler_version) &&
             requiredModules.every((key) => Boolean(mechanics[key]))
             ? "pass"
             : "review",
-          artifact.worldPackage.schema_version === 1 &&
-            artifact.worldPackage.compiler_version === 1 &&
+          artifact.worldPackage.schema_version === WORLD_PACKAGE_SCHEMA_VERSION &&
+            [1, WORLD_BUILDER_COMPILER_VERSION].includes(artifact.worldPackage.compiler_version) &&
             requiredModules.every((key) => Boolean(mechanics[key]))
             ? "World Package 已通过类型判断、世界组合和 Host 模块编译。"
             : "World Package 缺少编译版本或必要的导演运行模块。",

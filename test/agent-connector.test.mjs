@@ -8,6 +8,7 @@ import test from "node:test";
 import { connectAgent, onboardingRequirements } from "../src/agent-connector.mjs";
 import { createPetSocialApp } from "../src/app.mjs";
 import { PetSocialClient } from "../src/client.mjs";
+import { CLIENT_PACKAGE_VERSION } from "../src/release.mjs";
 import { PetSocialStore } from "../src/store.mjs";
 
 const projectRoot = resolve(import.meta.dirname, "..");
@@ -51,15 +52,7 @@ test("the generic connector creates a profile and returns portable MCP config", 
     assert.equal(result.mcp.command, "npx");
     assert.deepEqual(
       result.mcp.args,
-      [
-        "-y",
-        "@diyworld/mcp@latest",
-        "mcp",
-        "--profile",
-        "standard",
-        "--config",
-        configPath
-      ]
+      ["-y", `@diyworld/mcp@${CLIENT_PACKAGE_VERSION}`, "mcp", "--config", configPath]
     );
     assert.equal(result.remoteMcp.type, "http");
     assert.equal(result.remoteMcp.url, `${address.url}/mcp`);
@@ -71,6 +64,8 @@ test("the generic connector creates a profile and returns portable MCP config", 
     assert.equal(stored.profileId, result.profileId);
     assert.equal(stored.agentBindingId, result.agentBindingId);
     assert.equal(stored.agentProvider, "custom");
+    assert.equal(stored.clientVersion, CLIENT_PACKAGE_VERSION);
+    assert.equal(stored.protocolVersion, "1");
     assert.equal(typeof stored.token, "string");
 
     const client = new PetSocialClient(stored);
@@ -83,11 +78,14 @@ test("the generic connector creates a profile and returns portable MCP config", 
       projectRoot,
       serverUrl: address.url,
       configPath,
-      provider: "other"
+      provider: "custom",
+      clientName: "Research Agent",
+      clientInstanceId: "research-agent-1"
     });
     assert.equal(reused.reused, true);
     assert.equal(reused.profileId, result.profileId);
     assert.equal(reused.agentProvider, "custom");
+    assert.equal(reused.clientVersion, CLIENT_PACKAGE_VERSION);
   } finally {
     await app.close();
     store.close();

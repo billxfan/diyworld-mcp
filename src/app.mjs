@@ -1,7 +1,14 @@
 import http from "node:http";
 import { addCharacterAliases } from "./character-aliases.mjs";
 import { AppError, invariant } from "./errors.mjs";
-import { bearerToken, readJson, routeMatch, sendJson as sendHttpJson } from "./http.mjs";
+import {
+  bearerToken,
+  readJson,
+  requestClientAddress,
+  routeMatch,
+  sendJson as sendHttpJson,
+} from "./http.mjs";
+import { CLIENT_PACKAGE_VERSION, clientReleaseMetadata } from "./release.mjs";
 import { PetSocialStore } from "./store.mjs";
 import { clampInteger, DAY_MS } from "./utils.mjs";
 import { SocialError } from "./venue-lab-core/errors.js";
@@ -193,9 +200,15 @@ export function createPetSocialApp(options = {}) {
   const rateBuckets = new Map();
   const interactionTimers = new Map();
   let selfUrl = options.mcpSelfUrl ?? null;
+  const release = clientReleaseMetadata(options.clientRelease);
 
   function rateLimit(key, maximum, windowMs) {
     const now = clock();
+    if (rateBuckets.size >= 10_000) {
+      for (const [bucketKey, bucket] of rateBuckets) {
+        if (bucket.resetAt <= now) rateBuckets.delete(bucketKey);
+      }
+    }
     const current = rateBuckets.get(key);
     if (!current || current.resetAt <= now) {
       rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
@@ -432,6 +445,9 @@ export function createPetSocialApp(options = {}) {
     try {
       const url = new URL(req.url, "http://localhost");
       const { pathname } = url;
+      const clientAddress = requestClientAddress(req, {
+        trustCloudflareProxy: options.trustCloudflareProxy === true,
+      });
 
       if (req.method === "GET" && pathname === "/health") {
         return sendJson(res, 200, {
@@ -443,8 +459,9 @@ export function createPetSocialApp(options = {}) {
             transport: "streamable-http",
             endpoint: "/mcp",
             ready: Boolean(selfUrl),
-            version: "0.8.7"
+            version: CLIENT_PACKAGE_VERSION,
           },
+          versions: release,
           now: clock()
         });
       }
@@ -461,7 +478,8 @@ export function createPetSocialApp(options = {}) {
         );
         const token = bearerToken(req);
         invariant(token, 401, "MCP_AUTH_REQUIRED", "Provide an Agent credential as a Bearer token.");
-        authenticate(req);
+        const auth = authenticate(req);
+        rateLimit(`mcp:${auth.device_id}`, 240, 60 * 1000);
         invariant(selfUrl, 503, "MCP_NOT_READY", "MCP endpoint is not ready yet.");
         const message = await readJson(req);
         const response = await handleRemoteMcpMessage({ message, serverUrl: selfUrl, token });
@@ -470,6 +488,7 @@ export function createPetSocialApp(options = {}) {
       }
 
       if (req.method === "POST" && pathname === "/v1/register") {
+        rateLimit(`account-register:${clientAddress}`, 20, 60 * 60 * 1000);
         const body = await readJson(req);
         const registration = store.register(body, {
           inviteRequired,
@@ -481,7 +500,7 @@ export function createPetSocialApp(options = {}) {
       }
 
       if (req.method === "POST" && pathname === "/v1/recover") {
-        rateLimit(`account-recovery:${req.socket.remoteAddress ?? "unknown"}`, 10, 60 * 60 * 1000);
+        rateLimit(`account-recovery:${clientAddress}`, 10, 60 * 60 * 1000);
         const body = await readJson(req);
         return sendJson(res, 201, store.recoverAccount(body));
       }
@@ -1195,19 +1214,16 @@ export function createPetSocialApp(options = {}) {
             );
           } else {
             worldHostRunner?.enqueue(worldSubmitParams.id);
-            // Most actions finish inside this first bounded wait. Slower Host
-            // turns return an acknowledged processing state plus input ID, so
-            // the Agent can continue through world_input_result without losing
-            // the user's action. Collective inputs still follow quorum/deadline.
             if (
               worldActParams &&
               result.status === "pending" &&
               !result.input.interaction_id &&
               worldHostRunner?.waitForInput
             ) {
-              const committed = await worldHostRunner.waitForInput(result.input.id, {
-                timeoutMs: worldHostActionWaitMs,
-              });
+              const committed = await worldHostRunner.waitForInput(
+                result.input.id,
+                { timeoutMs: worldHostActionWaitMs },
+              );
               if (committed) {
                 result = worldService(auth).worldIntentResult(result.input.id);
               }

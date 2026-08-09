@@ -12,9 +12,10 @@ import {
   normalizeServerUrl
 } from "../src/installer.mjs";
 import { PetSocialStore } from "../src/store.mjs";
+import { CLIENT_PACKAGE_VERSION } from "../src/release.mjs";
 
 test("server URLs require HTTPS except for loopback development", () => {
-  assert.equal(DEFAULT_AGENT_WORLD_SERVER_URL, "https://internal-host.invalid");
+  assert.equal(DEFAULT_AGENT_WORLD_SERVER_URL, "https://api.diyworld.ai");
   assert.equal(normalizeServerUrl("https://pets.example.test/"), "https://pets.example.test");
   assert.equal(normalizeServerUrl("http://127.0.0.1:8787/"), "http://127.0.0.1:8787");
   assert.equal(normalizeServerUrl("http://localhost:8787"), "http://localhost:8787");
@@ -62,6 +63,8 @@ test("a clean isolated install registers, stores credentials securely, and insta
     assert.equal(config.characterId, result.characterId);
     assert.equal(config.agentBindingId, result.agentBindingId);
     assert.equal(config.agentProvider, "codex");
+    assert.equal(config.clientVersion, CLIENT_PACKAGE_VERSION);
+    assert.equal(config.protocolVersion, "1");
     assert.equal((await new PetSocialClient(config).character()).character.form, "robot");
     assert.equal(statSync(resolve(prefix, "config.json")).mode & 0o777, 0o600);
     assert.match(
@@ -77,7 +80,7 @@ test("a clean isolated install registers, stores credentials securely, and insta
     assert.ok(
       commands.some(([command, args]) =>
         command === "codex" &&
-        args.join(" ") === `mcp add diyworld -- npx -y @diyworld/mcp@latest mcp --config ${resolve(prefix, "config.json")}`
+        args.join(" ") === `mcp add diyworld -- npx -y @diyworld/mcp@${CLIENT_PACKAGE_VERSION} mcp --config ${resolve(prefix, "config.json")}`
       )
     );
   } finally {

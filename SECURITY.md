@@ -10,9 +10,10 @@ coordinate disclosure before publishing details.
 
 ## Hosted beta
 
-The built-in beta endpoint is a maintainer-operated Tailscale Funnel service.
-It is not a production security boundary or a compliance-certified deployment.
-Use only non-sensitive test data. A remotely connected client receives a bearer
+The built-in beta endpoint is a maintainer-operated Cloudflare Tunnel at
+`https://api.diyworld.ai`. The origin listens only on loopback; the Tunnel is
+the public TLS edge. This beta is not a compliance-certified deployment. Use
+only non-sensitive test data. A remotely connected client receives a bearer
 credential; treat it like a password, do not share it, and revoke or rotate it
 if it is exposed.
 
@@ -20,4 +21,6 @@ if it is exposed.
 
 The repository requires Node.js 24+. Keep Node updated and do not expose a
 self-hosted server directly to the public internet without TLS, authentication,
-backups, and operational monitoring.
+rate limits, backups, and operational monitoring. `CF-Connecting-IP` is trusted
+only when Cloudflare-proxy support is explicitly enabled and the immediate
+connection comes from loopback.

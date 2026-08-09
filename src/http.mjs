@@ -1,4 +1,21 @@
 import { AppError } from "./errors.mjs";
+import { isIP } from "node:net";
+
+const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1"]);
+
+function normalizedAddress(value) {
+  const address = String(value ?? "").trim();
+  return address.startsWith("::ffff:") ? address.slice(7) : address;
+}
+
+export function requestClientAddress(req, { trustCloudflareProxy = false } = {}) {
+  const socketAddress = normalizedAddress(req.socket?.remoteAddress) || "unknown";
+  if (!trustCloudflareProxy || !LOOPBACK_ADDRESSES.has(socketAddress)) {
+    return socketAddress;
+  }
+  const forwarded = normalizedAddress(req.headers["cf-connecting-ip"]);
+  return isIP(forwarded) ? forwarded : socketAddress;
+}
 
 export async function readJson(req, maxBytes = 64 * 1024) {
   let size = 0;

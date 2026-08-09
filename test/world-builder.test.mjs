@@ -10,6 +10,7 @@ import {
 } from "../src/venue-lab-core/database.js";
 import { SocialError } from "../src/venue-lab-core/errors.js";
 import { SocialService } from "../src/venue-lab-core/social-service.js";
+import { WORLD_BUILDER_COMPILER_VERSION } from "../src/venue-lab-core/world-agent-system.js";
 
 function expectCode(fn, code) {
   assert.throws(
@@ -79,11 +80,11 @@ test("the platform seeds one World Builder Agent, host templates, and official p
       const artifact = JSON.parse(build.artifact_json);
       assert.equal(artifact.host.name, build.display_name);
       assert.equal(artifact.host.worldRole, build.world_role);
-      assert.equal(build.platform_agent_policy_version, 3);
+      assert.equal(build.platform_agent_policy_version, 4);
       assert.ok(artifact.world.initialWorldState);
       assert.ok(artifact.world.initialMemberState);
       assert.equal(artifact.worldPackage.schema_version, 1);
-      assert.equal(artifact.worldPackage.compiler_version, 1);
+      assert.equal(artifact.worldPackage.compiler_version, WORLD_BUILDER_COMPILER_VERSION);
       assert.equal(artifact.worldPackage.source, "official");
       assert.ok(
         artifact.host.judgementPolicy.world_mechanics.beat_library.length >= 2,

@@ -8,19 +8,22 @@ const [command = "install", ...args] = process.argv.slice(2);
 const scripts = {
   install: "install.mjs",
   connect: "connect-agent.mjs",
+  upgrade: "upgrade.mjs",
   mcp: "mcp.mjs"
 };
 
 if (command === "help" || command === "--help" || command === "-h") {
-  console.log(`DIYworld MCP
+  console.log(`Agent World Social
 
 Usage:
   agent-world install [--invite CODE]
   agent-world connect [--json] [--provider PROVIDER] [--invite CODE]
+  agent-world upgrade [--config PATH] [--json]
   diyworld mcp [--config PATH] [--profile standard|advanced]
 
 install: Set up Codex Desktop on macOS.
 connect: Create a portable MCP configuration for Claude, Cursor, WorkBuddy, or another MCP client. With --json, missing details are returned as structured questions.
+upgrade: Prepare an explicit exact-version MCP replacement without changing identity or credentials.
 mcp: Start the standard stdio MCP server. It exposes task-oriented tools by default; advanced protocol tools require --profile advanced.`);
   process.exit(0);
 }

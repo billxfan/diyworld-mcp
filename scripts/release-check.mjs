@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { PetSocialStore } from "../src/store.mjs";
 import { rehearseAgentWorldMigration } from "../src/release-readiness.mjs";
+import { CLIENT_PACKAGE_VERSION } from "../src/release.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -56,10 +57,7 @@ if (keepCopy) mkdirSync(dirname(keepCopy), { recursive: true });
 
 try {
   const packageJson = JSON.parse(readFileSync(resolve(projectRoot, "package.json"), "utf8"));
-  const mcpSource = readFileSync(resolve(projectRoot, "src/mcp-server.mjs"), "utf8");
-  const versionMatches = new RegExp(
-    `version: ["']${packageJson.version.replaceAll(".", "\\.")}["']`
-  ).test(mcpSource);
+  const versionMatches = CLIENT_PACKAGE_VERSION === packageJson.version;
   const migration = await rehearseAgentWorldMigration(sourceDatabase, { copyPath: keepCopy });
   const result = {
     ok: versionMatches && migration.ok,

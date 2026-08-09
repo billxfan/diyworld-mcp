@@ -135,7 +135,6 @@ export class LocalCodexWorldHostRunner {
     this.activeCount = 0;
     this.closed = false;
     this.idleWaiters = [];
-    this.inputWaiters = new Map();
     this.bindingPromises = new Map();
   }
 
@@ -221,33 +220,6 @@ export class LocalCodexWorldHostRunner {
       return Promise.resolve();
     }
     return new Promise((resolveIdle) => this.idleWaiters.push(resolveIdle));
-  }
-
-  /**
-   * Wait for one ordinary World input to receive its Host resolution. This is
-   * deliberately scoped to an input rather than the whole queue: a client
-   * action should not be held up by unrelated Worlds that happen to be busy.
-   * A timeout returns null so transport callers can fall back to a truthful
-   * pending response without treating a slow Host as a failed action.
-   */
-  waitForInput(inputId, { timeoutMs = 45_000 } = {}) {
-    const id = String(inputId ?? "").trim();
-    if (!id) return Promise.resolve(null);
-    const timeout = Math.max(1, Math.min(Number(timeoutMs) || 45_000, 120_000));
-    return new Promise((resolveWaiter) => {
-      const waiter = (result) => {
-        clearTimeout(timer);
-        const waiters = this.inputWaiters.get(id) ?? [];
-        this.inputWaiters.set(id, waiters.filter((item) => item !== waiter));
-        if (this.inputWaiters.get(id)?.length === 0) this.inputWaiters.delete(id);
-        resolveWaiter(result);
-      };
-      const timer = setTimeout(() => waiter(null), timeout);
-      timer.unref?.();
-      const waiters = this.inputWaiters.get(id) ?? [];
-      waiters.push(waiter);
-      this.inputWaiters.set(id, waiters);
-    });
   }
 
   async close() {
@@ -456,7 +428,7 @@ export class LocalCodexWorldHostRunner {
                 decision.memberStatePatch === undefined
                   ? undefined
                   : work.actor_member_state.version,
-          });
+            });
       const completedAt = new Date().toISOString();
       const latestSequence = Number(
         this.db
@@ -475,10 +447,6 @@ export class LocalCodexWorldHostRunner {
         `)
         .run(turn.turnId, latestSequence, completedAt, completedAt, worldId);
       await this.onCommitted?.(result);
-      if (!result.interaction && result.input?.id) {
-        const inputId = String(result.input.id);
-        for (const waiter of this.inputWaiters.get(inputId) ?? []) waiter(result);
-      }
     }
   }
 

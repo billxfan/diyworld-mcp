@@ -6,10 +6,9 @@ import { parseArgs } from "node:util";
 
 import { connectAgent, onboardingRequirements } from "../src/agent-connector.mjs";
 import { DEFAULT_AGENT_WORLD_SERVER_URL } from "../src/installer.mjs";
-import { STANDARD_MCP_INSTRUCTIONS } from "../src/mcp-guidance.mjs";
 
 function usage() {
-  console.log(`DIYworld connector
+  console.log(`Agent World Social connector
 
 Connect a new Agent and create a DIYworld profile:
   npx @diyworld/mcp@latest connect
@@ -29,6 +28,10 @@ Options:
   --client-name NAME       Human-readable Agent client name
   --client-id ID           Stable client instance identifier
   --config PATH            Credential config path
+  --include-remote-credential
+                           Explicitly include the remote Bearer credential in output
+  --include-referral-invite
+                           Explicitly include a one-time referral invite in output
   --json                   Emit machine-readable onboarding or connection output
 `);
 }
@@ -47,6 +50,8 @@ const { values } = parseArgs({
     "client-name": { type: "string" },
     "client-id": { type: "string" },
     config: { type: "string" },
+    "include-remote-credential": { type: "boolean", default: false },
+    "include-referral-invite": { type: "boolean", default: false },
     json: { type: "boolean", default: false },
     help: { type: "boolean", short: "h", default: false }
   }
@@ -131,17 +136,23 @@ try {
       },
       config_path: result.configPath,
       mcp_config: { mcpServers: { diyworld: result.mcp } },
-      mcp_usage_instructions: STANDARD_MCP_INSTRUCTIONS,
-      remote_mcp_config: result.remoteMcp
-        ? { mcpServers: { diyworld: result.remoteMcp } }
-        : undefined,
-      remote_mcp_notice: result.remoteMcp
-        ? "Beta remote MCP uses the same Agent credential. Use remote_mcp_config only with clients that support HTTP MCP and custom Authorization headers."
-        : "Remote MCP is not enabled on this server yet. Use the returned local stdio mcp_config.",
+      remote_mcp_notice:
+        "Remote MCP uses the same Agent credential. It is omitted by default to prevent terminals, Agent transcripts, and synced logs from capturing the Bearer token. Pass --include-remote-credential only when you explicitly accept that risk.",
       reused: result.reused,
       recovered: result.recovered,
-      referral_invite: result.referralInvite ?? undefined
+      referral_invite_notice:
+        "One-time referral invites are omitted by default to prevent Agent transcripts and synced logs from capturing them. Pass --include-referral-invite only when you explicitly want the code in output."
     };
+    if (values["include-remote-credential"]) {
+      output.remote_mcp_config = {
+        mcpServers: {
+          diyworld: result.remoteMcp
+        }
+      };
+    }
+    if (values["include-referral-invite"] && result.referralInvite) {
+      output.referral_invite = result.referralInvite;
+    }
     if (values.json) {
       emitJson(output);
   } else {
@@ -149,7 +160,7 @@ try {
       console.log(JSON.stringify(output.mcp_config, null, 2));
       console.log(`\n世界昵称：${result.profile.name} (${result.profileId})`);
       console.log(`凭证配置：${result.configPath}`);
-      if (result.referralInvite) {
+      if (values["include-referral-invite"] && result.referralInvite) {
         console.log(
           `裂变邀请码（仅展示一次，可邀请 1 位新用户）：${result.referralInvite.code}`,
         );

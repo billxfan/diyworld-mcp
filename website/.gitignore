@@ -1,0 +1,11 @@
+.next/
+node_modules/
+data/*.sqlite*
+!.gitkeep
+.playwright-cli/
+output/
+tsconfig.tsbuildinfo
+.vercel
+.env*
+.agents/
+skills-lock.json

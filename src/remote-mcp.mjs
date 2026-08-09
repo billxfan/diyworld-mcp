@@ -1,6 +1,7 @@
 import { PetSocialClient } from "./client.mjs";
 import { callWorldTool, worldTools } from "./world-tools.mjs";
 import { STANDARD_MCP_INSTRUCTIONS, STANDARD_TOOL_NAMES } from "./mcp-guidance.mjs";
+import { CLIENT_PACKAGE_VERSION } from "./release.mjs";
 
 const object = (properties = {}, required = []) => ({
   type: "object",
@@ -25,8 +26,8 @@ const baseTools = [
     name: "profile_update",
     description: "更新资料。仅修改用户明确要求的字段。",
     inputSchema: object({
-      displayName: text("公开显示名。", 24),
-      bio: text("公开简介。", 160),
+      displayName: text("角色显示名。", 24),
+      bio: text("角色简介。", 160),
       visibility: { type: "string", enum: ["public", "friends_only", "private"] }
     })
   },
@@ -37,14 +38,14 @@ const baseTools = [
   },
   {
     name: "friend_list",
-    description: "查看当前资料的好友。",
+    description: "查看当前角色的好友。",
     inputSchema: object()
   },
   {
     name: "message_send",
     description: "向好友发送消息。必须先展示完整收件人和内容并取得用户确认。",
     inputSchema: object(
-      { target: text("好友 handle 或资料 ID。", 100), text: text("消息正文。", 2000) },
+      { target: text("好友 handle 或角色 ID。", 100), text: text("消息正文。", 2000) },
       ["target", "text"]
     )
   },
@@ -69,8 +70,10 @@ export async function callRemoteMcpTool({ serverUrl, token, name, args = {} }) {
   if (name.startsWith("world_")) return callWorldTool(client, name, args);
 
   switch (name) {
-    case "profile_get":
-      return client.profile();
+    case "profile_get": {
+      const { profile } = await client.profile();
+      return { profile };
+    }
     case "profile_update":
       return client.updateProfile(args);
     case "people_discover":
@@ -106,7 +109,7 @@ export async function handleRemoteMcpMessage({ message, serverUrl, token }) {
       instructions: STANDARD_MCP_INSTRUCTIONS,
       serverInfo: {
         name: "diyworld",
-        version: "0.8.7",
+        version: CLIENT_PACKAGE_VERSION,
         description: "DIYworld beta remote MCP. Uses a concise, intent-first tool surface."
       }
     });

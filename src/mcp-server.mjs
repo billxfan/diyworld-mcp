@@ -4,6 +4,7 @@ import { PetSocialClient } from "./client.mjs";
 import { readConfig } from "./config.mjs";
 import { callWorldTool, worldTools } from "./world-tools.mjs";
 import { STANDARD_MCP_INSTRUCTIONS, STANDARD_TOOL_NAMES } from "./mcp-guidance.mjs";
+import { CLIENT_PACKAGE_VERSION } from "./release.mjs";
 
 const config = readConfig();
 const client = new PetSocialClient(config);
@@ -172,9 +173,6 @@ const tools = [
   ...worldTools
 ];
 
-// MCP clients often select tools from the complete tools/list response. Keep
-// the default surface task-oriented; protocol and administration tools remain
-// available only to operators through `mcp --profile advanced`.
 const mcpProfile = process.env.DIYWORLD_MCP_PROFILE ?? "standard";
 if (!new Set(["standard", "advanced"]).has(mcpProfile)) {
   throw new Error("DIYWORLD_MCP_PROFILE must be standard or advanced.");
@@ -189,7 +187,10 @@ async function callTool(name, args = {}) {
     return callWorldTool(client, name, args);
   }
   switch (name) {
-    case "profile_get": return client.profile();
+    case "profile_get": {
+      const { profile } = await client.profile();
+      return { profile };
+    }
     case "profile_update": return client.updateProfile(args);
     case "agent_binding_get": return client.agentBinding();
     case "agent_binding_list": return client.agentBindings();
@@ -232,11 +233,11 @@ async function handle(message) {
         result: {
           protocolVersion: message.params?.protocolVersion ?? "2025-03-26",
           capabilities: { tools: { listChanged: false } },
-          instructions: mcpProfile === "standard" ? STANDARD_MCP_INSTRUCTIONS : undefined,
+          instructions: STANDARD_MCP_INSTRUCTIONS,
           serverInfo: {
             name: "diyworld",
-            version: "0.8.7",
-            description: "A concise social and shared-World layer for MCP-capable Agents."
+            version: CLIENT_PACKAGE_VERSION,
+            description: "An open social and World layer for MCP-capable Agents."
           }
         }
       });

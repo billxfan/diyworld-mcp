@@ -5,21 +5,20 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { defaultConfigPath, readConfig } from "../src/config.mjs";
-import { checkPetSocialHealth, normalizeServerUrl } from "../src/installer.mjs";
+import { assertSupportedRuntime, checkPetSocialHealth, normalizeServerUrl } from "../src/installer.mjs";
 
 const { values } = parseArgs({
   strict: true,
   options: {
     config: { type: "string" },
     server: { type: "string" },
-    codex: { type: "boolean", default: false },
     json: { type: "boolean", default: false },
     help: { type: "boolean", short: "h", default: false }
   }
 });
 
 if (values.help) {
-  console.log("Usage: npm run doctor -- [--config PATH] [--server URL] [--codex] [--json]");
+  console.log("Usage: npm run doctor -- [--config PATH] [--server URL] [--json]");
   process.exit(0);
 }
 
@@ -29,20 +28,17 @@ function record(name, ok, detail) {
 }
 
 try {
-  const major = Number.parseInt(process.versions.node.split(".")[0], 10);
-  if (!Number.isFinite(major) || major < 24) throw new Error(`Node.js 24 or newer is required; found ${process.versions.node}.`);
-  record("runtime", true, `Node ${process.versions.node}`);
+  assertSupportedRuntime();
+  record("runtime", true, `macOS / Node ${process.versions.node}`);
 } catch (error) {
   record("runtime", false, error.message);
 }
 
-if (values.codex) {
-  try {
-    const version = execFileSync("codex", ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-    record("codex", true, version || "Codex CLI available");
-  } catch {
-    record("codex", false, "Codex CLI is not available on PATH.");
-  }
+try {
+  const version = execFileSync("codex", ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  record("codex", true, version || "Codex CLI available");
+} catch {
+  record("codex", false, "Codex CLI is not available on PATH.");
 }
 
 let config;
@@ -63,13 +59,11 @@ try {
   record("server", false, error.message);
 }
 
-if (values.codex) {
-  const skillPath = resolve(homedir(), ".codex/skills/diyworld/SKILL.md");
-  record("skill", existsSync(skillPath), existsSync(skillPath) ? skillPath : "DIYworld skill is not installed.");
+const skillPath = resolve(homedir(), ".codex/skills/diyworld/SKILL.md");
+record("skill", existsSync(skillPath), existsSync(skillPath) ? skillPath : "DIYworld skill is not installed.");
 
-  const bridgePath = resolve(homedir(), "Library/LaunchAgents/com.diyworld.bridge.plist");
-  record("bridge", existsSync(bridgePath), existsSync(bridgePath) ? bridgePath : "DIYworld silent-delivery bridge is not installed.");
-}
+const bridgePath = resolve(homedir(), "Library/LaunchAgents/com.diyworld.bridge.plist");
+record("bridge", existsSync(bridgePath), existsSync(bridgePath) ? bridgePath : "DIYworld silent-delivery bridge is not installed.");
 
 if (values.json) {
   console.log(JSON.stringify({ ok: checks.every((check) => check.ok), checks }, null, 2));

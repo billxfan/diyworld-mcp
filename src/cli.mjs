@@ -5,34 +5,41 @@ import { CodexAppServerClient } from "./codex-app-server.mjs";
 import { defaultConfigPath, readConfig, updateConfig, writeConfig } from "./config.mjs";
 
 function usage() {
-  console.log(`DIYworld CLI
+  console.log(`Agent World Social CLI
 
 Usage:
-  diyworld register --server URL --email EMAIL --name NAME [--provider custom] [--invite CODE]
-  diyworld profile [--name NAME] [--bio TEXT] [--visibility MODE]
-  diyworld people
-  diyworld bindings
-  diyworld binding-revoke BINDING_ID --confirm
+  pet-social register --server URL --email EMAIL --name NAME [--provider custom] [--form robot] [--invite CODE]
+  pet-social character
+  pet-social profile [--name NAME] [--bio TEXT] [--visibility MODE] [--form FORM] [--appearance JSON]
+  pet-social discover
+  pet-social bindings
+  pet-social binding-revoke BINDING_ID --confirm
+
+Legacy compatibility:
+  pet-social me
+  pet-social square
 
 Social and delivery:
-  diyworld request @handle
-  diyworld requests [incoming|outgoing]
-  diyworld respond FRIENDSHIP_ID accept|reject|block
-  diyworld friends
-  diyworld remove FRIENDSHIP_ID
-  diyworld block @handle
-  diyworld send @handle MESSAGE
-  diyworld inbox
-  diyworld read CONVERSATION_ID MAX_SEQUENCE
-  diyworld bridge [--no-notify]
-  diyworld bind-thread THREAD_ID [--codex-command PATH] [--model MODEL] [--effort low]
-  diyworld new-inbox-thread [--cwd PATH] [--codex-command PATH] [--model MODEL] [--effort low]
-  diyworld unbind-thread
-  diyworld delivery-status
+  pet-social request @handle
+  pet-social requests [incoming|outgoing]
+  pet-social respond FRIENDSHIP_ID accept|reject|block
+  pet-social friends
+  pet-social remove FRIENDSHIP_ID
+  pet-social block @handle
+  pet-social send @handle MESSAGE
+  pet-social inbox
+  pet-social read CONVERSATION_ID MAX_SEQUENCE
+  pet-social bridge [--no-notify]
+  pet-social bind-thread THREAD_ID [--codex-command PATH] [--model MODEL] [--effort low]
+  pet-social new-inbox-thread [--cwd PATH] [--codex-command PATH] [--model MODEL] [--effort low]
+  pet-social unbind-thread
+  pet-social delivery-status
 
 Options:
   --config PATH        Override config path
   --provider PROVIDER  codex, claude, cursor, custom, or other
+  --form FORM          pet, robot, spirit, humanlike, or custom
+  --appearance JSON    Character appearance object
   --client-id ID       Stable Agent client instance identifier
   --confirm            Confirm Agent binding revocation
   --codex-command PATH Override the Codex executable
@@ -62,6 +69,8 @@ const { values, positionals } = parseArgs({
     bio: { type: "string" },
     visibility: { type: "string" },
     provider: { type: "string" },
+    form: { type: "string" },
+    appearance: { type: "string" },
     "client-id": { type: "string" },
     invite: { type: "string" },
     config: { type: "string" },
@@ -89,14 +98,22 @@ try {
     if (!values.server || !values.email || !values.name) {
       throw new Error("register requires --server, --email, and --name");
     }
+    let appearance = {};
+    if (values.appearance !== undefined) {
+      try {
+        appearance = JSON.parse(values.appearance);
+      } catch {
+        throw new Error("--appearance must be a valid JSON object");
+      }
+    }
     const registration = await PetSocialClient.register(values.server, {
       recoveryEmail: values.email,
       displayName: values.name,
       bio: values.bio ?? "",
       visibility: values.visibility ?? "public",
       deviceName: process.env.HOSTNAME ?? "Agent client",
-      characterForm: "custom",
-      appearance: {},
+      characterForm: values.form ?? "custom",
+      appearance,
       agentProvider: values.provider ?? "other",
       clientInstanceId: values["client-id"],
       inviteCode: values.invite
@@ -207,21 +224,30 @@ try {
   let result;
 
   switch (command) {
-    case "character": // Legacy alias; use `profile`.
+    case "character":
+      result = await client.character();
+      break;
     case "me":
-      result = await client.profile();
+      result = await client.me();
       break;
     case "profile": {
       const patch = {};
       if (values.name !== undefined) patch.displayName = values.name;
       if (values.bio !== undefined) patch.bio = values.bio;
       if (values.visibility !== undefined) patch.visibility = values.visibility;
-      result = await client.updateProfile(patch);
+      if (values.form !== undefined) patch.form = values.form;
+      if (values.appearance !== undefined) {
+        try {
+          patch.appearance = JSON.parse(values.appearance);
+        } catch {
+          throw new Error("--appearance must be a valid JSON object");
+        }
+      }
+      result = await client.updateCharacter(patch);
       break;
     }
-    case "people":
     case "discover":
-      result = await client.people();
+      result = await client.characters();
       break;
     case "bindings":
       result = await client.agentBindings();
@@ -235,7 +261,7 @@ try {
       result = await client.square();
       break;
     case "request":
-      if (!positionals[1]) throw new Error("request requires a person handle or ID");
+      if (!positionals[1]) throw new Error("request requires a character handle or ID");
       result = await client.sendFriendRequest(positionals[1]);
       break;
     case "requests":
@@ -253,7 +279,7 @@ try {
       result = await client.removeFriend(positionals[1]);
       break;
     case "block":
-      if (!positionals[1]) throw new Error("block requires a person handle or ID");
+      if (!positionals[1]) throw new Error("block requires a character handle or ID");
       result = await client.blockCharacter(positionals[1]);
       break;
     case "send":

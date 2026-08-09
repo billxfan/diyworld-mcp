@@ -18,6 +18,9 @@ const inviteRequired = ["1", "true", "yes", "on"].includes(
       "true"
   ).toLowerCase()
 );
+const trustCloudflareProxy = ["1", "true", "yes", "on"].includes(
+  String(process.env.AGENT_WORLD_TRUST_CLOUDFLARE_PROXY ?? "false").toLowerCase(),
+);
 const officialHostOwnerIds = String(
   process.env.AGENT_WORLD_OFFICIAL_HOST_OWNER_IDS ??
     process.env.PET_SOCIAL_OFFICIAL_HOST_OWNER_IDS ??
@@ -80,6 +83,14 @@ const app = createPetSocialApp({
   worldHostMode,
   worldHostMaxConcurrency,
   worldHostPrewarm,
+  trustCloudflareProxy,
+  clientRelease: {
+    recommendedClientVersion:
+      process.env.AGENT_WORLD_RECOMMENDED_CLIENT_VERSION,
+    minimumSupportedClientVersion:
+      process.env.AGENT_WORLD_MINIMUM_CLIENT_VERSION,
+    platformRelease: process.env.AGENT_WORLD_PLATFORM_RELEASE,
+  },
   mcpSelfUrl: process.env.AGENT_WORLD_MCP_SELF_URL,
   mcpAllowedOrigins: String(process.env.AGENT_WORLD_MCP_ALLOWED_ORIGINS ?? "")
     .split(",")
@@ -96,6 +107,7 @@ const address = await app.listen(port, host);
 console.log(`Agent World Social listening on ${address.url}`);
 console.log(`Database: ${databaseFile}`);
 console.log(`Registration: ${inviteRequired ? "invite only" : "open"}`);
+console.log(`Trusted proxy: ${trustCloudflareProxy ? "Cloudflare Tunnel on loopback" : "disabled"}`);
 console.log(
   `World Hosts: ${worldHostMode}` +
     (worldHostMode === "local_codex"

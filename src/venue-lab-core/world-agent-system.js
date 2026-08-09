@@ -1,6 +1,35 @@
 export const WORLD_PACKAGE_SCHEMA_VERSION = 1;
-export const WORLD_BUILDER_COMPILER_VERSION = 1;
-export const WORLD_DIRECTOR_RUNTIME_VERSION = 1;
+export const WORLD_BUILDER_COMPILER_VERSION = 2;
+export const WORLD_DIRECTOR_RUNTIME_VERSION = 2;
+
+const BASE_PLAYER_EXPERIENCE_POLICY = {
+  principle: "先让玩家理解并在意眼前事件，再逐步解释世界和规则。",
+  opening: ["发生了什么", "为什么值得管", "行动可能改变什么"],
+  response_order: ["发生了什么", "玩家行动得到的反馈", "造成的具体变化", "接下来可做什么"],
+  information_budget: { first_turn_max_proper_nouns: 3, first_turn_max_choices: 3, one_immediate_objective: true, no_table_on_entry: true },
+  choice_style: "给出二至三个‘动词 + 对象’的不同方向，并允许自由输入。",
+};
+
+const BASE_ASYNC_CONTINUITY_POLICY = {
+  priority: "异步影响优先于伪造同时在线的热闹。",
+  layers: {
+    trace: "留下后来者能直接感知的物品、记号、档案、修复或建设",
+    state: "改变同一份公共世界状态",
+    narrative: "由世界内人物、记录或环境具体转述前人的影响",
+  },
+  idle: "无人时暂停自由推进、资源消耗和个人风险；再次激活时只结算排期事件与既有行动的确定后果。",
+  requirements: [
+    "每个被接受的公共行动至少形成痕迹、状态或叙事影响中的一种",
+    "失败和未完成可以成为可修复、可纠正或可接续的处境",
+  ],
+};
+
+const BASE_COLLECTIVE_DECISION_POLICY = {
+  independent: "日常、局部、可逆行动允许单人完成并立即反馈。",
+  npc_role: "NPC 可以表达立场，但不计作真人玩家的同意或法定人数。",
+  collective: "影响全体成员、长期公共资产或不可逆方向的决定，使用有截止、法定人数和分歧处理的集体窗口。",
+  fallback: "人数不足时只允许临时、可逆的维持方案，并保留正式议题。",
+};
 
 const FAMILY_MODULES = {
   general: {
@@ -15,7 +44,7 @@ const FAMILY_MODULES = {
       { id: "shared-project", scope: "world", states: ["proposed", "active", "completed"] },
     ],
     beat_library: [
-      { id: "first-contact", trigger: "entry", scene: "一个与世界当前状态直接相关、可立即处理的变化出现", choices: ["直接处理", "先调查", "留下公开邀请"], outcome: ["thread_progress", "public_trace"], hook: "行动造成的结果成为下一位参与者的入口" },
+      { id: "first-contact", trigger: "entry", scene: "一个具体的人或地方正在发生可立即处理的变化；玩家能看懂为什么值得管，以及行动可能改变什么", choices: ["直接搭把手", "先问清缘由", "留下公开邀请"], outcome: ["thread_progress", "public_trace"], hook: "行动造成的结果成为下一位参与者的入口" },
       { id: "consequence-return", trigger: "returning", scene: "玩家上次行动已经在世界中产生可见回声", choices: ["继续旧目标", "回应新变化", "转向同价值旁路"], outcome: ["journey_progress", "thread_progress"], hook: "一个未解决后果仍然开放" },
     ],
     npc_cast: [
@@ -25,7 +54,7 @@ const FAMILY_MODULES = {
     event_generator: {
       inputs: ["world_progress", "open_threads", "recent_changes", "player_stage", "population"],
       pools: ["opportunity", "obstacle", "relationship", "shared_consequence"],
-      rules: ["至少一个本轮可收束选项", "优先续接已有后果", "近期场景和冲突去重"],
+      rules: ["事件来自具体人物、地点或既有后果", "至少一个本轮可收束选项", "优先续接已有后果", "近期场景和冲突去重"],
     },
     pacing_model: { baseline: "低强度进入→明确阻力→阶段结果→开放钩子", escalation: "只在玩家已有准备或明确选择时升级", recovery: "高强度后提供一轮整理、关系或建设回报" },
     recovery_model: { failure: "保留已获得信息并提供降级目标", deviation: "把自由行动连接到最近开放线程", deadlock: "实例化一个低门槛 Beat" },
@@ -67,14 +96,14 @@ const FAMILY_MODULES = {
       { id: "upgrade", scope: "world", states: ["proposed", "building", "active"] },
     ],
     beat_library: [
-      { id: "mission-briefing", trigger: "entry", scene: "一项与当前能力匹配的任务公开了目标、已知风险和报酬", choices: ["领取并准备", "先查情报", "发布组队计划"], outcome: ["quest_stage", "supplies"], hook: "任务现场存在一条可复用的新路线" },
+      { id: "mission-briefing", trigger: "entry", scene: "一个具体托付人带来正在发生的护送、寻人、探路或抢险麻烦，并说明谁在等待结果", choices: ["先接住眼前麻烦", "问清路线和风险", "准备后立刻出发"], outcome: ["quest_stage", "supplies"], hook: "任务现场存在一条可复用的新路线" },
       { id: "bounded-obstacle", trigger: "challenge", scene: "路线上的具体障碍要求在资源、时间与风险间取舍", choices: ["消耗资源", "承担风险", "撤退并保留情报"], outcome: ["supplies", "risk", "map"], hook: "结果改变后续任务条件" },
     ],
     npc_cast: [
       { id: "quest-handler", name: "任务管理员", role: "NPC", goal: "发布可验证委托并记录结果", tension: "声誉与安全存在冲突" },
       { id: "field-specialist", name: "领域专家", role: "NPC", goal: "提供有条件的装备或情报", tension: "帮助需要资源、关系或承诺" },
     ],
-    event_generator: { inputs: ["rank", "equipment", "known_locations", "recent_quests", "party_size"], pools: ["survey", "recovery", "escort", "rescue", "anomaly"], rules: ["难度不超过能力加一", "存在单人路径", "奖励由风险与消耗决定"] },
+    event_generator: { inputs: ["rank", "equipment", "known_locations", "recent_quests", "party_size"], pools: ["survey", "recovery", "escort", "rescue", "anomaly"], rules: ["任务来自具体人物、生计或既有后果", "首轮可开始实质行动", "存在单人路径", "奖励由风险与消耗决定"] },
     pacing_model: { baseline: "接取1→准备2→挑战3-4→结果2→余波1", escalation: "准备和线索充分后才能升级", recovery: "高风险后进入整备回合" },
     recovery_model: { failure: "保留情报并生成修理、救援或降级任务", deviation: "把自由探索登记为临时任务", deadlock: "降低目标或开放替代路线" },
     settlement: { authority: "host_plus_rules", deterministic_fields: ["inventory", "supplies", "quest_stage", "rank_progress"], random_policy: "bounded_table_with_logged_inputs" },
@@ -91,8 +120,8 @@ const FAMILY_MODULES = {
       { id: "contact", scope: "member", states: ["unknown", "cooperative", "trusted", "broken"] },
     ],
     beat_library: [
-      { id: "first-scene", trigger: "entry", scene: "案件现场提供数个具体可观察细节，其中至少一项可以立即核验", choices: ["勘查现场", "重建时间线", "询问证人"], outcome: ["evidence", "testimony", "time_budget"], hook: "新证据打开第二条调查路径" },
-      { id: "evidence-conflict", trigger: "two_clues", scene: "两条已知信息在时间、来源或解释上发生可验证冲突", choices: ["寻找第三证据", "重新询问来源", "提交可证伪假说"], outcome: ["contradiction", "credibility"], hook: "冲突指向被忽略的现场" },
+      { id: "first-scene", trigger: "entry", scene: "一个具体委托人带来可独立成立的小案；现场有数个日常细节，其中至少一项可以立即核对", choices: ["去现场看看", "问清最后一次发生的事", "查一份相关记录"], outcome: ["evidence", "testimony", "time_budget"], hook: "新事实打开第二条调查路径" },
+      { id: "evidence-conflict", trigger: "two_clues", scene: "两份已知信息不可能同时为真，分歧具体落在时间、来源或物件上", choices: ["找第三份记录", "重新问信息来源", "回现场核对"], outcome: ["contradiction", "credibility"], hook: "冲突指向被忽略的现场" },
     ],
     npc_cast: [
       { id: "case-director", name: "案件负责人", role: "NPC", goal: "用可采信证据推进案件", tension: "时效不能取代证据标准" },
@@ -115,7 +144,7 @@ const FAMILY_MODULES = {
       { id: "expedition", scope: "member_or_party", states: ["planned", "departed", "encounter", "returned"] },
     ],
     beat_library: [
-      { id: "visible-shortage", trigger: "entry", scene: "公开台账显示一个迫近瓶颈和其连锁影响", choices: ["保守修复", "高风险获取", "提出集体方案"], outcome: ["resources", "risk", "facility"], hook: "本轮取舍改变下一周期压力" },
+      { id: "visible-shortage", trigger: "entry", scene: "一个具体的人或设施正受到短缺影响；先呈现眼前处境，再说明本次选择相关的少量账目", choices: ["先处理眼前问题", "核对消耗和替代方案", "采取可逆的临时方案"], outcome: ["resources", "risk", "facility"], hook: "本轮取舍改变下一周期压力" },
       { id: "dependency-choice", trigger: "facility_change", scene: "上游资源不足以同时维持两项设施", choices: ["优先生存", "优先建设", "寻找替代来源"], outcome: ["resources", "morale", "production"], hook: "受影响者提出新的公共议题" },
     ],
     npc_cast: [
@@ -139,7 +168,7 @@ const FAMILY_MODULES = {
       { id: "rescue", scope: "member_and_world", states: ["missing", "signal_found", "route_open", "resolved"] },
     ],
     beat_library: [
-      { id: "sensory-pattern", trigger: "entry", scene: "稳定锚点附近出现一条可以记录和复核的感官异常", choices: ["记录多组样本", "设计对照实验", "标记后撤退"], outcome: ["rule_confidence", "exposure", "recording"], hook: "异常指向一条未确认路线" },
+      { id: "sensory-pattern", trigger: "entry", scene: "一个熟悉的门、楼梯或声音突然出现具体错误；退路仍可看见，前人留下一句能立刻核对的警告", choices: ["先确认退路", "观察哪里变了", "留下记号后靠近"], outcome: ["rule_confidence", "exposure", "recording"], hook: "异常指向一条未确认路线" },
       { id: "conflicting-marker", trigger: "player_trace", scene: "真实玩家留下的路线标记与后来警告发生冲突", choices: ["核对时间", "远距离观察", "寻找原记录者"], outcome: ["marker_reliability", "route", "social_trace"], hook: "记录中出现另一处稳定锚点" },
     ],
     npc_cast: [
@@ -204,7 +233,13 @@ export function compileWorldPackage({
   artifact.host.facilitationPolicy ??= {};
   const existingMechanics = artifact.host.judgementPolicy.world_mechanics ?? {};
   artifact.host.judgementPolicy.world_mechanics = deepMerge(
-    { family, ...directorFamilyModules(family) },
+    {
+      family,
+      player_experience_policy: BASE_PLAYER_EXPERIENCE_POLICY,
+      async_continuity_policy: BASE_ASYNC_CONTINUITY_POLICY,
+      collective_decision_policy: BASE_COLLECTIVE_DECISION_POLICY,
+      ...directorFamilyModules(family),
+    },
     existingMechanics,
   );
   artifact.host.facilitationPolicy.content_loop = deepMerge(
@@ -243,7 +278,14 @@ export function compileWorldPackage({
     stages: ["classify", "compose_world", "compile_host", "simulate", "creator_confirm"],
     provenance: {
       creator_confirmed_paths: creatorPaths,
-      builder_inferred_paths: ["world.description", "world.definitionText", "host.judgementPolicy.world_mechanics.family"].filter((path) => !creatorPaths.includes(path)),
+      builder_inferred_paths: [
+        "world.description",
+        "world.definitionText",
+        "host.judgementPolicy.world_mechanics.family",
+        "host.judgementPolicy.world_mechanics.player_experience_policy",
+        "host.judgementPolicy.world_mechanics.async_continuity_policy",
+        "host.judgementPolicy.world_mechanics.collective_decision_policy",
+      ].filter((path) => !creatorPaths.includes(path)),
       defaulted_paths: source === "legacy"
         ? ["host.facilitationPolicy.content_loop"]
         : ["world.initialWorldState.world_progress", "world.initialMemberState.journey", "host.facilitationPolicy.content_loop"],
@@ -268,6 +310,8 @@ export function simulateWorldPackage(artifact) {
     ["multiplayer", Boolean(population.few_players) && Boolean(population.many_players), "少量与大量玩家均有编排策略"],
     ["failure_recovery", Boolean(mechanics.recovery_model?.failure) && Boolean(mechanics.recovery_model?.deadlock), "失败和卡死均有恢复路径"],
     ["authority", Boolean(mechanics.settlement?.authority) && host.judgementPolicy?.state_writes === "referee_only", "结算权威和状态写入边界明确"],
+    ["async_continuity", Object.keys(mechanics.async_continuity_policy?.layers ?? {}).length === 3 && mechanics.async_continuity_policy?.requirements?.length > 0, "公共行动具有痕迹、状态或叙事异步影响"],
+    ["collective_boundary", Boolean(mechanics.collective_decision_policy?.npc_role) && Boolean(mechanics.collective_decision_policy?.collective), "NPC 与真人集体决策边界明确"],
   ];
   return {
     valid: checks.every(([, passed]) => passed),
@@ -344,6 +388,9 @@ export function buildDirectorTurnPlan({ host, worldState, memberState, context =
     : selectedBeat === null
       ? "no_compatible_beat"
       : null;
+  const playerExperiencePolicy = mechanics.player_experience_policy ?? {};
+  const asyncContinuityPolicy = mechanics.async_continuity_policy ?? {};
+  const collectiveDecisionPolicy = mechanics.collective_decision_policy ?? {};
   return {
     contract_version: WORLD_DIRECTOR_RUNTIME_VERSION,
     family: mechanics.family ?? "general",
@@ -362,6 +409,18 @@ export function buildDirectorTurnPlan({ host, worldState, memberState, context =
       beat_choices: selectedBeat?.choices ?? [],
       required_outcomes: selectedBeat?.outcome ?? [],
       required_hook: selectedBeat?.hook ?? "留下一个可由当前玩家或后来者继续的开放钩子",
+      player_facing: {
+        response_order: playerExperiencePolicy.response_order ?? ["发生了什么", "行动反馈", "具体变化", "下一步"],
+        information_budget: playerExperiencePolicy.information_budget ?? {},
+        choice_style: playerExperiencePolicy.choice_style ?? "给出二至三个具体行动，并允许自由输入。",
+      },
+    },
+    continuity_contract: {
+      accepted_action_requirement: asyncContinuityPolicy.requirements?.[0]
+        ?? "每个被接受的公共行动至少形成一种可被后来者感知的影响。",
+      layers: asyncContinuityPolicy.layers ?? {},
+      idle: asyncContinuityPolicy.idle ?? population.zero_players ?? "无人时暂停自由推进。",
+      collective_decision: collectiveDecisionPolicy,
     },
     pacing: mechanics.pacing_model ?? {},
     recovery: recoveryReason ? mechanics.recovery_model?.deadlock ?? mechanics.recovery_model?.failure ?? "提供低门槛替代行动" : null,
@@ -371,6 +430,12 @@ export function buildDirectorTurnPlan({ host, worldState, memberState, context =
       "先使用选中的线程或 Beat；只有不适用时才调用有边界的事件生成器。",
       "玩家描述是尝试，不是既成结果；不得替其他真人决定。",
       "裁决必须说明依据、代价、新事实、状态变化和后续钩子。",
+      "无论单人还是多人，提交行动后都要立即说明是否接住、眼前反馈和下一步；需要异步结算时也要先返回可理解的受理反馈。",
+      asyncContinuityPolicy.requirements?.[0] ?? "被接受的公共行动必须至少留下痕迹、状态或叙事影响中的一种。",
+      asyncContinuityPolicy.idle ?? "无人时不任意推进世界或施加离线惩罚。",
+      collectiveDecisionPolicy.npc_role ?? "NPC 不替真人表态，也不计入真人法定人数。",
+      playerExperiencePolicy.principle ?? "先让玩家理解并在意眼前事件，再逐步解释规则。",
+      "内部裁决可以使用系统术语；面向玩家只使用自然语言，不展示内部字段、状态机或设计术语。",
     ],
   };
 }

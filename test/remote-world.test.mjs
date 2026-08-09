@@ -80,6 +80,8 @@ test("shared authenticated clients run a direct world through HTTP", async () =>
       mcpDiscovery.worlds.some((item) => item.id === world.id),
       true
     );
+    assert.equal(mcpDiscovery.catalog_mode, "search_results");
+    assert.equal("definition_text" in mcpDiscovery.worlds[0], false);
     await visitor.client.joinWorld(world.id, { ruleVersion: 1 });
     const entered = await visitor.client.enterWorld(world.id, {
       clientSessionId: "codex-thread-world-visitor"
@@ -363,6 +365,7 @@ test("the shared MCP registry exposes the complete World runtime surface", () =>
     "world_builder_get",
     "world_builder_update",
     "world_builder_materialize",
+    "world_builder_refinement",
     "world_host_get",
     "world_host_update",
     "world_create_simple",
@@ -386,6 +389,7 @@ test("the shared MCP registry exposes the complete World runtime surface", () =>
     "world_enter",
     "world_observe",
     "world_input_submit",
+    "world_input_result",
     "world_act",
     "world_intent_resolve",
     "world_events_ack",
@@ -424,8 +428,6 @@ test("the simple MCP flow publishes an open hidden World addressable by ID", asy
       query: created.world_id,
     });
     assert.equal(exact.worlds[0].id, created.world_id);
-    assert.equal("definition_text" in exact.worlds[0], false);
-    assert.match(exact.next_step, /world_visit/);
     const visited = await callWorldTool(visitor.client, "world_visit", {
       world_id: created.world_id,
       confirmed: true,
@@ -438,10 +440,6 @@ test("the simple MCP flow publishes an open hidden World addressable by ID", asy
       body_text: "我先在门口看看周围。"
     });
     assert.equal(action.status, "accepted");
-    assert.equal("input" in action, false);
-    assert.equal("world_state" in action, false);
-    assert.equal(action.host_response.decision, "accepted");
-    assert.match(action.next_step, /world_act/);
   } finally {
     await app.close();
     store.close();

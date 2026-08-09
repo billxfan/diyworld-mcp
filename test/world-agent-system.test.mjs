@@ -6,6 +6,8 @@ import {
   compileWorldPackage,
   directorFamilyModules,
   simulateWorldPackage,
+  WORLD_BUILDER_COMPILER_VERSION,
+  WORLD_DIRECTOR_RUNTIME_VERSION,
 } from "../src/venue-lab-core/world-agent-system.js";
 
 function baseHost(family = "quest") {
@@ -55,6 +57,7 @@ test("the compiler emits a versioned World Package and fills family modules", ()
   });
 
   assert.equal(artifact.worldPackage.schema_version, 1);
+  assert.equal(artifact.worldPackage.compiler_version, WORLD_BUILDER_COMPILER_VERSION);
   assert.equal(artifact.worldPackage.primary_family, "quest");
   assert.ok(
     artifact.worldPackage.provenance.creator_confirmed_paths.includes(
@@ -66,6 +69,8 @@ test("the compiler emits a versioned World Package and fills family modules", ()
   assert.ok(mechanics.director_abilities.length >= 3);
   assert.ok(mechanics.thread_templates.length >= 3);
   assert.ok(mechanics.beat_library.length >= 2);
+  assert.equal(Object.keys(mechanics.async_continuity_policy.layers).length, 3);
+  assert.match(mechanics.collective_decision_policy.npc_role, /不计作真人/u);
   assert.ok(artifact.world.initialWorldState.world_progress);
   assert.ok(artifact.world.initialMemberState.journey);
   assert.equal(simulateWorldPackage(artifact).valid, true);
@@ -130,6 +135,8 @@ test("the Director Runtime deterministically selects an open thread and Beat", (
   assert.equal(first.selection.thread.id, "echo-lamp");
   assert.equal(first.selection.beat.id, "echo-lamp");
   assert.equal(first.selection.source, "thread_beat_match");
+  assert.equal(first.contract_version, WORLD_DIRECTOR_RUNTIME_VERSION);
+  assert.match(first.continuity_contract.idle, /暂停/u);
 });
 
 test("the Director Runtime uses the declared recovery path when no thread is open", () => {

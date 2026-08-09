@@ -41,6 +41,13 @@ class FakeCodexWorldHosts {
   close() {}
 }
 
+class SlowFakeCodexWorldHosts extends FakeCodexWorldHosts {
+  async runWorldHostTurn(args) {
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    return super.runWorldHostTurn(args);
+  }
+}
+
 async function createPublishedWorld(client, name, marker) {
   const world = await client.createWorld({
     name,
@@ -136,44 +143,51 @@ test("each World binds one isolated local Codex Host thread", async () => {
   }
 });
 
-test("a normal World action waits briefly and returns its Host result", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-action-result-"));
+test("a submitted action is acknowledged and its final Host result is waitable", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-result-"));
   const store = new PetSocialStore(join(directory, "social.sqlite"));
-  const codex = new FakeCodexWorldHosts();
   const app = createAgentWorldApp({
     store,
     worldHostMode: "local_codex",
-    worldHostCodexClient: codex,
+    worldHostCodexClient: new SlowFakeCodexWorldHosts(),
     worldHostRoot: join(directory, "hosts"),
-    worldHostActionWaitMs: 2_000,
   });
   const address = await app.listen();
   try {
     const registration = await AgentWorldClient.register(address.url, {
-      recoveryEmail: "host-action-result@example.test",
-      displayName: "行动结果测试者",
-      agentProvider: "other",
+      recoveryEmail: "host-result@example.test",
+      displayName: "结果等待测试者",
+      agentProvider: "codex",
     });
     const client = new AgentWorldClient({
       serverUrl: address.url,
       token: registration.token,
     });
-    const world = await createPublishedWorld(client, "结果直达世界", "DIRECT_RESULT");
-    await client.enterWorld(world.id, { clientSessionId: "direct-result-session" });
+    const world = await createPublishedWorld(client, "回声世界", "RESULT_ONLY");
+    await client.enterWorld(world.id, { clientSessionId: "result-session" });
     const observed = await client.observeWorld(world.id);
-    const result = await client.actInWorld(world.id, {
+    const acknowledged = await client.submitWorldInput(world.id, {
       inputType: "action",
-      eventType: "action",
-      bodyText: "我整理广场上的公告栏。",
-      expectedWorldStateVersion: observed.world_state.version,
-      expectedMemberStateVersion: observed.member_state.version,
-      idempotencyKey: "direct-host-result",
+      eventType: "inspect",
+      bodyText: "检查回声来自哪里。",
+      observedWorldStateVersion: observed.world_state.version,
+      observedMemberStateVersion: observed.member_state.version,
+      idempotencyKey: "result:inspect",
     });
 
-    assert.equal(result.status, "accepted");
-    assert.equal(result.judgement.decision, "accepted");
-    assert.match(result.outcome.body_text, /已处理该输入/u);
-    assert.equal(codex.turns.length, 1);
+    assert.equal(acknowledged.processing.acknowledged, true);
+    assert.equal(acknowledged.processing.final, false);
+    assert.equal(acknowledged.processing.result_tool, "world_input_result");
+
+    const completed = await client.worldInputResult(
+      world.id,
+      acknowledged.input.id,
+      { waitMs: 2_000 },
+    );
+    assert.equal(completed.processing.state, "completed");
+    assert.equal(completed.processing.final, true);
+    assert.equal(completed.status, "accepted");
+    assert.match(completed.host_response.outcome_text, /已处理该输入/u);
   } finally {
     await app.close();
     store.close();

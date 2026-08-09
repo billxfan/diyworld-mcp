@@ -1154,7 +1154,7 @@ export function migrateWorldRuntime(db) {
     db.prepare(`
       INSERT OR IGNORE INTO platform_agents (
         id, kind, name, status, policy_version, created_at, updated_at
-      ) VALUES (?, 'world_builder', '创世 Agent', 'active', 3, ?, ?)
+      ) VALUES (?, 'world_builder', '创世 Agent', 'active', 4, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         status = excluded.status,
@@ -1168,7 +1168,7 @@ export function migrateWorldRuntime(db) {
       INSERT INTO world_agent_templates (
         id, name, description, version, status, world_defaults_json,
         referee_defaults_json, created_by_agent_id, created_at, updated_at
-      ) VALUES (?, ?, ?, 5, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, 6, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         description = excluded.description,

@@ -27,6 +27,10 @@ test("the platform publishes five focused solo-first official Worlds", () => {
     );
     assert.equal(new Set(catalog.map((world) => world.category)).size, 5);
     assert.equal(new Set(catalog.map((world) => world.shortcut)).size, 5);
+    assert.deepEqual(
+      catalog.map((world) => world.name),
+      ["晨雾镇", "风口集", "钟楼巷 19 号", "白河电站", "失序回廊"],
+    );
 
     for (const definition of OFFICIAL_WORLDS) {
       const world = catalog.find((candidate) => candidate.id === definition.id);
@@ -69,6 +73,11 @@ test("every official World provides an isolated Host and an immediate solo actio
         ),
       );
       assert.equal(entered.host_guidance.choices.length, 3);
+      assert.doesNotMatch(
+        `${definition.description} ${entered.host_guidance.host.onboarding_policy.welcome_text} ${entered.host_guidance.choices.map((choice) => choice.label).join(" ")}`,
+        /Truth Package|Beat|状态机|置信度|暴露值|推进一个任务节点|可证伪假说/u,
+        definition.id,
+      );
       assert.equal(entered.host_guidance.live_context.currently_alone, true);
       assert.equal(
         entered.host_guidance.participation_context.participation_style,
@@ -106,6 +115,23 @@ test("every official World has a distinct gameplay loop, state model, and Host c
       assert.ok(mechanics.pacing_model.baseline, definition.id);
       assert.ok(mechanics.recovery_model.failure, definition.id);
       assert.ok(mechanics.settlement.authority, definition.id);
+      assert.equal(
+        mechanics.player_experience_policy.information_budget.no_table_on_entry,
+        true,
+        definition.id,
+      );
+      assert.match(
+        mechanics.player_experience_policy.principle,
+        /先让玩家在意/u,
+        definition.id,
+      );
+      assert.deepEqual(
+        Object.keys(mechanics.async_continuity_policy.layers),
+        ["trace", "state", "narrative"],
+        definition.id,
+      );
+      assert.match(mechanics.async_continuity_policy.idle, /暂停/u, definition.id);
+      assert.match(mechanics.collective_decision_policy.npc_role, /不计作真人/u, definition.id);
       assert.ok(host.judgement_policy.npc_policy.cast.length >= 2, definition.id);
       assert.equal(
         host.judgement_policy.npc_policy.separate_agent_default,
@@ -206,14 +232,35 @@ test("all five official Host contracts execute one mechanic-specific turn and re
       assert.ok(work.world_state.value[worldKey], definition.id);
       assert.ok(work.actor_member_state.value[memberKey], definition.id);
       assert.equal(work.contract_version, 2, definition.id);
-      assert.equal(work.director_plan.contract_version, 1, definition.id);
+      assert.equal(work.director_plan.contract_version, 2, definition.id);
       assert.equal(
         work.director_plan.family,
         work.host.judgement_policy.world_mechanics.family ?? "general",
         definition.id,
       );
       assert.ok(work.director_plan.selection.beat, definition.id);
+      assert.equal(
+        work.director_plan.selection.beat.id,
+        work.director_plan.selection.thread.beat,
+        definition.id,
+      );
       assert.ok(work.director_plan.scene_contract.required_hook, definition.id);
+      assert.match(
+        work.director_plan.continuity_contract.accepted_action_requirement,
+        /至少形成/u,
+        definition.id,
+      );
+      assert.match(work.director_plan.continuity_contract.idle, /暂停/u, definition.id);
+      assert.match(
+        work.director_plan.continuity_contract.collective_decision.npc_role,
+        /不计作真人/u,
+        definition.id,
+      );
+      assert.equal(
+        work.director_plan.scene_contract.player_facing.information_budget.first_turn_max_choices,
+        3,
+        definition.id,
+      );
       assert.ok(work.director_plan.settlement.authority, definition.id);
 
       executor.resolveLocalCodexHostInput({
@@ -260,7 +307,7 @@ test("all five official Host contracts execute one mechanic-specific turn and re
   }
 });
 
-test("official v4 gameplay state backfills preserve existing World and Character progress", () => {
+test("official v6 gameplay state backfills preserve existing World and Character progress", () => {
   const db = openDatabase(":memory:");
   const visitor = createCharacter(db, "official-v2-migration", "旧版居民");
   const worldId = "official-center-town";
@@ -294,6 +341,28 @@ test("official v4 gameplay state backfills preserve existing World and Character
     assert.equal(memberState.journey.stage, "legacy");
     assert.equal(memberState.legacy_badge, "founder");
     assert.ok(memberState.resident);
+  } finally {
+    db.close();
+  }
+});
+
+test("official v6 adds grounded world-specific state without changing stable top-level contracts", () => {
+  const db = openDatabase(":memory:");
+  const visitor = createCharacter(db, "official-v6-state", "新版状态检验者");
+  try {
+    const expectations = new Map([
+      ["official-center-town", ["town", "resident_routines"]],
+      ["official-adventurers-guild", ["adventure", "caravan_schedule"]],
+      ["official-city-detective-agency", ["mystery", "case_season"]],
+      ["official-apocalypse-shelter", ["settlement", "season_phase"]],
+      ["official-liminal-backrooms", ["backrooms", "documented_zones"]],
+    ]);
+    for (const [worldId, [topLevel, groundedField]] of expectations) {
+      visitor.joinWorld({ worldId, ruleVersion: OFFICIAL_WORLD_VERSION });
+      const state = visitor.worldStateView(worldId).value;
+      assert.ok(state[topLevel], worldId);
+      assert.ok(state[topLevel][groundedField], worldId);
+    }
   } finally {
     db.close();
   }
