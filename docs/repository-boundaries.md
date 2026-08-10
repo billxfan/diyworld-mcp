@@ -50,3 +50,32 @@ For an occasional full scan of every reachable commit, run `npm run repo:public-
 If the full-history scan fails, pause publication and classify the finding before changing history. Rotate a credential first if one is involved. History rewriting must be prepared in a separate clone, reviewed, and coordinated with repository owners because it changes commit IDs and disrupts existing clones, tags, and open branches. Rewriting a repository also cannot retract data already copied into forks, caches, or local clones.
 
 Automated detection is a backstop, not authorization to publish. Review the complete staged diff, verify that fixtures use reserved example domains, and use a Git hosting `noreply` author address for public commits.
+
+## Normal contribution path
+
+1. Update local `main` from the public remote without merging unrelated internal history.
+2. Create a short-lived branch. Do not develop or commit directly on `main`.
+3. Run `npm run hooks:install` once per clone to enable the repository pre-push gate.
+4. Stage explicit files, inspect the staged diff, and commit with a Git hosting `noreply` identity.
+5. Push the branch and open a pull request using the repository checklist.
+6. Merge only after the public-boundary check, tests, migration rehearsal, and website build pass in CI.
+7. Create or update a release tag only from the protected `main` history.
+
+The public `main` branch must reject deletion and non-fast-forward updates during normal operation. A temporary exception for a verified sensitive-data cleanup requires explicit repository-owner approval, a recovery bundle, an isolated dry-run, exact remote ref checks, and immediate restoration of protection.
+
+## Sensitive-data incident response
+
+If private data reaches any public commit, tag, pull request, release, artifact, or log:
+
+1. Stop merges, releases, and automated publishing. Do not repeat the sensitive value in issues or chat.
+2. Revoke or rotate credentials before changing Git history.
+3. Record affected refs, pull requests, forks, releases, artifacts, and the first commit that introduced the exposure.
+4. Create a permission-restricted recovery bundle outside the repository.
+5. Use `git-filter-repo --sensitive-data-removal` in an isolated fresh clone. Run a dry-run and verify that the replacement removes every historical match, commit identity, and tag identity.
+6. Run the full public gate, `npm run repo:public-check -- --all-history`, tests, migration rehearsal, package inspection, and website build on the rewritten clone.
+7. Recheck every remote ref immediately before updating it. Use an exact `--force-with-lease`; never use an unconstrained force push.
+8. Restore branch protection and notify collaborators to re-clone or carefully rebase. Never merge an old clone back into the rewritten history.
+9. Ask the hosting provider to purge cached commit views and pull-request references. Provide the repository, affected pull-request count, first changed commits, and any orphaned LFS report without pasting the sensitive value.
+10. Verify the old object is no longer reachable, close the incident record, and securely remove temporary mirrors and recovery bundles according to the retention decision.
+
+History rewriting does not remove copies already held in clones or forks. Coordinate with their owners separately.

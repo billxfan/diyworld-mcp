@@ -97,6 +97,8 @@ DIYworld is a Node.js modular monolith using built-in SQLite, an HTTP JSON API, 
 - [Release, migration, backup, and rollback runbook](docs/agent-world-release-runbook.md)
 - [Regression checklist](REGRESSION-CHECKLIST.zh-CN.md)
 - [Public repository boundaries and contribution gate](docs/repository-boundaries.md)
+- [Contribution workflow](CONTRIBUTING.md)
+- [Security reporting](SECURITY.md)
 
 ## Development
 

@@ -43,6 +43,7 @@
     "connect:agent": "node scripts/connect-agent.mjs",
     "doctor": "node scripts/doctor.mjs",
     "backup": "node scripts/backup.mjs",
+    "hooks:install": "node scripts/install-git-hooks.mjs",
     "repo:public-check": "node scripts/public-repo-check.mjs",
     "release:check": "node scripts/release-check.mjs",
     "docs:official-worlds": "node scripts/generate-official-world-doc.mjs",

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -24,6 +24,11 @@ test("future public commits require a Git hosting noreply address", () => {
   assert.equal(isPublicCommitEmail(`Builder <123+builder@${"users.noreply.github.com"}>`), true);
   assert.equal(isPublicCommitEmail(`noreply@${"github.com"}`), true);
   assert.equal(isPublicCommitEmail(`developer@${"personal.invalid"}`), false);
+});
+
+test("the opt-in pre-push public gate is executable", () => {
+  const hook = statSync(resolve(projectRoot, ".githooks/pre-push"));
+  assert.notEqual(hook.mode & 0o111, 0);
 });
 
 test("the public gate reports locations without echoing suspected secrets", () => {
