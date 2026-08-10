@@ -97,6 +97,8 @@ test("World event delivery names the channel, target, and honest receipt boundar
   assert.match(bridgeSource, /world\.event_committed/u);
   assert.match(bridgeSource, /deliverIncomingWorldEvent/u);
   assert.match(bridgeSource, /markEventReceipt\(event\.eventId, "delivered"\)/u);
+  assert.match(bridgeSource, /active Codex[\s\S]*return false;/u);
+  assert.doesNotMatch(bridgeSource, /throw error;/u);
 });
 
 test("collective World prompts display their durable prompt without claiming a committed outcome", () => {

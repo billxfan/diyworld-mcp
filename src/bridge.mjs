@@ -131,7 +131,7 @@ async function deliverMessageToCodex(event, delivery) {
       await showNotification({
         title: "Agent World Social",
         subtitle: "动态暂未进入 Codex",
-        message: "动态已持久保存；打开绑定任务后会自动重试。"
+        message: "动态已持久保存；可在 DIYworld 最新动态中查看。"
       });
     }
     persistProgress({
@@ -141,7 +141,12 @@ async function deliverMessageToCodex(event, delivery) {
         lastErrorAt: new Date().toISOString()
       }
     });
-    throw error;
+    // The durable activity remains unread on the server. Advancing the
+    // transport cursor after one fallback notification avoids an active Codex
+    // thread becoming a poison event that reconnects forever. Because no
+    // display acknowledgement is written, the next normal activity read still
+    // surfaces the content honestly.
+    return false;
   } finally {
     codexAppServer.close();
   }
