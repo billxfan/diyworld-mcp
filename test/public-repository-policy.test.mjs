@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -6,6 +7,7 @@ import test from "node:test";
 
 import {
   isPublicCommitEmail,
+  selectPublicHeadRevision,
   scanPublicFiles,
   scanPublicRepository,
 } from "../scripts/public-repo-check.mjs";
@@ -29,6 +31,27 @@ test("future public commits require a Git hosting noreply address", () => {
 test("the opt-in pre-push public gate is executable", () => {
   const hook = statSync(resolve(projectRoot, ".githooks/pre-push"));
   assert.notEqual(hook.mode & 0o111, 0);
+});
+
+test("pull-request CI scans the head commit instead of GitHub's synthetic merge", () => {
+  const directory = mkdtempSync(join(tmpdir(), "diyworld-public-event-"));
+  try {
+    const headSha = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: projectRoot,
+      encoding: "utf8",
+    }).trim();
+    const eventPath = join(directory, "event.json");
+    writeFileSync(eventPath, JSON.stringify({ pull_request: { head: { sha: headSha } } }));
+    assert.equal(
+      selectPublicHeadRevision(projectRoot, {
+        GITHUB_EVENT_NAME: "pull_request",
+        GITHUB_EVENT_PATH: eventPath,
+      }),
+      headSha,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("the public gate reports locations without echoing suspected secrets", () => {

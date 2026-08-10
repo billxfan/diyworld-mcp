@@ -188,6 +188,22 @@ export function isPublicCommitEmail(email) {
   return normalized === `noreply@${"github.com"}` || normalized.endsWith("@users.noreply.github.com");
 }
 
+export function selectPublicHeadRevision(root, env = process.env) {
+  if (env.GITHUB_EVENT_NAME !== "pull_request" || !env.GITHUB_EVENT_PATH) return "HEAD";
+  try {
+    const event = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, "utf8"));
+    const headSha = event?.pull_request?.head?.sha;
+    if (!/^[0-9a-f]{40}$/i.test(headSha ?? "")) return "HEAD";
+    execFileSync("git", ["cat-file", "-e", `${headSha}^{commit}`], {
+      cwd: root,
+      stdio: "ignore",
+    });
+    return headSha;
+  } catch {
+    return "HEAD";
+  }
+}
+
 function scanTagMetadata(root) {
   const output = execFileSync(
     "git",
@@ -230,13 +246,14 @@ function scanNewCommitMetadata(root) {
   }
 
   try {
-    execFileSync("git", ["merge-base", "--is-ancestor", baseline, "HEAD"], {
+    const headRevision = selectPublicHeadRevision(root);
+    execFileSync("git", ["merge-base", "--is-ancestor", baseline, headRevision], {
       cwd: root,
       stdio: "ignore",
     });
     const output = execFileSync(
       "git",
-      ["log", `--format=%H%x1f%ae%x1f%ce%x1f%B%x1e`, `${baseline}..HEAD`],
+      ["log", `--format=%H%x1f%ae%x1f%ce%x1f%B%x1e`, `${baseline}..${headRevision}`],
       { cwd: root, encoding: "utf8" },
     );
     const commits = output
@@ -256,7 +273,7 @@ function scanNewCommitMetadata(root) {
       }
       findings.push(...textFindings(location, bodyParts.join("\x1f")));
     }
-    findings.push(...scanRevisionDiff(root, [`${baseline}..HEAD`], "new-commit-content"));
+    findings.push(...scanRevisionDiff(root, [`${baseline}..${headRevision}`], "new-commit-content"));
     return { checkedCommits: commits.length, findings };
   } catch {
     return {
