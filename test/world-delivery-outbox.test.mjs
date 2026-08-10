@@ -4,7 +4,11 @@ import test from "node:test";
 import { createPetSocialApp } from "../src/app.mjs";
 import { PetSocialClient } from "../src/client.mjs";
 import { PetSocialStore } from "../src/store.mjs";
-import { enqueueWorldDelivery } from "../src/world-delivery-outbox.mjs";
+import {
+  enqueueWorldDelivery,
+  retryDeadLetterWorldDelivery,
+  worldDeliveryOutboxStatus,
+} from "../src/world-delivery-outbox.mjs";
 
 async function registerClient(address, suffix) {
   const registration = await PetSocialClient.register(address.url, {
@@ -67,6 +71,8 @@ test("committed World outcome survives request retries and startup drain is idem
   const errors = [];
   const firstApp = createPetSocialApp({
     store,
+    worldDeliveryDrainIntervalMs: 0,
+    worldDeliveryRetryBaseDelayMs: 0,
     worldDeliveryBeforePersist() {
       if (deliveryFailuresRemaining <= 0) return;
       deliveryFailuresRemaining -= 1;
@@ -120,7 +126,11 @@ test("committed World outcome survives request retries and startup drain is idem
     await firstApp.close();
   }
 
-  const recoveredApp = createPetSocialApp({ store });
+  const recoveredApp = createPetSocialApp({
+    store,
+    worldDeliveryDrainIntervalMs: 0,
+    worldDeliveryRetryBaseDelayMs: 0,
+  });
   const recoveredAddress = await recoveredApp.listen();
   try {
     assert.ok(recoveredAddress.port > 0);
@@ -145,6 +155,81 @@ test("committed World outcome survives request retries and startup drain is idem
     assert.equal(committedEvents(store, actor.registration.pet.id, outcomeId).length, 1);
   } finally {
     await recoveredApp.close();
+    store.close();
+  }
+});
+
+test("World delivery failures back off, dead-letter, and can be explicitly retried", async () => {
+  const store = new PetSocialStore();
+  let timestamp = Date.parse("2026-08-10T00:00:00.000Z");
+  let injectFailure = true;
+  const app = createPetSocialApp({
+    store,
+    now: () => timestamp,
+    worldDeliveryDrainIntervalMs: 0,
+    worldDeliveryRetryBaseDelayMs: 1_000,
+    worldDeliveryMaxAttempts: 2,
+    worldDeliveryBeforePersist() {
+      if (injectFailure) throw new Error("persistent delivery poison");
+    },
+  });
+  const address = await app.listen();
+  try {
+    const owner = await registerClient(address, "outbox-dead-owner");
+    const actor = await registerClient(address, "outbox-dead-actor");
+    const world = await createPublishedWorld(owner.client, "dead-letter");
+    await actor.client.joinWorld(world.id, { ruleVersion: 1 });
+    await actor.client.enterWorld(world.id, { clientSessionId: "outbox-dead-actor" });
+    const action = await actor.client.actInWorld(world.id, {
+      eventType: "explore.personal",
+      bodyText: "触发需要退避的投递。",
+      idempotencyKey: "outbox-dead-letter",
+    });
+    const firstFailure = store.db.prepare(`
+      SELECT * FROM world_delivery_outbox WHERE source_world_event_id = ?
+    `).get(action.outcome.id);
+    assert.equal(firstFailure.attempt_count, 1);
+    assert.equal(firstFailure.dead_letter_at, null);
+    assert.equal(
+      firstFailure.next_attempt_at,
+      "2026-08-10T00:00:01.000Z",
+    );
+    assert.equal(app.drainWorldDeliveryOutbox().processed, 0);
+
+    timestamp += 1_000;
+    const terminalDrain = app.drainWorldDeliveryOutbox();
+    assert.equal(terminalDrain.processed, 1);
+    assert.equal(terminalDrain.dead_lettered.length, 1);
+    const status = worldDeliveryOutboxStatus(store.db, { now: timestamp });
+    assert.deepEqual(status, {
+      pending: 0,
+      due: 0,
+      scheduled: 0,
+      dead_letter: 1,
+      oldest_pending_at: null,
+    });
+    const health = await fetch(`${address.url}/health`).then((response) => response.json());
+    assert.equal(health.ok, true);
+    assert.equal(health.degraded, true);
+    assert.equal(health.runtime.delivery_outbox.dead_letter, 1);
+    const ready = await fetch(`${address.url}/ready`);
+    assert.equal(ready.status, 200, "dead letters degrade readiness without killing it");
+
+    const dead = store.db.prepare(`
+      SELECT id FROM world_delivery_outbox WHERE source_world_event_id = ?
+    `).get(action.outcome.id);
+    assert.equal(retryDeadLetterWorldDelivery(store.db, dead.id, {
+      timestamp: new Date(timestamp).toISOString(),
+    }), true);
+    injectFailure = false;
+    assert.equal(app.drainWorldDeliveryOutbox().processed, 1);
+    assert.equal(
+      store.db.prepare("SELECT status FROM world_delivery_outbox WHERE id = ?")
+        .get(dead.id).status,
+      "delivered",
+    );
+  } finally {
+    await app.close();
     store.close();
   }
 });
@@ -290,6 +375,8 @@ test("collective delivery retries the authoritative audience snapshot instead of
   let failPromptDelivery = true;
   const app = createPetSocialApp({
     store,
+    worldDeliveryDrainIntervalMs: 0,
+    worldDeliveryRetryBaseDelayMs: 0,
     worldDeliveryBeforePersist({ row }) {
       if (!failPromptDelivery || row.event_type !== "world.interaction_opened") return;
       failPromptDelivery = false;

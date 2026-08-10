@@ -45,6 +45,22 @@ const worldHostMaxAttempts = Number.parseInt(
   process.env.AGENT_WORLD_HOST_MAX_ATTEMPTS ?? "3",
   10,
 );
+const worldHostRetryBaseDelayMs = Number.parseInt(
+  process.env.AGENT_WORLD_HOST_RETRY_BASE_DELAY_MS ?? "1000",
+  10,
+);
+const worldDeliveryMaxAttempts = Number.parseInt(
+  process.env.AGENT_WORLD_DELIVERY_MAX_ATTEMPTS ?? "5",
+  10,
+);
+const worldDeliveryRetryBaseDelayMs = Number.parseInt(
+  process.env.AGENT_WORLD_DELIVERY_RETRY_BASE_DELAY_MS ?? "1000",
+  10,
+);
+const worldDeliveryDrainIntervalMs = Number.parseInt(
+  process.env.AGENT_WORLD_DELIVERY_DRAIN_INTERVAL_MS ?? "1000",
+  10,
+);
 const worldHostPrewarm = !["0", "false", "no", "off"].includes(
   String(process.env.AGENT_WORLD_HOST_PREWARM ?? "true").toLowerCase(),
 );
@@ -84,6 +100,30 @@ if (
     "AGENT_WORLD_HOST_MAX_ATTEMPTS must be an integer between 1 and 5",
   );
 }
+if (
+  !Number.isInteger(worldHostRetryBaseDelayMs) ||
+  worldHostRetryBaseDelayMs < 0 ||
+  worldHostRetryBaseDelayMs > 60_000
+) {
+  throw new Error(
+    "AGENT_WORLD_HOST_RETRY_BASE_DELAY_MS must be between 0 and 60000",
+  );
+}
+if (
+  !Number.isInteger(worldDeliveryMaxAttempts) ||
+  worldDeliveryMaxAttempts < 1 ||
+  worldDeliveryMaxAttempts > 100 ||
+  !Number.isInteger(worldDeliveryRetryBaseDelayMs) ||
+  worldDeliveryRetryBaseDelayMs < 0 ||
+  worldDeliveryRetryBaseDelayMs > 3_600_000 ||
+  !Number.isInteger(worldDeliveryDrainIntervalMs) ||
+  worldDeliveryDrainIntervalMs < 0 ||
+  worldDeliveryDrainIntervalMs > 60_000
+) {
+  throw new Error(
+    "World delivery retry settings are outside their supported ranges",
+  );
+}
 
 mkdirSync(dirname(databaseFile), { recursive: true });
 
@@ -96,7 +136,11 @@ const app = createPetSocialApp({
   worldHostMode,
   worldHostMaxConcurrency,
   worldHostMaxAttempts,
+  worldHostRetryBaseDelayMs,
   worldHostPrewarm,
+  worldDeliveryMaxAttempts,
+  worldDeliveryRetryBaseDelayMs,
+  worldDeliveryDrainIntervalMs,
   trustCloudflareProxy,
   clientRelease: {
     recommendedClientVersion:

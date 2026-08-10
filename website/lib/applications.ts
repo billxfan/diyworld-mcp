@@ -45,9 +45,6 @@ async function ensureSchema() {
 export async function saveApplication(input: ApplicationInput) {
   await ensureSchema();
   const database = getSql();
-  const existing = await database`
-    SELECT id FROM applications WHERE email = ${input.email} LIMIT 1
-  `;
   const rows = await database`
     INSERT INTO applications (
       name,
@@ -65,19 +62,13 @@ export async function saveApplication(input: ApplicationInput) {
       ${input.selectedWorld ?? null},
       ${input.locale ?? "zh"}
     )
-    ON CONFLICT (email) DO UPDATE SET
-      name = EXCLUDED.name,
-      world_type = EXCLUDED.world_type,
-      selected_world_id = EXCLUDED.selected_world_id,
-      selected_world = EXCLUDED.selected_world,
-      locale = EXCLUDED.locale,
-      updated_at = NOW()
+    ON CONFLICT (email) DO NOTHING
     RETURNING id, updated_at
   `;
 
   return {
-    id: Number(rows[0].id),
-    created: existing.length === 0,
-    updatedAt: new Date(String(rows[0].updated_at)),
+    id: rows[0] ? Number(rows[0].id) : null,
+    created: rows.length === 1,
+    updatedAt: rows[0] ? new Date(String(rows[0].updated_at)) : new Date(),
   };
 }

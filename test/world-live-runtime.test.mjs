@@ -502,13 +502,13 @@ test("the Host collects a quorum and resolves the whole interaction atomically",
       eventType: "collective.vote",
       bodyText: "先修屋顶，雨季快到了。",
       replyToEventId: opened.prompt_event.id,
-      visibility: "actor",
       observedWorldStateVersion: firstObserved.state_version,
       observedMemberStateVersion: firstObserved.member_state_version,
       idempotencyKey: "collective-first-response",
       requireLive: true,
     });
     assert.equal(first.status, "collecting");
+    assert.equal(first.input.visibility, "actor");
     assert.equal(first.input.interaction_id, opened.interaction.id);
     assert.equal(first.interaction.prompt_text, opened.prompt_event.body_text);
     assert.match(first.host_response.outcome_text, /1\/2/);
@@ -531,18 +531,23 @@ test("the Host collects a quorum and resolves the whole interaction atomically",
     );
 
     const secondObserved = second.observeWorld({ worldId });
+    assert.equal(
+      secondObserved.events.some((event) => event.id === first.input.id),
+      false,
+    );
     const secondResponse = second.actInWorld({
       worldId,
       eventType: "collective.vote",
       bodyText: "也先修屋顶，厨房可以之后扩建。",
       replyToEventId: opened.prompt_event.id,
-      visibility: "actor",
+      visibility: "world",
       observedWorldStateVersion: secondObserved.state_version,
       observedMemberStateVersion: secondObserved.member_state_version,
       idempotencyKey: "collective-second-response",
       requireLive: true,
     });
     assert.equal(secondResponse.status, "ready_for_host");
+    assert.equal(secondResponse.input.visibility, "actor");
     assert.match(secondResponse.host_response.outcome_text, /2\/2/);
     assert.match(secondResponse.host_response.outcome_text, /等待 Host 统一结算/);
     assert.match(secondResponse.host_response.outcome_text, /没有改变共享世界/);
@@ -567,6 +572,20 @@ test("the Host collects a quorum and resolves the whole interaction atomically",
           expectedWorldStateVersion: 1,
         }),
       "WORLD_INTERACTION_BATCH_REQUIRED",
+    );
+
+    expectCode(
+      () => owner.resolveWorldHostInteraction({
+        worldId,
+        interactionId: opened.interaction.id,
+        clientSessionId: "collective-owner",
+        decision: "accepted",
+        reasonText: "这次尝试故意泄露私人回应。",
+        outcomeText: `公开原文：${first.input.body_text}`,
+        result: { leaked_input_id: first.input.id },
+        expectedWorldStateVersion: 1,
+      }),
+      "COLLECTIVE_PRIVATE_DATA_LEAK",
     );
 
     const resolved = owner.resolveWorldHostInteraction({

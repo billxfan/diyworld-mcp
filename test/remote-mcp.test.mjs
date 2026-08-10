@@ -111,6 +111,26 @@ test("the Tunnel-ready remote MCP exposes a concise authenticated tool surface",
     assert.equal(profile.body.result.structuredContent.profile.name, "远程 MCP 测试者");
     assert.equal("form" in profile.body.result.structuredContent.profile, false);
 
+    const rejectedCreation = await callMcp(address.url, registration.token, {
+      jsonrpc: "2.0",
+      id: 31,
+      method: "tools/call",
+      params: {
+        name: "world_create_simple",
+        arguments: {
+          name: "未经确认的世界",
+          rules_text: "这个调用必须被服务端拒绝。",
+          visibility: "public",
+          confirmed: false,
+        },
+      },
+    });
+    assert.equal(rejectedCreation.body.result.isError, true);
+    assert.match(
+      rejectedCreation.body.result.content[0].text,
+      /CONFIRMATION_REQUIRED|explicit confirmation/u,
+    );
+
     const catalog = await callMcp(address.url, registration.token, {
       jsonrpc: "2.0",
       id: 4,

@@ -45,6 +45,13 @@ const tags = {
   items: text("用于发现世界的标签。", 24)
 };
 
+function requireExplicitConfirmation(args, action) {
+  if (args?.confirmed === true) return;
+  const error = new Error(`${action} requires explicit confirmation.`);
+  error.code = "CONFIRMATION_REQUIRED";
+  throw error;
+}
+
 export const worldTools = [
   {
     name: "world_search",
@@ -854,14 +861,23 @@ const catalogWorld = (world) => ({
 export function formatWorldCatalog(result, { query = "" } = {}) {
   const normalizedQuery = String(query ?? "").trim();
   const worlds = (result?.worlds ?? result?.spaces ?? []).map(catalogWorld);
+  const hasMore = result?.has_more === true;
+  const complete = normalizedQuery === "" && !hasMore;
   return {
-    catalog_mode: normalizedQuery ? "search_results" : "complete_public_catalog",
+    catalog_mode: normalizedQuery
+      ? "search_results"
+      : complete
+        ? "complete_public_catalog"
+        : "public_catalog_page",
     query: normalizedQuery || null,
     total: worlds.length,
-    complete: normalizedQuery === "",
+    complete,
+    has_more: hasMore,
     guidance: normalizedQuery
       ? "如需查看某个世界的完整设定与规则，请使用 world_get。"
-      : "这是一次返回的完整公开世界目录；请直接向用户展示全部结果，不要再按主题重复搜索。完整设定与规则请使用 world_get。",
+      : complete
+        ? "这是一次返回的完整公开世界目录；请直接向用户展示全部结果，不要再按主题重复搜索。完整设定与规则请使用 world_get。"
+        : "公开世界目录仍有更多结果；当前接口尚未提供游标，请明确说明本页不完整，不要声称已展示全部世界。",
     worlds
   };
 }
@@ -1022,6 +1038,7 @@ export async function callWorldTool(client, name, args = {}) {
         })
       );
     case "world_create_simple": {
+      requireExplicitConfirmation(args, "Creating and publishing a World");
       const draft = await client.createWorld({
         name: args.name,
         description: args.rules_text.slice(0, 500),

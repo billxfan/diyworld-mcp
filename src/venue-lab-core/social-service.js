@@ -187,6 +187,32 @@ function optionalJsonObject(value, field, options) {
   return jsonObject(value, field, options);
 }
 
+function jsonStringLeaves(value, output = []) {
+  if (typeof value === "string") {
+    output.push(value);
+  } else if (Array.isArray(value)) {
+    for (const child of value) jsonStringLeaves(child, output);
+  } else if (value && typeof value === "object") {
+    for (const child of Object.values(value)) jsonStringLeaves(child, output);
+  }
+  return output;
+}
+
+function assertCollectivePublicProjection({ outcomeText, result, worldStatePatch, privateValues }) {
+  const publicStrings = jsonStringLeaves({ outcomeText, result, worldStatePatch });
+  for (const privateValue of privateValues) {
+    if (typeof privateValue !== "string" || privateValue.length === 0) continue;
+    if (publicStrings.some((candidate) =>
+      candidate === privateValue ||
+      (privateValue.length >= 8 && candidate.includes(privateValue)))) {
+      fail(
+        "COLLECTIVE_PRIVATE_DATA_LEAK",
+        "A public collective outcome must not quote or identify a private response.",
+      );
+    }
+  }
+}
+
 function normalizeParticipationPolicy(value = DEFAULT_WORLD_PARTICIPATION_POLICY) {
   const policy = jsonObject(value, "World participation policy");
   const mode = enumValue(
@@ -930,6 +956,7 @@ export class SocialService {
     const shortcutWorldId = shortcutWorld?.id ?? "";
     const normalizedQuery = shortcutWorld ? "" : requestedQuery;
     const boundedLimit = integer(limit, "limit", { min: 1, max: 50 });
+    const fetchLimit = boundedLimit + 1;
     const pattern = `%${normalizedQuery}%`;
     const timestamp = now();
     const runtimeWorlds = this.db
@@ -1000,21 +1027,24 @@ export class SocialService {
         pattern,
         requestedQuery,
         requestedQuery,
-        boundedLimit,
+        fetchLimit,
       );
+    const hasMore = rows.length > boundedLimit;
+    const visibleRows = rows.slice(0, boundedLimit);
     return {
-      spaces: rows.map((row) =>
+      spaces: visibleRows.map((row) =>
         spaceView({
           ...row,
           world_runtime_platform_mode: this.platformHostMode,
         }),
       ),
+      has_more: hasMore,
     };
   }
 
   searchWorlds(options = {}) {
-    const { spaces } = this.searchSpaces(options);
-    return { worlds: spaces };
+    const { spaces, has_more: hasMore } = this.searchSpaces(options);
+    return { worlds: spaces, has_more: hasMore };
   }
 
   getSpace({ spaceId }) {
@@ -4407,7 +4437,7 @@ export class SocialService {
       memberPatch = mergePatch(memberPatch ?? {}, { role: selectedRole });
       hostDerivedMemberPatch = true;
     }
-    const normalizedVisibility = enumValue(
+    let normalizedVisibility = enumValue(
       visibility,
       "event visibility",
       EVENT_VISIBILITIES,
@@ -4470,14 +4500,22 @@ export class SocialService {
       }
       normalizedSceneId = replyEvent.scene_id ?? normalizedSceneId;
     }
+    const collectiveReply = normalizedReply
+      ? this.db
+          .prepare(`
+            SELECT id FROM world_interactions
+            WHERE space_id = ? AND prompt_event_id = ?
+          `)
+          .get(world.id, normalizedReply)
+      : null;
+    // A collective response is private evidence until the authoritative
+    // aggregate outcome is published. Never trust an Agent/client to select
+    // the correct visibility for a vote or other shared-decision response.
+    if (collectiveReply) normalizedVisibility = "actor";
     if (normalizedSceneId) {
       const privateCollectiveResponse =
         normalizedVisibility === "actor" &&
-        normalizedReply &&
-        Boolean(this.db.prepare(`
-          SELECT 1 FROM world_interactions
-          WHERE space_id = ? AND prompt_event_id = ?
-        `).get(world.id, normalizedReply));
+        Boolean(collectiveReply);
       if (normalizedVisibility !== "world" && !privateCollectiveResponse) {
         fail(
           "INVALID_ARGUMENT",
@@ -6712,6 +6750,10 @@ export class SocialService {
       execution_fence: {
         active_executor: "platform",
         runtime_version: Number(runtime.runtime_version),
+        profile_version: Number(world.profile_version),
+        spec_version: Number(world.current_spec_version),
+        rule_version: Number(world.current_rule_version),
+        host_version: Number(host.version),
       },
       world: this.spaceDetails(world.id),
       host,
@@ -6755,6 +6797,38 @@ export class SocialService {
       },
       untrusted_external_content: true,
     };
+  }
+
+  assertWorldHostExecutionFence(worldId, {
+    expectedProfileVersion,
+    expectedSpecVersion,
+    expectedRuleVersion,
+    expectedHostVersion,
+  }) {
+    const world = this.requireSpace(worldId);
+    const host = hostConfigView(this.currentWorldHostConfig(world.id));
+    const expected = {
+      profile_version: Number(expectedProfileVersion),
+      spec_version: Number(expectedSpecVersion),
+      rule_version: Number(expectedRuleVersion),
+      host_version: Number(expectedHostVersion),
+    };
+    const current = {
+      profile_version: Number(world.profile_version),
+      spec_version: Number(world.current_spec_version),
+      rule_version: Number(world.current_rule_version),
+      host_version: Number(host.version),
+    };
+    if (
+      Object.values(expected).some((value) => !Number.isSafeInteger(value)) ||
+      Object.keys(expected).some((key) => expected[key] !== current[key])
+    ) {
+      fail(
+        "WORLD_HOST_CONFIGURATION_CHANGED",
+        "World rules or Host configuration changed while the platform Host was deciding.",
+        { expected, current },
+      );
+    }
   }
 
   enforceWorldMechanicStateContract({
@@ -6959,15 +7033,41 @@ export class SocialService {
     if (input.actor_pet_id !== this.actorKey) {
       fail("FORBIDDEN", "The executor identity must match the input actor.");
     }
+    this.assertWorldHostExecutionFence(worldId, resolution);
+    const world = this.requireSpace(worldId);
+    const actor = this.requirePet();
+    const storedData = parseJsonObject(input.data_json);
+    const hardRuleJudgement = this.evaluatePlatformWorldInput({
+      world,
+      worldAgent: this.requireWorldAgent(world.id),
+      actor,
+      inputType: input.input_type,
+      eventType: input.event_type,
+      bodyText: input.body_text,
+      data: storedData.data ?? {},
+      worldState: this.worldStateView(world.id).value,
+      memberState: this.worldMemberStateView(world.id, actor.id).value,
+      visibility: input.visibility,
+    });
+    // Deterministic safety boundaries are authoritative. A schema-valid LLM
+    // response cannot accept an input that violates declared blocked rules or
+    // another Character's agency.
+    const enforcedResolution = hardRuleJudgement.decision === "rejected"
+      ? {
+          ...resolution,
+          ...hardRuleJudgement,
+          resolutionDisposition: "apply",
+        }
+      : resolution;
     this.enforceWorldMechanicStateContract({
       worldId,
-      worldStatePatch: resolution.worldStatePatch,
-      memberStatePatch: resolution.memberStatePatch,
+      worldStatePatch: enforcedResolution.worldStatePatch,
+      memberStatePatch: enforcedResolution.memberStatePatch,
     });
     return this.resolveWorldIntent({
       worldId,
       intentId: inputId,
-      ...resolution,
+      ...enforcedResolution,
       applyProposedState: false,
       [PLATFORM_HOST_AUTHORIZATION]: true,
     });
@@ -6999,10 +7099,8 @@ export class SocialService {
     const worldState = this.worldStateView(world.id);
     const responseRows = this.db
       .prepare(`
-        SELECT wi.*, p.${this.petNameColumn} AS actor_name,
-          p.bio AS actor_bio
+        SELECT wi.*
         FROM world_inputs wi
-        JOIN pets p ON p.id = wi.actor_pet_id
         WHERE wi.interaction_id = ? AND wi.status = 'pending'
         ORDER BY wi.created_at ASC, wi.rowid ASC
       `)
@@ -7016,21 +7114,16 @@ export class SocialService {
         "The executor identity must match the first response actor.",
       );
     }
-    const inputBatch = responseRows.map((row) => {
+    const inputBatch = responseRows.map((row, index) => {
       const storedData = parseJsonObject(row.data_json);
       return {
-        ...this.worldInputView(row),
-        proposed_world_state_patch:
-          storedData.proposed_world_state_patch ?? null,
-        actor: {
-          id: row.actor_pet_id,
-          name: row.actor_name,
-          bio: row.actor_bio,
-        },
-        actor_member_state: this.worldMemberStateView(
-          world.id,
-          row.actor_pet_id,
-        ),
+        response_index: index + 1,
+        input_type: row.input_type,
+        event_type: row.event_type,
+        body_text: row.body_text,
+        scene_id: storedData.scene_id ?? null,
+        reply_to_event_id: row.reply_to_event_id ?? null,
+        visibility: "actor",
         concurrency: this.worldInputConcurrency(world, row, worldState),
       };
     });
@@ -7051,6 +7144,10 @@ export class SocialService {
       execution_fence: {
         active_executor: "platform",
         runtime_version: Number(runtime.runtime_version),
+        profile_version: Number(world.profile_version),
+        spec_version: Number(world.current_spec_version),
+        rule_version: Number(world.current_rule_version),
+        host_version: Number(host.version),
       },
       batch_mode: true,
       world: this.spaceDetails(world.id),
@@ -7063,7 +7160,10 @@ export class SocialService {
       director_plan: buildDirectorTurnPlan({
         host,
         worldState,
-        memberState: inputBatch[0].actor_member_state,
+        // Public collective settlement must not receive any participant's
+        // private member state. The response text is the only private evidence
+        // needed by this single-purpose aggregate Host turn.
+        memberState: {},
         context,
         input: {
           id: interaction.id,
@@ -7091,6 +7191,7 @@ export class SocialService {
     if (!this.platformHostExecutor) {
       fail("FORBIDDEN", "Platform World Host executor permission is required.");
     }
+    this.assertWorldHostExecutionFence(worldId, resolution);
     const firstInput = this.db
       .prepare(`
         SELECT * FROM world_inputs
@@ -7462,6 +7563,18 @@ export class SocialService {
         ORDER BY created_at ASC, rowid ASC
       `)
       .all(interaction.id);
+    const privateResponseValues = responseInputs.flatMap((input) => {
+      const actorName = this.db
+        .prepare(`SELECT ${this.petNameColumn} AS name FROM pets WHERE id = ?`)
+        .get(input.actor_pet_id)?.name;
+      return [input.id, input.actor_pet_id, actorName, input.body_text];
+    });
+    assertCollectivePublicProjection({
+      outcomeText: normalizedOutcome,
+      result: normalizedResult,
+      worldStatePatch: normalizedPatch,
+      privateValues: privateResponseValues,
+    });
     const needsReconciliation =
       Number(interaction.base_world_state_version) < currentWorldState.version ||
       responseInputs.some(
@@ -9348,6 +9461,20 @@ export class SocialService {
             toPhase,
             timestamp,
             loop.id,
+          );
+          const journey = this.ensureWorldMemberJourney(world.id, petId, timestamp);
+          const remainingLegacyLoops = parseJsonArray(journey.open_loops_json)
+            .filter((item) => typeof item === "string" && item.trim())
+            .filter((title) => title.trim() !== loop.title);
+          this.db.prepare(`
+            UPDATE world_member_journeys
+            SET open_loops_json = ?, updated_at = ?
+            WHERE space_id = ? AND pet_id = ?
+          `).run(
+            JSON.stringify(remainingLegacyLoops),
+            timestamp,
+            world.id,
+            petId,
           );
         }
         receipts.push({ status: "applied", requested_transition: candidate, applied_loop_id: loop.id, applied_transition: action, reason: "validated_and_committed" });

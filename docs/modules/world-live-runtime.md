@@ -66,9 +66,9 @@ Every runtime uses the policy
 The execution path is:
 
 - `platform`: the platform World Host runtime is authoritative while members
-  are present. In the validation deployment, every World is bound on demand to
-  one persistent local Codex task. One World queue is serial; different World
-  queues share a bounded local concurrency pool.
+  are present. Every judgement runs in a fresh, ephemeral local Codex task. One
+  World queue is serial; different World queues share a bounded local
+  concurrency pool.
 - `creator_codex`: compatibility execution-mode value indicating that an owner
   or administrator has explicitly bound a live Agent
   session as the temporary Host executor.
@@ -77,9 +77,9 @@ The logical `world_agent_id` does not change when execution moves between the
 platform and creator Agent. Judgements and state commits therefore retain one
 stable World-local authority.
 
-The platform binding is stored in `world_host_executors`. Its Codex task is
-created on the first pending Host judgement, then reused only for that World.
-Each turn receives a freshly assembled World-local context pack containing the
+The logical executor row is stored in `world_host_executors`, but no Codex task
+is retained between turns. Each fresh task receives a newly assembled
+World-local context pack containing the
 bound World ID, its Host configuration, visible World history, current state,
 and the input or ready collective batch being resolved. It does not receive
 other Worlds, private messages, shell/files/browser tools, environment
@@ -87,7 +87,11 @@ capabilities, or the user's unrelated Codex conversation context. Structured
 JSON output is validated and committed through the same transactional World
 authority checks as creator-hosted decisions. If Codex execution or validation
 fails, the input remains pending and the executor records the failure; it does
-not partially update World state.
+not partially update World state. Non-terminal failures are re-enqueued by the
+runner with bounded exponential backoff, without requiring another client
+request. A creator takeover suppresses platform retries until that lease is
+released. Work that still fails at the configured attempt limit becomes a
+terminal escalation and releases later World work.
 
 The creator flow is:
 
@@ -154,11 +158,15 @@ a bounded collection policy:
 - `quorum`: become ready when the minimum response count is reached, otherwise
   become ready at the deadline.
 
-Every window has a 5-300 second deadline, so a disconnected member cannot block
-the World indefinitely. Only one open or ready collective interaction can
-exist in a World at a time. A response must reply to the prompt event, and each
-Character may contribute once. While open, its returned status is `collecting`; once
-ready it is `ready_for_host`.
+Sync windows are 5-300 seconds, flexible windows are 5-86400 seconds, and async
+windows are 60-604800 seconds, so offline participation remains bounded. At
+most one open or ready collective interaction can exist in one Scene at a time;
+different Scenes may proceed in parallel. A legacy interaction without
+`scene_id` remains World-wide. A response must reply to the prompt event, and
+each Character may contribute once. The server forces every collective response
+to actor-only visibility until settlement, even when a client omits visibility
+or requests World visibility. While open, its returned status is `collecting`;
+once ready it is `ready_for_host`.
 
 The World-visible prompt includes the complete participation contract before
 any member responds: participation is optional, silence is not agreement, the
@@ -176,8 +184,8 @@ isolation. `world_host_interaction_resolve` atomically:
 3. writes one World-visible aggregate outcome;
 4. marks the interaction resolved.
 
-Without creator takeover, a ready batch is sent to the same persistent local
-Codex task already bound to that World and follows the same atomic settlement
+Without creator takeover, a ready batch is sent to a fresh ephemeral local
+Codex task and follows the same atomic settlement
 contract.
 
 The aggregate outcome must preserve participation fairness: it names material

@@ -317,6 +317,10 @@ test("all five official Host contracts execute one mechanic-specific turn and re
         expectedWorldStateVersion: work.world_state.version,
         expectedMemberStateVersion: work.actor_member_state.version,
         expectedHostRuntimeVersion: work.execution_fence.runtime_version,
+        expectedProfileVersion: work.execution_fence.profile_version,
+        expectedSpecVersion: work.execution_fence.spec_version,
+        expectedRuleVersion: work.execution_fence.rule_version,
+        expectedHostVersion: work.execution_fence.host_version,
       });
       assert.equal(resolved.host_guidance.choices[0].label, dynamicChoiceLabel);
       visitor.leaveWorld({ worldId: definition.id });

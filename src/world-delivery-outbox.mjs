@@ -63,6 +63,8 @@ export function migrateWorldDeliveryOutbox(db) {
         CHECK (status IN ('pending', 'delivered')),
       attempt_count INTEGER NOT NULL DEFAULT 0,
       last_error TEXT,
+      next_attempt_at TEXT,
+      dead_letter_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       delivered_at TEXT
@@ -77,6 +79,16 @@ export function migrateWorldDeliveryOutbox(db) {
   if (!columns.some((column) => column.name === "recipient_snapshot_json")) {
     db.exec("ALTER TABLE world_delivery_outbox ADD COLUMN recipient_snapshot_json TEXT");
   }
+  if (!columns.some((column) => column.name === "next_attempt_at")) {
+    db.exec("ALTER TABLE world_delivery_outbox ADD COLUMN next_attempt_at TEXT");
+  }
+  if (!columns.some((column) => column.name === "dead_letter_at")) {
+    db.exec("ALTER TABLE world_delivery_outbox ADD COLUMN dead_letter_at TEXT");
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_world_delivery_outbox_retry
+      ON world_delivery_outbox(status, dead_letter_at, next_attempt_at, id);
+  `);
 }
 
 export function worldDeliveryMode(db, worldId) {
@@ -405,15 +417,28 @@ export function drainWorldDeliveryOutbox(db, {
   now = () => Date.now(),
   decorateEnvelope = (_worldId, envelope) => envelope,
   beforePersist,
+  maxAttempts = 5,
+  retryBaseDelayMs = 1_000,
 } = {}) {
   const boundedLimit = Math.max(1, Math.min(Number(limit) || 100, 1000));
+  const boundedMaxAttempts = Math.max(1, Math.min(Number(maxAttempts) || 5, 100));
+  const boundedRetryBaseDelayMs = Math.max(
+    0,
+    Math.min(Number(retryBaseDelayMs) || 0, 60 * 60 * 1000),
+  );
+  const drainNow = Number(now());
+  const drainNowIso = new Date(drainNow).toISOString();
   const rows = db.prepare(`
     SELECT * FROM world_delivery_outbox
-    WHERE status = 'pending' AND (? IS NULL OR space_id = ?)
+    WHERE status = 'pending'
+      AND dead_letter_at IS NULL
+      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+      AND (? IS NULL OR space_id = ?)
     ORDER BY id ASC LIMIT ?
-  `).all(worldId, worldId, boundedLimit);
+  `).all(drainNowIso, worldId, worldId, boundedLimit);
   const emitted = [];
   const failures = [];
+  const deadLettered = [];
 
   for (const candidate of rows) {
     try {
@@ -485,7 +510,8 @@ export function drainWorldDeliveryOutbox(db, {
       db.prepare(`
         UPDATE world_delivery_outbox
         SET status = 'delivered', attempt_count = attempt_count + 1,
-          last_error = NULL, delivered_at = ?, updated_at = ?
+          last_error = NULL, next_attempt_at = NULL, dead_letter_at = NULL,
+          delivered_at = ?, updated_at = ?
         WHERE id = ? AND status = 'pending'
       `).run(timestamp, timestamp, row.id);
       db.exec("COMMIT");
@@ -493,13 +519,78 @@ export function drainWorldDeliveryOutbox(db, {
     } catch (error) {
       try { db.exec("ROLLBACK"); } catch {}
       const timestamp = new Date(now()).toISOString();
+      const nextAttemptCount = Number(candidate.attempt_count ?? 0) + 1;
+      const terminal = nextAttemptCount >= boundedMaxAttempts;
+      const retryDelayMs = Math.min(
+        60 * 60 * 1000,
+        boundedRetryBaseDelayMs * (2 ** Math.max(0, nextAttemptCount - 1)),
+      );
+      const nextAttemptAt = terminal
+        ? null
+        : new Date(Number(now()) + retryDelayMs).toISOString();
       db.prepare(`
         UPDATE world_delivery_outbox
-        SET attempt_count = attempt_count + 1, last_error = ?, updated_at = ?
+        SET attempt_count = attempt_count + 1, last_error = ?,
+          next_attempt_at = ?, dead_letter_at = ?, updated_at = ?
         WHERE id = ? AND status = 'pending'
-      `).run(String(error?.message ?? error).slice(0, 2000), timestamp, candidate.id);
-      failures.push({ outboxId: candidate.id, error });
+      `).run(
+        String(error?.message ?? error).slice(0, 2000),
+        nextAttemptAt,
+        terminal ? timestamp : null,
+        timestamp,
+        candidate.id,
+      );
+      const failure = {
+        outboxId: candidate.id,
+        error,
+        attempt: nextAttemptCount,
+        terminal,
+        nextAttemptAt,
+      };
+      failures.push(failure);
+      if (terminal) deadLettered.push(failure);
     }
   }
-  return { emitted, failures, processed: rows.length };
+  return {
+    emitted,
+    failures,
+    dead_lettered: deadLettered,
+    processed: rows.length,
+  };
+}
+
+export function retryDeadLetterWorldDelivery(
+  db,
+  outboxId,
+  { timestamp = new Date().toISOString() } = {},
+) {
+  const updated = db.prepare(`
+    UPDATE world_delivery_outbox
+    SET attempt_count = 0, next_attempt_at = NULL, dead_letter_at = NULL,
+      updated_at = ?
+    WHERE id = ? AND status = 'pending' AND dead_letter_at IS NOT NULL
+  `).run(timestamp, outboxId);
+  return updated.changes === 1;
+}
+
+export function worldDeliveryOutboxStatus(db, { now = Date.now() } = {}) {
+  const nowIso = new Date(Number(now)).toISOString();
+  const row = db.prepare(`
+    SELECT
+      SUM(CASE WHEN status = 'pending' AND dead_letter_at IS NULL THEN 1 ELSE 0 END) AS pending,
+      SUM(CASE WHEN status = 'pending' AND dead_letter_at IS NULL
+        AND (next_attempt_at IS NULL OR next_attempt_at <= ?) THEN 1 ELSE 0 END) AS due,
+      SUM(CASE WHEN status = 'pending' AND dead_letter_at IS NULL
+        AND next_attempt_at > ? THEN 1 ELSE 0 END) AS scheduled,
+      SUM(CASE WHEN status = 'pending' AND dead_letter_at IS NOT NULL THEN 1 ELSE 0 END) AS dead_letter,
+      MIN(CASE WHEN status = 'pending' AND dead_letter_at IS NULL THEN created_at END) AS oldest_pending_at
+    FROM world_delivery_outbox
+  `).get(nowIso, nowIso);
+  return {
+    pending: Number(row.pending ?? 0),
+    due: Number(row.due ?? 0),
+    scheduled: Number(row.scheduled ?? 0),
+    dead_letter: Number(row.dead_letter ?? 0),
+    oldest_pending_at: row.oldest_pending_at ?? null,
+  };
 }

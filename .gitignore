@@ -3,10 +3,18 @@ node_modules/
 coverage/
 dist/
 .npm-cache/
+.next/
+.vercel/
+*.tgz
 
 .env
 .env.*
 !.env.example
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Local identities and credentials
 config.json

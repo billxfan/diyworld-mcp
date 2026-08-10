@@ -396,6 +396,7 @@ export class LocalCodexWorldHostRunner {
     codexClient = new CodexAppServerClient(),
     maxConcurrency = 2,
     maxAttempts = 3,
+    retryBaseDelayMs = 1_000,
     hostRoot = resolve(process.cwd(), "data/world-hosts"),
     model,
     effort = "medium",
@@ -410,6 +411,13 @@ export class LocalCodexWorldHostRunner {
     if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 5) {
       throw new Error("World Host maxAttempts must be between 1 and 5");
     }
+    if (
+      !Number.isInteger(retryBaseDelayMs) ||
+      retryBaseDelayMs < 0 ||
+      retryBaseDelayMs > 60_000
+    ) {
+      throw new Error("World Host retryBaseDelayMs must be between 0 and 60000");
+    }
     if (threadIsolation !== "per_turn") {
       throw new Error("World Host threadIsolation must be per_turn");
     }
@@ -417,6 +425,7 @@ export class LocalCodexWorldHostRunner {
     this.codexClient = codexClient;
     this.maxConcurrency = maxConcurrency;
     this.maxAttempts = maxAttempts;
+    this.retryBaseDelayMs = retryBaseDelayMs;
     this.hostRoot = hostRoot;
     this.model = model;
     this.effort = effort;
@@ -429,6 +438,7 @@ export class LocalCodexWorldHostRunner {
     this.closed = false;
     this.idleWaiters = [];
     this.bindingPromises = new Map();
+    this.retryTimers = new Map();
   }
 
   start({ prewarmPublishedWorlds = false } = {}) {
@@ -492,6 +502,10 @@ export class LocalCodexWorldHostRunner {
 
   enqueue(worldId) {
     if (this.closed || this.activeWorldIds.has(worldId)) return;
+    const runtime = this.db
+      .prepare("SELECT active_executor FROM world_host_runtimes WHERE space_id = ?")
+      .get(worldId);
+    if (runtime?.active_executor === "creator_codex") return;
     this.queuedWorldIds.add(String(worldId));
     this.db
       .prepare(`
@@ -505,7 +519,11 @@ export class LocalCodexWorldHostRunner {
   }
 
   whenIdle() {
-    if (this.activeCount === 0 && this.queuedWorldIds.size === 0) {
+    if (
+      this.activeCount === 0 &&
+      this.queuedWorldIds.size === 0 &&
+      this.retryTimers.size === 0
+    ) {
       return Promise.resolve();
     }
     return new Promise((resolveIdle) => this.idleWaiters.push(resolveIdle));
@@ -514,6 +532,8 @@ export class LocalCodexWorldHostRunner {
   async close() {
     this.closed = true;
     this.queuedWorldIds.clear();
+    for (const timer of this.retryTimers.values()) clearTimeout(timer);
+    this.retryTimers.clear();
     await this.whenIdle();
     this.codexClient.close?.();
   }
@@ -550,8 +570,39 @@ export class LocalCodexWorldHostRunner {
   }
 
   #notifyIdle() {
-    if (this.activeCount !== 0 || this.queuedWorldIds.size !== 0) return;
+    if (
+      this.activeCount !== 0 ||
+      this.queuedWorldIds.size !== 0 ||
+      this.retryTimers.size !== 0
+    ) return;
     for (const resolveIdle of this.idleWaiters.splice(0)) resolveIdle();
+  }
+
+  status() {
+    return {
+      closed: this.closed,
+      active_worlds: this.activeWorldIds.size,
+      queued_worlds: this.queuedWorldIds.size,
+      scheduled_retries: this.retryTimers.size,
+      max_concurrency: this.maxConcurrency,
+      max_attempts: this.maxAttempts,
+    };
+  }
+
+  #scheduleRetry(worldId, attempt) {
+    if (this.closed || this.retryTimers.has(worldId)) return;
+    const delay = Math.min(
+      30_000,
+      this.retryBaseDelayMs * (2 ** Math.max(0, attempt - 1)),
+    );
+    const timer = setTimeout(() => {
+      this.retryTimers.delete(worldId);
+      if (this.closed) return this.#notifyIdle();
+      this.enqueue(worldId);
+      this.#notifyIdle();
+    }, delay);
+    timer.unref?.();
+    this.retryTimers.set(worldId, timer);
   }
 
   #drain() {
@@ -850,17 +901,15 @@ export class LocalCodexWorldHostRunner {
         }
         const resolution = {
           ...decision,
-          result: {
-            ...decision.result,
-            host_executor: {
-              provider: "local_codex",
-              codex_thread_id: executor.codex_thread_id,
-              codex_turn_id: turn.turnId,
-              context_version: Number(executor.context_version),
-            },
-          },
+          // Executor thread/turn identifiers stay in world_host_executors for
+          // operator audit. They are never copied into member-visible results.
+          result: decision.result,
           expectedWorldStateVersion: work.world_state.version,
           expectedHostRuntimeVersion: work.execution_fence.runtime_version,
+          expectedProfileVersion: work.execution_fence.profile_version,
+          expectedSpecVersion: work.execution_fence.spec_version,
+          expectedRuleVersion: work.execution_fence.rule_version,
+          expectedHostVersion: work.execution_fence.host_version,
         };
         const result =
           next.kind === "interaction"
@@ -905,6 +954,7 @@ export class LocalCodexWorldHostRunner {
           retry.attempt,
         );
         if (terminal) continue;
+        this.#scheduleRetry(worldId, retry.attempt);
         const recordedError =
           error instanceof Error ? error : new Error(String(error));
         recordedError.worldHostFailureRecorded = true;

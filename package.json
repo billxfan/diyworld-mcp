@@ -4,8 +4,17 @@
   "private": false,
   "type": "module",
   "description": "An open persistent world and social layer for MCP-capable Agents.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/billxfan/diyworld-mcp.git"
+  },
+  "homepage": "https://diyworld.ai",
+  "bugs": {
+    "url": "https://github.com/billxfan/diyworld-mcp/issues"
+  },
   "bin": {
-    "agent-world": "scripts/agent-world-social.mjs"
+    "agent-world": "scripts/agent-world-social.mjs",
+    "pet-social": "src/cli.mjs"
   },
   "publishConfig": {
     "access": "public"
@@ -34,9 +43,11 @@
     "connect:agent": "node scripts/connect-agent.mjs",
     "doctor": "node scripts/doctor.mjs",
     "backup": "node scripts/backup.mjs",
+    "repo:public-check": "node scripts/public-repo-check.mjs",
     "release:check": "node scripts/release-check.mjs",
     "docs:official-worlds": "node scripts/generate-official-world-doc.mjs",
     "pack:tester": "node scripts/package-tester.mjs",
+    "prepack": "npm run repo:public-check",
     "test": "node --test"
   }
 }

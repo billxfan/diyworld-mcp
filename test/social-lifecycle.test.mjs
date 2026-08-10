@@ -117,6 +117,34 @@ test("the first invite wave receives one referral each and registration stops at
   }
 });
 
+test("invite-only registration validates the invite before revealing email existence", () => {
+  const store = new PetSocialStore();
+  try {
+    const invite = store.createInvite({ label: "privacy", maxUses: 2 });
+    store.register({
+      recoveryEmail: "private-registration@example.test",
+      displayName: "private-registration",
+      inviteCode: invite.code,
+    }, { inviteRequired: true });
+
+    for (const recoveryEmail of [
+      "private-registration@example.test",
+      "unknown-registration@example.test",
+    ]) {
+      assert.throws(
+        () => store.register({
+          recoveryEmail,
+          displayName: "privacy-probe",
+          inviteCode: "invalid-invite",
+        }, { inviteRequired: true }),
+        (error) => error.code === "INVALID_INVITE",
+      );
+    }
+  } finally {
+    store.close();
+  }
+});
+
 test("an expired incoming request is hidden and a reverse request does not auto-accept", () => {
   let now = 1_000_000;
   const store = new PetSocialStore(":memory:", { now: () => now });

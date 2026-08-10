@@ -15,9 +15,10 @@ device, social, message, and World identifier.
 - Existing clients upgrade only through `npx -y @diyworld/mcp@latest upgrade`.
   The command prepares a replacement configuration and never silently changes
   identity or credentials.
-- `/health` publishes the protocol version plus minimum and recommended client
-  versions. A client below the minimum must stop; a supported older client may
-  continue and report an optional update.
+- `/health` publishes protocol/client versions plus database, Host queue, retry,
+  and delivery-outbox status. `/ready` returns non-2xx only when the process
+  cannot safely serve; a dead letter marks the service degraded but remains
+  operator-recoverable.
 - `character_*`, `agent_binding_*`, `AGENT_WORLD_*`, and Character response
   fields are the preferred contract for new integrations.
 - `pet_*`, legacy Pet response fields, `PET_SOCIAL_*`, and the Codex installer
@@ -88,8 +89,20 @@ The Tunnel ingress must target the loopback URL above and use a final catch-all
 rule that returns 404. Do not proxy the Vercel website through this origin;
 `diyworld.ai` and `www.diyworld.ai` remain the website, while
 `api.diyworld.ai` is the MCP/API edge. Confirm that `/health` is reachable over
-HTTPS, that the origin is not listening on a LAN address, and that registration
-rate limits distinguish public clients using the validated Cloudflare address.
+HTTPS, `/ready` returns 200, `runtime.delivery_outbox.dead_letter` is zero, and
+the Host failed-executor count is understood. Confirm that the origin is not
+listening on a LAN address and that registration rate limits distinguish public
+clients using the validated Cloudflare address.
+
+Runtime retry controls are `AGENT_WORLD_HOST_RETRY_BASE_DELAY_MS`,
+`AGENT_WORLD_DELIVERY_MAX_ATTEMPTS`,
+`AGENT_WORLD_DELIVERY_RETRY_BASE_DELAY_MS`, and
+`AGENT_WORLD_DELIVERY_DRAIN_INTERVAL_MS`. Keep non-zero production delays;
+zero is intended only for deterministic tests or an explicit operator drain.
+Inspect or requeue isolated delivery failures with
+`npm run admin -- delivery:status` and
+`npm run admin -- delivery:retry OUTBOX_ID`; requeue only after addressing the
+recorded cause.
 
 Do not use real outgoing messages, account deletion, World deletion, or Host
 takeover as smoke tests.

@@ -6,9 +6,26 @@ import { PetSocialClient } from "../src/client.mjs";
 import { PetSocialStore } from "../src/store.mjs";
 import {
   callWorldTool,
+  formatWorldCatalog,
   WORLD_CONTENT_SECURITY_NOTICE,
   worldTools
 } from "../src/world-tools.mjs";
+
+test("the public catalog never claims a truncated page is complete", () => {
+  const catalog = formatWorldCatalog({
+    worlds: [{
+      id: "world-page-item",
+      kind: "user",
+      name: "目录页世界",
+      description: "用于验证分页诚实性。",
+      publication_status: "published",
+    }],
+    has_more: true,
+  });
+  assert.equal(catalog.catalog_mode, "public_catalog_page");
+  assert.equal(catalog.complete, false);
+  assert.equal(catalog.has_more, true);
+});
 
 async function registerClient(address, suffix) {
   const registration = await PetSocialClient.register(address.url, {
@@ -552,6 +569,25 @@ test("the simple MCP flow publishes an open hidden World addressable by ID", asy
   try {
     const owner = await registerClient(address, "simple-world-owner");
     const visitor = await registerClient(address, "simple-world-visitor");
+    const before = await owner.client.myWorlds();
+    await assert.rejects(
+      () => callWorldTool(owner.client, "world_create_simple", {
+        name: "不应创建",
+        rules_text: "没有明确确认时不得创建或发布。",
+        visibility: "hidden",
+        confirmed: false,
+      }),
+      (error) => error.code === "CONFIRMATION_REQUIRED",
+    );
+    await assert.rejects(
+      () => callWorldTool(owner.client, "world_create_simple", {
+        name: "同样不应创建",
+        rules_text: "缺少确认也不得创建或发布。",
+        visibility: "hidden",
+      }),
+      (error) => error.code === "CONFIRMATION_REQUIRED",
+    );
+    assert.equal((await owner.client.myWorlds()).worlds.length, before.worlds.length);
     const created = await callWorldTool(owner.client, "world_create_simple", {
       name: "暗门之后",
       rules_text: "知道世界 ID 的角色可以进入；不能替其他角色作决定。",

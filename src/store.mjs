@@ -366,13 +366,7 @@ export class PetSocialStore {
   }
 
   consumeInvite(inviteCode, ownerId, now = this.now()) {
-    invariant(inviteCode, 403, "INVITE_REQUIRED", "A valid invite code is required to register.");
-    const invite = this.db.prepare("SELECT * FROM invite_codes WHERE code_hash = ?").get(hashToken(String(inviteCode).trim()));
-    invariant(invite, 403, "INVALID_INVITE", "The invite code is invalid.");
-    const status = this.inviteStatus(invite, now);
-    invariant(status !== "disabled", 403, "INVITE_DISABLED", "The invite code has been disabled.");
-    invariant(status !== "expired", 403, "INVITE_EXPIRED", "The invite code has expired.");
-    invariant(status !== "exhausted", 409, "INVITE_EXHAUSTED", "The invite code has already been used.");
+    const invite = this.requireUsableInvite(inviteCode, now);
 
     const updated = this.db.prepare(`
       UPDATE invite_codes
@@ -388,6 +382,17 @@ export class PetSocialStore {
       VALUES (?, ?, ?, ?)
     `).run(makeId("ird"), invite.id, ownerId, now);
     return invite.id;
+  }
+
+  requireUsableInvite(inviteCode, now = this.now()) {
+    invariant(inviteCode, 403, "INVITE_REQUIRED", "A valid invite code is required to register.");
+    const invite = this.db.prepare("SELECT * FROM invite_codes WHERE code_hash = ?").get(hashToken(String(inviteCode).trim()));
+    invariant(invite, 403, "INVALID_INVITE", "The invite code is invalid.");
+    const status = this.inviteStatus(invite, now);
+    invariant(status !== "disabled", 403, "INVITE_DISABLED", "The invite code has been disabled.");
+    invariant(status !== "expired", 403, "INVITE_EXPIRED", "The invite code has expired.");
+    invariant(status !== "exhausted", 409, "INVITE_EXHAUSTED", "The invite code has already been used.");
+    return invite;
   }
 
   register({
@@ -461,6 +466,11 @@ export class PetSocialStore {
           "REGISTRATION_LIMIT_REACHED",
           `The invite-only validation is limited to ${registrationLimit} accounts.`,
         );
+      }
+      // Validate the invite before looking up the recovery email so an
+      // unauthenticated caller cannot use an invalid invite as an email oracle.
+      if (options.inviteRequired || inviteCode) {
+        this.requireUsableInvite(inviteCode, now);
       }
       if (this.db.prepare("SELECT id FROM owners WHERE recovery_email = ?").get(email)) {
         throw new AppError(409, "ACCOUNT_EXISTS", "An account already exists for this recovery email. Contact support to recover it.");

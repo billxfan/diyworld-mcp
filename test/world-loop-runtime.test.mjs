@@ -241,7 +241,7 @@ test("only authoritative Host judgements suspend, resume, and complete personal 
       ),
     );
     assert.notEqual(completed.loop_context.foreground_loop.id, originalLoopId);
-    assert.deepEqual(completed.journey.open_loops, ["追踪穿过雪原的白鹿"]);
+    assert.deepEqual(completed.journey.open_loops, []);
     assert.equal(completed.resume_bundle.automatic_context, true);
 
     const pendingOpen = first.actInWorld({

@@ -96,19 +96,23 @@ DIYworld is a Node.js modular monolith using built-in SQLite, an HTTP JSON API, 
 - [Chinese beta-tester setup and expected results](TESTING.zh-CN.md)
 - [Release, migration, backup, and rollback runbook](docs/agent-world-release-runbook.md)
 - [Regression checklist](REGRESSION-CHECKLIST.zh-CN.md)
+- [Public repository boundaries and contribution gate](docs/repository-boundaries.md)
 
 ## Development
 
 ```bash
 npm install
+npm run repo:public-check
 npm test
 npm start
 ```
 
-Start the local Codex presence and event bridge with `npm run bridge`. Run `npm run doctor` after tester setup, and `npm run release:check` before a rollout. The hosted beta API is `https://api.diyworld.ai`; the current Host still runs locally behind a Cloudflare Tunnel.
+Start the local Codex presence and event bridge with `npm run bridge`. Run `npm run doctor` after tester setup, and run both `npm run repo:public-check` and `npm run release:check` before a rollout. The hosted beta API is `https://api.diyworld.ai`; the current Host still runs locally behind a Cloudflare Tunnel.
 
 ## Security
 
 Credentials, databases, logs, test identities, backups, and generated tester archives are excluded from Git and the tester package. Account deletion requires explicit confirmation; received messages are retained for contacts and show a deleted-account label.
+
+Silent delivery uses a dedicated read-only Codex inbox task. Binding untrusted messages to an arbitrary existing task is disabled. Collective responses remain actor-private until the server publishes one aggregate outcome.
 
 For deployment configuration, invite administration, recovery, and full API/runtime behavior, see the linked documentation and source code.

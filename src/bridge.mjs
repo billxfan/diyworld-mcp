@@ -3,7 +3,10 @@ import { setTimeout as wait } from "node:timers/promises";
 import { AgentWorldClient } from "./client.mjs";
 import { CodexAppServerClient } from "./codex-app-server.mjs";
 import { defaultConfigPath, readConfig, updateConfig } from "./config.mjs";
-import { shouldInterruptForEvent } from "./delivery-policy.mjs";
+import {
+  isIsolatedCodexDelivery,
+  shouldInterruptForEvent,
+} from "./delivery-policy.mjs";
 import { isCodexOpen, showNotification } from "./macos.mjs";
 
 const configPath = defaultConfigPath();
@@ -16,6 +19,16 @@ const codexAppServer = new CodexAppServerClient({
 let stopped = false;
 let codexOpen = false;
 let streamAbortController;
+
+if (
+  config.codexDelivery?.enabled === true &&
+  config.codexDelivery?.threadId &&
+  config.codexDelivery?.isolation !== "dedicated_inbox"
+) {
+  console.error(
+    "[bridge] legacy Codex delivery binding disabled: run `pet-social new-inbox-thread` to create an isolated inbox task.",
+  );
+}
 
 function eventMessage(event) {
   switch (event.eventType) {
@@ -196,9 +209,7 @@ async function eventLoop() {
         const deliverInCodex =
           ["message.created", "world.event_committed", "world.interaction_opened"].includes(event.eventType) &&
           shouldInterrupt &&
-          delivery.enabled === true &&
-          typeof delivery.threadId === "string" &&
-          delivery.threadId.length > 0;
+          isIsolatedCodexDelivery(delivery);
         let displayed = false;
 
         if (deliverInCodex) {

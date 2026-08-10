@@ -61,7 +61,7 @@ class FakeCodexWorldHosts {
         decision: "accepted",
         resolution_disposition: "apply",
         reason_text: "输入符合当前 World 规则。",
-        outcome_text: `${threadId} 已处理该输入。`,
+        outcome_text: "世界主持已处理该输入。",
         result: {
           resolution: "full_success",
           ...(loopTransition ? { loop_transition: loopTransition } : {}),
@@ -155,7 +155,12 @@ test("persistent per-World Host threads are rejected to preserve Character priva
   }
 });
 
-async function createPublishedWorld(client, name, marker) {
+async function createPublishedWorld(
+  client,
+  name,
+  marker,
+  { initialMemberState = {} } = {},
+) {
   const world = await client.createWorld({
     name,
     description: `${name} 的公开说明`,
@@ -163,6 +168,7 @@ async function createPublishedWorld(client, name, marker) {
     definitionText: `隔离标记：${marker}`,
     resolutionMode: "direct",
     initialWorldState: { marker },
+    initialMemberState,
   });
   await client.publishWorld(world.id, {
     expectedSpecVersion: world.spec_version,
@@ -217,9 +223,9 @@ test("every Host turn gets a fresh isolated local Codex thread", async () => {
     const second = await createPublishedWorld(client, "青瓷世界", "CELADON_ONLY");
 
     const firstObserved = await submitAndDrain(app, client, first, "amber");
-    assert.match(firstObserved.events.at(-1).body_text, /thread:/u);
+    assert.doesNotMatch(firstObserved.events.at(-1).body_text, /thread:/u);
     const secondObserved = await submitAndDrain(app, client, second, "celadon");
-    assert.match(secondObserved.events.at(-1).body_text, /thread:/u);
+    assert.doesNotMatch(secondObserved.events.at(-1).body_text, /thread:/u);
     await submitAndDrain(app, client, first, "amber-again");
 
     assert.equal(codex.created.length, 3);
@@ -375,6 +381,63 @@ test("a submitted action is acknowledged and its final Host result is waitable",
   }
 });
 
+test("deterministic agency rules override a schema-valid accepting Host", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-agency-"));
+  const store = new PetSocialStore(join(directory, "social.sqlite"));
+  const codex = new FakeCodexWorldHosts();
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostCodexClient: codex,
+    worldHostRoot: join(directory, "hosts"),
+  });
+  const address = await app.listen();
+  try {
+    const actorRegistration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-agency-actor@example.test",
+      displayName: "行动者甲",
+      agentProvider: "codex",
+    });
+    const otherRegistration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-agency-other@example.test",
+      displayName: "自主角色乙",
+      agentProvider: "other",
+    });
+    const actor = new AgentWorldClient({
+      serverUrl: address.url,
+      token: actorRegistration.token,
+    });
+    const other = new AgentWorldClient({
+      serverUrl: address.url,
+      token: otherRegistration.token,
+    });
+    const world = await createPublishedWorld(actor, "自主权世界", "AGENCY_ONLY");
+    await other.joinWorld(world.id, { ruleVersion: world.rule_version });
+    await actor.enterWorld(world.id, { clientSessionId: "agency-actor" });
+    const observed = await actor.observeWorld(world.id);
+    const pending = await actor.submitWorldInput(world.id, {
+      inputType: "action",
+      eventType: "force_other",
+      bodyText: "自主角色乙已经同意并离开世界。",
+      observedWorldStateVersion: observed.world_state.version,
+      observedMemberStateVersion: observed.member_state.version,
+      idempotencyKey: "agency:force-other",
+    });
+    await app.worldHostRunner.whenIdle();
+
+    assert.equal(codex.turns.length, 1, "the LLM still returned its accepting decision");
+    const completed = await actor.worldInputResult(world.id, pending.input.id, {
+      waitMs: 0,
+    });
+    assert.equal(completed.status, "rejected");
+    assert.match(completed.host_response.reason_text, /不能替其他角色决定/u);
+  } finally {
+    await app.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("bounded Host failures terminalize a poison input and release later work", async () => {
   const directory = mkdtempSync(join(tmpdir(), "agent-world-host-poison-"));
   const store = new PetSocialStore(join(directory, "social.sqlite"));
@@ -383,6 +446,7 @@ test("bounded Host failures terminalize a poison input and release later work", 
     store,
     worldHostMode: "local_codex",
     worldHostCodexClient: codex,
+    worldHostRetryBaseDelayMs: 10,
     worldHostMaxAttempts: 2,
     worldHostRoot: join(directory, "hosts"),
   });
@@ -464,6 +528,7 @@ test("a platform Host cannot commit after a creator takes over mid-turn", async 
     store,
     worldHostMode: "local_codex",
     worldHostCodexClient: codex,
+    worldHostRetryBaseDelayMs: 10,
     worldHostRoot: join(directory, "hosts"),
   });
   const address = await app.listen();
@@ -509,6 +574,65 @@ test("a platform Host cannot commit after a creator takes over mid-turn", async 
     assert.equal(judgement, undefined);
     assert.equal(executor.status, "failed");
     assert.match(executor.last_error, /execution authority changed/u);
+  } finally {
+    codex.completeTurn();
+    await app.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a platform Host automatically retries from fresh context when Host configuration changes mid-turn", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-config-fence-"));
+  const store = new PetSocialStore(join(directory, "social.sqlite"));
+  const codex = new ControlledFakeCodexWorldHosts();
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostCodexClient: codex,
+    worldHostRetryBaseDelayMs: 10,
+    worldHostRoot: join(directory, "hosts"),
+  });
+  const address = await app.listen();
+  try {
+    const registration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-config-fence@example.test",
+      displayName: "Host 配置栅栏测试者",
+      agentProvider: "codex",
+    });
+    const owner = new AgentWorldClient({
+      serverUrl: address.url,
+      token: registration.token,
+    });
+    const world = await createPublishedWorld(owner, "配置栅栏世界", "ORIGINAL_HOST_POLICY");
+    await owner.enterWorld(world.id, { clientSessionId: "config-fence-session" });
+    const observed = await owner.observeWorld(world.id);
+    const pending = await owner.submitWorldInput(world.id, {
+      inputType: "action",
+      eventType: "inspect",
+      bodyText: "在主持配置变化时等待判断。",
+      observedWorldStateVersion: observed.world_state.version,
+      observedMemberStateVersion: observed.member_state.version,
+      idempotencyKey: "config-fence-input",
+    });
+
+    await codex.started;
+    const currentHost = await owner.worldHost(world.id);
+    await owner.updateWorldHost(world.id, {
+      expectedVersion: currentHost.host.version,
+      personaText: "UPDATED_HOST_POLICY",
+    });
+    codex.completeTurn();
+    await app.worldHostRunner.whenIdle();
+
+    assert.equal(codex.turns.length, 2);
+    assert.doesNotMatch(codex.turns[0].prompt, /UPDATED_HOST_POLICY/u);
+    assert.match(codex.turns[1].prompt, /UPDATED_HOST_POLICY/u);
+    const input = store.db
+      .prepare("SELECT status, host_attempt_count FROM world_inputs WHERE id = ?")
+      .get(pending.input.id);
+    assert.equal(input.status, "accepted");
+    assert.equal(input.host_attempt_count, 2);
   } finally {
     codex.completeTurn();
     await app.close();
@@ -579,8 +703,17 @@ test("a ready collective interaction is settled in a fresh isolated World Host t
       owner,
       "集体决策世界",
       "COLLECTIVE_ONLY",
+      {
+        initialMemberState: {
+          secret: "PRIVATE_MEMBER_STATE_MUST_NOT_REACH_COLLECTIVE_HOST",
+        },
+      },
     );
     await guest.joinWorld(world.id, { ruleVersion: world.rule_version });
+    store.db.prepare("UPDATE pets SET bio = ? WHERE id = ?").run(
+      "PRIVATE_BIO_MUST_NOT_REACH_COLLECTIVE_HOST",
+      guestRegistration.pet.id,
+    );
     await owner.enterWorld(world.id, { clientSessionId: "batch-owner-session" });
     await guest.enterWorld(world.id, { clientSessionId: "batch-guest-session" });
     await owner.takeoverWorldHost(world.id, {
@@ -621,6 +754,10 @@ test("a ready collective interaction is settled in a fresh isolated World Host t
     assert.equal(codex.turns[0].threadId, `thread:${world.id}:1`);
     assert.match(codex.turns[0].prompt, /collective interaction batch/u);
     assert.match(codex.turns[0].prompt, /COLLECTIVE_ONLY/u);
+    assert.doesNotMatch(codex.turns[0].prompt, /PRIVATE_BIO_MUST_NOT_REACH/u);
+    assert.doesNotMatch(codex.turns[0].prompt, /PRIVATE_MEMBER_STATE_MUST_NOT_REACH/u);
+    const publicEvents = await guest.observeWorld(world.id, { afterSequence: 0 });
+    assert.doesNotMatch(JSON.stringify(publicEvents), /codex_thread_id|codex_turn_id/u);
     const resolution = store.db
       .prepare(`
         SELECT resolution_source

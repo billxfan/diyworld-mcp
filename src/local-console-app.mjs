@@ -9,6 +9,28 @@ import { readJson } from "./http.mjs";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
 
+function localAuthority(req, configuredHost) {
+  const port = req.socket.localPort;
+  const displayHost = configuredHost === "::1" ? "[::1]" : configuredHost;
+  return `${displayHost}:${port}`;
+}
+
+function requireLocalBrowserBoundary(req, configuredHost) {
+  const authority = localAuthority(req, configuredHost);
+  if (String(req.headers.host ?? "").toLowerCase() !== authority.toLowerCase()) {
+    throw new AppError(421, "TEST_CONSOLE_HOST_MISMATCH", "The test-console Host header is invalid.");
+  }
+  const expectedOrigin = `http://${authority}`;
+  const origin = req.headers.origin;
+  if (origin && origin !== expectedOrigin) {
+    throw new AppError(403, "TEST_CONSOLE_ORIGIN_MISMATCH", "The test-console Origin is invalid.");
+  }
+  const fetchSite = req.headers["sec-fetch-site"];
+  if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
+    throw new AppError(403, "TEST_CONSOLE_CROSS_SITE", "Cross-site test-console requests are forbidden.");
+  }
+}
+
 function securityHeaders(extra = {}) {
   return {
     "cache-control": "no-store",
@@ -178,6 +200,7 @@ export function createTestConsoleApp(options) {
 
   async function handler(req, res) {
     try {
+      requireLocalBrowserBoundary(req, host);
       const url = new URL(req.url, "http://127.0.0.1");
       if (req.method === "GET" && url.pathname === "/") {
         const nonce = randomBytes(18).toString("base64url");

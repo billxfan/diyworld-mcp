@@ -38,8 +38,17 @@ export async function POST(request: Request) {
     });
 
     try {
+      // Duplicate submissions intentionally do not send another notification.
+      // The public response below is identical for new and existing addresses,
+      // so this endpoint cannot be used to enumerate the waitlist.
+      if (!result.created) {
+        return Response.json(
+          { ok: true, message: "如果该邮箱可以接收邀请，我们会通过邮件联系你。" },
+          { status: 202 },
+        );
+      }
       await sendApplicationNotification({
-        id: result.id,
+        id: result.id!,
         name: name || email.split("@")[0] || "访客",
         email,
         worldType: worldType || "undecided",
@@ -54,8 +63,8 @@ export async function POST(request: Request) {
     }
 
     return Response.json(
-      { ok: true, id: result.id, message: result.created ? "已收到，我们会通过邮箱与你联系。" : "信息已更新，我们会通过邮箱与你联系。" },
-      { status: result.created ? 201 : 200 },
+      { ok: true, message: "如果该邮箱可以接收邀请，我们会通过邮件联系你。" },
+      { status: 202 },
     );
   } catch (error) {
     console.error("Failed to save application", error);

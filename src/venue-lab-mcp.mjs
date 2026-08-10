@@ -52,6 +52,13 @@ const jsonObject = (description) => ({
   additionalProperties: true,
 });
 
+function requireExplicitConfirmation(args, action) {
+  if (args?.confirmed === true) return;
+  const error = new Error(`${action} requires explicit confirmation.`);
+  error.code = "CONFIRMATION_REQUIRED";
+  throw error;
+}
+
 const tools = [
   {
     name: "character_get_or_create",
@@ -1039,6 +1046,7 @@ function callTool(name, args = {}) {
         initialMemberState: args.initial_member_state ?? {},
       });
     case "world_create_simple": {
+      requireExplicitConfirmation(args, "Creating and publishing a World");
       const draft = service.createWorld({
         name: args.name,
         description: args.rules_text.slice(0, 500),

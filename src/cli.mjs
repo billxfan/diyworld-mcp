@@ -30,7 +30,6 @@ Social and delivery:
   pet-social inbox
   pet-social read CONVERSATION_ID MAX_SEQUENCE
   pet-social bridge [--no-notify]
-  pet-social bind-thread THREAD_ID [--codex-command PATH] [--model MODEL] [--effort low]
   pet-social new-inbox-thread [--cwd PATH] [--codex-command PATH] [--model MODEL] [--effort low]
   pet-social unbind-thread
   pet-social delivery-status
@@ -131,6 +130,7 @@ try {
       codexDelivery: {
         enabled: false,
         threadId: null,
+        isolation: null,
         lastDeliveredEventSequence: 0,
         fallbackNotifiedSequence: 0
       }
@@ -152,6 +152,7 @@ try {
     print({
       enabled: current.codexDelivery?.enabled === true,
       threadId: current.codexDelivery?.threadId ?? null,
+      isolation: current.codexDelivery?.isolation ?? null,
       model: current.codexDelivery?.model ?? null,
       effort: current.codexDelivery?.effort ?? null,
       lastDeliveredEventSequence: current.codexDelivery?.lastDeliveredEventSequence ?? 0,
@@ -168,6 +169,7 @@ try {
         ...(current.codexDelivery ?? {}),
         enabled: false,
         threadId: null,
+        isolation: null,
         lastError: null,
         lastErrorAt: null
       }
@@ -177,21 +179,21 @@ try {
   }
 
   if (command === "bind-thread" || command === "new-inbox-thread") {
+    if (command === "bind-thread") {
+      throw new Error(
+        "bind-thread is disabled because external messages must not inherit an existing task's tools or context. Use new-inbox-thread.",
+      );
+    }
     const current = readConfig(configPath);
     const codexCommand = values["codex-command"] ?? current.codexDelivery?.codexCommand;
     const appServer = new CodexAppServerClient({ command: codexCommand });
     try {
       let threadId = positionals[1];
-      if (command === "bind-thread") {
-        if (!threadId) throw new Error("bind-thread requires THREAD_ID");
-        await appServer.request("thread/read", { threadId, includeTurns: false });
-      } else {
-        const thread = await appServer.createInboxThread({
-          cwd: values.cwd ?? process.cwd(),
-          model: values.model
-        });
-        threadId = thread.id;
-      }
+      const thread = await appServer.createInboxThread({
+        cwd: values.cwd ?? process.cwd(),
+        model: values.model
+      });
+      threadId = thread.id;
 
       const next = updateConfig((latest) => ({
         ...latest,
@@ -199,6 +201,7 @@ try {
           ...(latest.codexDelivery ?? {}),
           enabled: true,
           threadId,
+          isolation: "dedicated_inbox",
           ...(codexCommand ? { codexCommand } : {}),
           ...(values.model ? { model: values.model } : {}),
           ...(values.effort ? { effort: values.effort } : {}),
@@ -208,7 +211,7 @@ try {
       }), configPath);
       print({
         enabled: true,
-        mode: command === "new-inbox-thread" ? "dedicated_thread" : "existing_thread",
+        mode: "dedicated_thread",
         threadId,
         configPath,
         eventCursor: next.eventCursor ?? 0

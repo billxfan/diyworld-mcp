@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Check public repository boundary
+        run: npm run repo:public-check
+      - name: Test runtime
+        run: npm test
+      - name: Rehearse release migration
+        run: npm run release:check
+      - name: Install website dependencies
+        run: npm ci --prefix website
+      - name: Build website
+        run: npm run build --prefix website

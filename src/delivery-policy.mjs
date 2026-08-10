@@ -23,3 +23,12 @@ export function deliveryPolicyForEvent(event) {
 export function shouldInterruptForEvent(event) {
   return INTERRUPTING_DELIVERY_POLICIES.has(deliveryPolicyForEvent(event));
 }
+
+export function isIsolatedCodexDelivery(delivery) {
+  return Boolean(
+    delivery?.enabled === true &&
+      delivery.isolation === "dedicated_inbox" &&
+      typeof delivery.threadId === "string" &&
+      delivery.threadId.length > 0,
+  );
+}

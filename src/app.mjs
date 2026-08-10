@@ -17,6 +17,7 @@ import { LocalCodexWorldHostRunner } from "./world-host-runner.mjs";
 import { handleRemoteMcpMessage } from "./remote-mcp.mjs";
 import {
   drainWorldDeliveryOutbox as drainDurableWorldDeliveryOutbox,
+  worldDeliveryOutboxStatus,
 } from "./world-delivery-outbox.mjs";
 
 const WORLD_NOT_FOUND_CODES = new Set(["NOT_FOUND"]);
@@ -204,6 +205,28 @@ export function createPetSocialApp(options = {}) {
   const sseByPet = new Map();
   const rateBuckets = new Map();
   const interactionTimers = new Map();
+  const worldDeliveryMaxAttempts = Math.max(
+    1,
+    Math.min(Number(options.worldDeliveryMaxAttempts) || 5, 100),
+  );
+  const worldDeliveryRetryBaseDelayMs = Math.max(
+    0,
+    Math.min(
+      options.worldDeliveryRetryBaseDelayMs === undefined
+        ? 1_000
+        : Number(options.worldDeliveryRetryBaseDelayMs) || 0,
+      60 * 60 * 1000,
+    ),
+  );
+  const worldDeliveryDrainIntervalMs = Math.max(
+    0,
+    Math.min(
+      options.worldDeliveryDrainIntervalMs === undefined
+        ? 1_000
+        : Number(options.worldDeliveryDrainIntervalMs) || 0,
+      60_000,
+    ),
+  );
   let selfUrl = options.mcpSelfUrl ?? null;
   const release = clientReleaseMetadata(options.clientRelease);
 
@@ -565,6 +588,8 @@ export function createPetSocialApp(options = {}) {
       now: clock,
       decorateEnvelope: worldNotificationPayload,
       beforePersist: options.worldDeliveryBeforePersist,
+      maxAttempts: worldDeliveryMaxAttempts,
+      retryBaseDelayMs: worldDeliveryRetryBaseDelayMs,
     });
     pushEvents(result.emitted);
     for (const failure of result.failures) {
@@ -576,6 +601,21 @@ export function createPetSocialApp(options = {}) {
   }
 
   const worldDeliveryStartupDrain = drainSemanticWorldDeliveries();
+  let worldDeliveryDrainClosed = false;
+  let worldDeliveryDrainTimer = null;
+
+  function scheduleWorldDeliveryDrain() {
+    if (worldDeliveryDrainClosed || worldDeliveryDrainIntervalMs === 0) return;
+    worldDeliveryDrainTimer = scheduleTimeout(() => {
+      worldDeliveryDrainTimer = null;
+      if (worldDeliveryDrainClosed) return;
+      drainSemanticWorldDeliveries();
+      scheduleWorldDeliveryDrain();
+    }, worldDeliveryDrainIntervalMs);
+    worldDeliveryDrainTimer.unref?.();
+  }
+
+  scheduleWorldDeliveryDrain();
 
   function cancelInteractionDeadline(interactionId) {
     const timer = interactionTimers.get(interactionId);
@@ -668,6 +708,7 @@ export function createPetSocialApp(options = {}) {
           codexClient: options.worldHostCodexClient,
           maxConcurrency: options.worldHostMaxConcurrency ?? 2,
           maxAttempts: options.worldHostMaxAttempts ?? 3,
+          retryBaseDelayMs: options.worldHostRetryBaseDelayMs ?? 1_000,
           hostRoot: options.worldHostRoot,
           model: options.worldHostModel,
           effort: options.worldHostEffort,
@@ -713,6 +754,52 @@ export function createPetSocialApp(options = {}) {
     Math.min(Number(options.worldHostActionWaitMs) || 45_000, 120_000),
   );
 
+  function runtimeHealth() {
+    const checkedAt = Number(clock());
+    try {
+      store.db.prepare("SELECT 1 AS ok").get();
+      const outbox = worldDeliveryOutboxStatus(store.db, { now: checkedAt });
+      const hostWork = store.db.prepare(`
+        SELECT
+          SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_inputs,
+          SUM(CASE WHEN status = 'escalated' THEN 1 ELSE 0 END) AS escalated_inputs
+        FROM world_inputs
+      `).get();
+      const hostExecutors = store.db.prepare(`
+        SELECT SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+        FROM world_host_executors
+      `).get();
+      const hostRunner = worldHostRunner?.status?.() ?? {
+        mode: worldHostMode,
+        active_worlds: 0,
+        queued_worlds: 0,
+        scheduled_retries: 0,
+      };
+      const failedExecutors = Number(hostExecutors.failed ?? 0);
+      const degraded = outbox.dead_letter > 0 || failedExecutors > 0;
+      return {
+        ready: hostRunner.closed !== true,
+        degraded,
+        database: { ready: true },
+        host: {
+          ...hostRunner,
+          pending_inputs: Number(hostWork.pending_inputs ?? 0),
+          escalated_inputs: Number(hostWork.escalated_inputs ?? 0),
+          failed_executors: failedExecutors,
+        },
+        delivery_outbox: outbox,
+        checked_at: checkedAt,
+      };
+    } catch {
+      return {
+        ready: false,
+        degraded: true,
+        database: { ready: false },
+        checked_at: checkedAt,
+      };
+    }
+  }
+
   async function handler(req, res) {
     try {
       const url = new URL(req.url, "http://localhost");
@@ -721,9 +808,16 @@ export function createPetSocialApp(options = {}) {
         trustCloudflareProxy: options.trustCloudflareProxy === true,
       });
 
-      if (req.method === "GET" && pathname === "/health") {
-        return sendJson(res, 200, {
-          ok: true,
+      if (
+        req.method === "GET" &&
+        (pathname === "/health" || pathname === "/ready")
+      ) {
+        const runtime = runtimeHealth();
+        const status = pathname === "/ready" && !runtime.ready ? 503 : 200;
+        return sendJson(res, status, {
+          ok: runtime.ready,
+          ready: runtime.ready,
+          degraded: runtime.degraded,
           service: "diyworld",
           product: "agent-world-social",
           registrationMode: inviteRequired ? "invite_only" : "open",
@@ -734,6 +828,7 @@ export function createPetSocialApp(options = {}) {
             version: CLIENT_PACKAGE_VERSION,
           },
           versions: release,
+          runtime,
           now: clock()
         });
       }
@@ -1820,6 +1915,9 @@ export function createPetSocialApp(options = {}) {
       });
     },
     async close() {
+      worldDeliveryDrainClosed = true;
+      if (worldDeliveryDrainTimer) cancelTimeout(worldDeliveryDrainTimer);
+      worldDeliveryDrainTimer = null;
       for (const timer of interactionTimers.values()) cancelTimeout(timer);
       interactionTimers.clear();
       for (const devices of sseByPet.values()) {

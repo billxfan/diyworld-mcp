@@ -9,6 +9,10 @@ import {
   normalizeServerUrl
 } from "../src/installer.mjs";
 import { DAY_MS } from "../src/utils.mjs";
+import {
+  retryDeadLetterWorldDelivery,
+  worldDeliveryOutboxStatus,
+} from "../src/world-delivery-outbox.mjs";
 
 function usage() {
   console.log(`Agent World Social Admin
@@ -18,6 +22,8 @@ Usage:
   npm run admin -- invite:list
   npm run admin -- invite:disable INVITE_ID
   npm run admin -- account:recovery:create --email EMAIL [--expires-in-minutes N]
+  npm run admin -- delivery:status
+  npm run admin -- delivery:retry OUTBOX_ID
 
 Options:
   --db PATH              Override the SQLite database path
@@ -115,6 +121,18 @@ try {
       } : {}),
       note: "Verify the tester out of band, then send this single-use recovery code privately. Creating another code invalidates this one."
     }, values.json);
+  } else if (command === "delivery:status") {
+    print({ deliveryOutbox: worldDeliveryOutboxStatus(store.db) }, values.json);
+  } else if (command === "delivery:retry") {
+    const outboxId = Number(positionals[1]);
+    if (!Number.isSafeInteger(outboxId) || outboxId < 1) {
+      throw new Error("delivery:retry requires a positive OUTBOX_ID");
+    }
+    const retried = retryDeadLetterWorldDelivery(store.db, outboxId);
+    if (!retried) {
+      throw new Error("The outbox item does not exist or is not dead-lettered");
+    }
+    print({ retried: true, outboxId }, values.json);
   } else {
     usage();
     throw new Error(`Unknown admin command: ${command}`);

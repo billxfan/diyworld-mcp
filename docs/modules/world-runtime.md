@@ -188,10 +188,14 @@ input identifiers. Scene participants retain the full Scene closure. Collective
 public outcomes expose counts and aggregate results only; participant/input
 mapping stays in the private resolution records.
 
-Outbox draining is idempotent at application startup and after each commit. A
-database uniqueness constraint prevents duplicate per-Character activity rows.
-Failures leave the envelope pending with an attempt count and error so a later
-drain can recover it. Creating the activity does not advance its receipt:
+Outbox draining is idempotent at application startup, after each commit, and on
+a bounded background interval. A database uniqueness constraint prevents
+duplicate per-Character activity rows. Failures persist an attempt count, error,
+and exponential-backoff deadline. Envelopes that reach the configured attempt
+limit are isolated with `dead_letter_at` instead of consuming every later scan;
+an operator can explicitly reset one for another attempt. `/health` reports
+due, scheduled, pending, and dead-letter counts. Creating the activity does not
+advance its receipt:
 `queued`, `delivered`, `displayed`, and `read` remain distinct monotonic states.
 
 The World persists independently of its live runtime. Accepted inputs, Host

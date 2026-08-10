@@ -19,6 +19,7 @@ import {
 } from "../src/codex-app-server.mjs";
 import {
   deliveryPolicyForEvent,
+  isIsolatedCodexDelivery,
   shouldInterruptForEvent,
 } from "../src/delivery-policy.mjs";
 
@@ -131,6 +132,23 @@ test("the bridge interrupts only immediate or action-required semantic deliverie
     eventType: "world.event_committed",
     payload: {},
   }), "immediate", "legacy events preserve their historical delivery behavior");
+});
+
+test("Codex delivery requires a dedicated inbox isolation marker", () => {
+  assert.equal(isIsolatedCodexDelivery({
+    enabled: true,
+    threadId: "dedicated-thread",
+    isolation: "dedicated_inbox",
+  }), true);
+  assert.equal(isIsolatedCodexDelivery({
+    enabled: true,
+    threadId: "legacy-arbitrary-thread",
+  }), false);
+  assert.equal(isIsolatedCodexDelivery({
+    enabled: false,
+    threadId: "dedicated-thread",
+    isolation: "dedicated_inbox",
+  }), false);
 });
 
 test("explicit Codex command takes precedence", () => {

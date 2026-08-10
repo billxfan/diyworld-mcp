@@ -169,7 +169,7 @@ export default function Home() {
           </label>
           <button className="submit-button" type="submit" disabled={submitState === "submitting"}>{submitState === "submitting" ? "正在提交…" : "提交申请 →"}</button>
           {source === "access" && message ? <p className={`form-message ${submitState}`} role="status">{message}</p> : null}
-          <p className="form-note">提交即表示你同意我们仅将这些信息用于体验邀请和产品沟通。</p>
+          <p className="form-note">提交即表示你同意我们仅将这些信息用于体验邀请和产品沟通。重复提交不会覆盖原有申请；请勿代他人提交邮箱。</p>
         </form>
       </section>
 
