@@ -31,8 +31,15 @@ export async function createVerifiedBackup({ database, outputDir, now = new Date
   }
   chmodSync(destinationPath, 0o600);
 
-  const copy = new DatabaseSync(destinationPath, { readOnly: true });
+  // The online backup inherits WAL mode from a live source. Normalize the copy
+  // to a standalone rollback-journal database before verification so restoring
+  // it never depends on adjacent -wal/-shm files.
+  const copy = new DatabaseSync(destinationPath);
   try {
+    const journalMode = copy.prepare("PRAGMA journal_mode = DELETE").get();
+    if (String(journalMode.journal_mode).toLowerCase() !== "delete") {
+      throw new Error(`Backup journal normalization failed: ${JSON.stringify(journalMode)}`);
+    }
     copy.exec("PRAGMA foreign_keys = ON");
     const integrity = copy.prepare("PRAGMA integrity_check").all();
     if (integrity.length !== 1 || integrity[0].integrity_check !== "ok") {

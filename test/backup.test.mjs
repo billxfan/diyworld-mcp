@@ -19,6 +19,8 @@ test("operational backup creates a verified SQLite copy and refuses overwrite", 
   try {
     const destination = await createVerifiedBackup({ database, outputDir, now });
     assert.ok(existsSync(destination));
+    assert.equal(existsSync(`${destination}-wal`), false);
+    assert.equal(existsSync(`${destination}-shm`), false);
     const copy = new DatabaseSync(destination, { readOnly: true });
     try {
       assert.equal(
