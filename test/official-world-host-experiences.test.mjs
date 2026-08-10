@@ -414,6 +414,53 @@ test("official semantic contracts reject impossible ledgers and rewritten locked
         }),
       (error) => error.code === "WORLD_STATE_CONTRACT_VIOLATION",
     );
+
+    const observedClaims = backrooms.backrooms.rule_claims.map((claim, index) =>
+      index === 0
+        ? { ...claim, status: "observed", confirmations: 1 }
+        : claim,
+    );
+    assert.doesNotThrow(() =>
+      visitor.enforceWorldMechanicStateContract({
+        worldId: "official-liminal-backrooms",
+        worldStatePatch: {
+          backrooms: {
+            rule_claims: observedClaims.map((claim, index) =>
+              index === 0
+                ? { ...claim, status: "verified", confirmations: 2 }
+                : claim,
+            ),
+          },
+        },
+      }),
+    );
+
+    backrooms.backrooms.rule_claims = observedClaims.map((claim, index) =>
+      index === 0
+        ? { ...claim, status: "verified", confirmations: 2 }
+        : claim,
+    );
+    db.prepare("UPDATE world_states SET state_json = ?, updated_by_world_agent_id = ? WHERE space_id = ?").run(
+      JSON.stringify(backrooms),
+      "world-agent:official-liminal-backrooms",
+      "official-liminal-backrooms",
+    );
+    assert.throws(
+      () =>
+        visitor.enforceWorldMechanicStateContract({
+          worldId: "official-liminal-backrooms",
+          worldStatePatch: {
+            backrooms: {
+              rule_claims: backrooms.backrooms.rule_claims.map((claim, index) =>
+                index === 0
+                  ? { ...claim, status: "observed" }
+                  : claim,
+              ),
+            },
+          },
+        }),
+      (error) => error.code === "WORLD_STATE_CONTRACT_VIOLATION",
+    );
   } finally {
     db.close();
   }

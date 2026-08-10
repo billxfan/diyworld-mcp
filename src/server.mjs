@@ -41,6 +41,10 @@ const worldHostMaxConcurrency = Number.parseInt(
   process.env.AGENT_WORLD_HOST_MAX_CONCURRENCY ?? "2",
   10,
 );
+const worldHostMaxAttempts = Number.parseInt(
+  process.env.AGENT_WORLD_HOST_MAX_ATTEMPTS ?? "3",
+  10,
+);
 const worldHostPrewarm = !["0", "false", "no", "off"].includes(
   String(process.env.AGENT_WORLD_HOST_PREWARM ?? "true").toLowerCase(),
 );
@@ -71,6 +75,15 @@ if (
     "AGENT_WORLD_HOST_MAX_CONCURRENCY must be an integer between 1 and 8",
   );
 }
+if (
+  !Number.isInteger(worldHostMaxAttempts) ||
+  worldHostMaxAttempts < 1 ||
+  worldHostMaxAttempts > 5
+) {
+  throw new Error(
+    "AGENT_WORLD_HOST_MAX_ATTEMPTS must be an integer between 1 and 5",
+  );
+}
 
 mkdirSync(dirname(databaseFile), { recursive: true });
 
@@ -82,6 +95,7 @@ const app = createPetSocialApp({
   officialHostOwnerIds,
   worldHostMode,
   worldHostMaxConcurrency,
+  worldHostMaxAttempts,
   worldHostPrewarm,
   trustCloudflareProxy,
   clientRelease: {

@@ -93,6 +93,30 @@ class SlowFakeCodexWorldHosts extends FakeCodexWorldHosts {
   }
 }
 
+class PoisonInputCodexWorldHosts extends FakeCodexWorldHosts {
+  async runWorldHostTurn(args) {
+    const turn = await super.runWorldHostTurn(args);
+    const contextEnvelope = JSON.parse(args.prompt.split("\n\n").at(-1));
+    if (contextEnvelope.context_pack.input?.body_text !== "必然失败的结构测试") {
+      return turn;
+    }
+    const decision = JSON.parse(turn.text);
+    decision.result.affected_entities = ["character:broken"];
+    return { ...turn, text: JSON.stringify(decision) };
+  }
+}
+
+class PoisonCollectiveCodexWorldHosts extends FakeCodexWorldHosts {
+  async runWorldHostTurn(args) {
+    const turn = await super.runWorldHostTurn(args);
+    const contextEnvelope = JSON.parse(args.prompt.split("\n\n").at(-1));
+    if (!contextEnvelope.context_pack.batch_mode) return turn;
+    const decision = JSON.parse(turn.text);
+    decision.member_state_patch = { forbidden: true };
+    return { ...turn, text: JSON.stringify(decision) };
+  }
+}
+
 class ControlledFakeCodexWorldHosts extends FakeCodexWorldHosts {
   constructor() {
     super();
@@ -351,6 +375,87 @@ test("a submitted action is acknowledged and its final Host result is waitable",
   }
 });
 
+test("bounded Host failures terminalize a poison input and release later work", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-poison-"));
+  const store = new PetSocialStore(join(directory, "social.sqlite"));
+  const codex = new PoisonInputCodexWorldHosts();
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostCodexClient: codex,
+    worldHostMaxAttempts: 2,
+    worldHostRoot: join(directory, "hosts"),
+  });
+  const address = await app.listen();
+  try {
+    const registration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-poison@example.test",
+      displayName: "失败隔离测试者",
+      agentProvider: "codex",
+    });
+    const client = new AgentWorldClient({
+      serverUrl: address.url,
+      token: registration.token,
+    });
+    const world = await createPublishedWorld(client, "失败隔离世界", "POISON_ONLY");
+    await client.enterWorld(world.id, { clientSessionId: "poison-session" });
+    let observed = await client.observeWorld(world.id);
+    const poison = await client.submitWorldInput(world.id, {
+      inputType: "action",
+      eventType: "inspect",
+      bodyText: "必然失败的结构测试",
+      observedWorldStateVersion: observed.world_state.version,
+      observedMemberStateVersion: observed.member_state.version,
+      idempotencyKey: "poison:input",
+    });
+    await app.worldHostRunner.whenIdle();
+
+    const failed = await client.worldInputResult(world.id, poison.input.id, {
+      waitMs: 2_000,
+    });
+    await app.worldHostRunner.whenIdle();
+    assert.equal(failed.status, "escalated");
+    assert.equal(failed.processing.state, "host_failed");
+    assert.equal(failed.processing.final, true);
+    assert.equal(failed.processing.should_retry, false);
+    assert.equal(failed.processing.result_tool, null);
+    assert.equal(failed.processing.host_attempt_count, 2);
+    assert.match(failed.processing.message, /不会阻塞后续行动/u);
+    assert.match(codex.turns[1].prompt, /bounded repair attempt 2 of 2/u);
+    assert.match(codex.turns[1].prompt, /affected_entities\[0\] must be a JSON object/u);
+
+    observed = await client.observeWorld(world.id);
+    const healthy = await client.submitWorldInput(world.id, {
+      inputType: "action",
+      eventType: "continue",
+      bodyText: "继续处理后续的正常行动。",
+      observedWorldStateVersion: observed.world_state.version,
+      observedMemberStateVersion: observed.member_state.version,
+      idempotencyKey: "poison:follow-up",
+    });
+    const completed = await client.worldInputResult(world.id, healthy.input.id, {
+      waitMs: 2_000,
+    });
+    assert.equal(completed.processing.state, "completed");
+    assert.equal(completed.status, "accepted");
+
+    const rows = store.db
+      .prepare(`
+        SELECT id, status, host_attempt_count, host_failed_at
+        FROM world_inputs WHERE id IN (?, ?) ORDER BY created_at ASC
+      `)
+      .all(poison.input.id, healthy.input.id);
+    assert.deepEqual(rows.map((row) => row.status), ["escalated", "accepted"]);
+    assert.equal(rows[0].host_attempt_count, 2);
+    assert.ok(rows[0].host_failed_at);
+    assert.equal(rows[1].host_attempt_count, 1);
+  } finally {
+    await app.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("a platform Host cannot commit after a creator takes over mid-turn", async () => {
   const directory = mkdtempSync(join(tmpdir(), "agent-world-host-takeover-fence-"));
   const store = new PetSocialStore(join(directory, "social.sqlite"));
@@ -528,6 +633,98 @@ test("a ready collective interaction is settled in a fresh isolated World Host t
       .prepare("SELECT status FROM world_interactions WHERE id = ?")
       .get(opened.interaction.id);
     assert.equal(interaction.status, "resolved");
+  } finally {
+    await app.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a terminal collective Host failure closes the batch and its pending inputs", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-batch-failure-"));
+  const store = new PetSocialStore(join(directory, "social.sqlite"));
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostCodexClient: new PoisonCollectiveCodexWorldHosts(),
+    worldHostMaxAttempts: 1,
+    worldHostRoot: join(directory, "hosts"),
+  });
+  const address = await app.listen();
+  try {
+    const registration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-batch-failure@example.test",
+      displayName: "批次失败测试者",
+      agentProvider: "codex",
+    });
+    const guestRegistration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-batch-failure-guest@example.test",
+      displayName: "批次失败访客",
+      agentProvider: "other",
+    });
+    const owner = new AgentWorldClient({
+      serverUrl: address.url,
+      token: registration.token,
+    });
+    const guest = new AgentWorldClient({
+      serverUrl: address.url,
+      token: guestRegistration.token,
+    });
+    const world = await createPublishedWorld(
+      owner,
+      "批次失败世界",
+      "BATCH_FAILURE_ONLY",
+    );
+    await guest.joinWorld(world.id, { ruleVersion: world.rule_version });
+    await owner.enterWorld(world.id, { clientSessionId: "batch-failure-session" });
+    await guest.enterWorld(world.id, { clientSessionId: "batch-failure-guest" });
+    await owner.takeoverWorldHost(world.id, {
+      clientSessionId: "batch-failure-session",
+    });
+    const opened = await owner.openWorldHostInteraction(world.id, {
+      clientSessionId: "batch-failure-session",
+      promptText: "确认执行批次测试？",
+      mode: "quorum",
+      quorum: 2,
+      windowSeconds: 120,
+      expectedWorldStateVersion: 1,
+    });
+    await owner.releaseWorldHost(world.id, {
+      clientSessionId: "batch-failure-session",
+    });
+    let response;
+    for (const [client, key] of [[owner, "owner"], [guest, "guest"]]) {
+      const observed = await client.observeWorld(world.id);
+      const submitted = await client.submitWorldInput(world.id, {
+        inputType: "choice",
+        eventType: "collective.vote",
+        bodyText: "确认。",
+        replyToEventId: opened.prompt_event.id,
+        visibility: "actor",
+        observedWorldStateVersion: observed.world_state.version,
+        observedMemberStateVersion: observed.member_state.version,
+        idempotencyKey: `batch-failure:${key}`,
+      });
+      if (key === "owner") response = submitted;
+    }
+    await app.worldHostRunner.whenIdle();
+
+    const failed = await owner.worldInputResult(world.id, response.input.id, {
+      waitMs: 0,
+    });
+    assert.equal(failed.status, "escalated");
+    assert.equal(failed.processing.state, "host_failed");
+    assert.equal(failed.processing.final, true);
+    const interaction = store.db
+      .prepare(`
+        SELECT status, host_attempt_count, host_last_error, host_failed_at
+        FROM world_interactions WHERE id = ?
+      `)
+      .get(opened.interaction.id);
+    assert.equal(interaction.status, "cancelled");
+    assert.equal(interaction.host_attempt_count, 1);
+    assert.match(interaction.host_last_error, /cannot include member_state_patch/u);
+    assert.ok(interaction.host_failed_at);
   } finally {
     await app.close();
     store.close();
@@ -809,4 +1006,46 @@ test("World Host prompt treats causal overlap, not presence, as multiplayer evid
   assert.match(prompt, /Presence alone must never force multiplayer interaction/u);
   assert.match(prompt, /server impact router alone determines recipients/u);
   assert.match(prompt, /result\.loop_transition is required/u);
+  assert.match(prompt, /Every item in all three arrays must be a JSON object/u);
+  assert.match(prompt, /affected_entities items shaped like \{ entity_type, entity_id, effect_kind \}/u);
+  assert.match(prompt, /next_affordances items shaped like \{ label, input_type, event_type, body_text, visibility \}/u);
+  assert.match(prompt, /copy its id and claim text exactly/u);
+  assert.match(prompt, /may only advance metadata such as status or confirmations/u);
+});
+
+test("Loop parser rejects bare string affected entities and affordances", () => {
+  const base = {
+    decision: "accepted",
+    resolution_disposition: "apply",
+    reason_text: "验证结构化结果。",
+    outcome_text: "不应提交格式错误的裁决。",
+    result: {
+      loop_transition: {
+        contract_version: 1,
+        loop_id: "personal:test",
+        scope: "personal",
+        from_phase: "active",
+        transition: "continue",
+        to_phase: "active",
+        reason: "测试结构校验。",
+      },
+      effects: [],
+      affected_entities: [{ entity_type: "character", entity_id: "character:a" }],
+      next_affordances: [{ label: "继续" }],
+    },
+  };
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({
+      ...base,
+      result: { ...base.result, affected_entities: ["character:a"] },
+    })),
+    /affected_entities\[0\] must be a JSON object/u,
+  );
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({
+      ...base,
+      result: { ...base.result, next_affordances: ["继续"] },
+    })),
+    /next_affordances\[0\] must be a JSON object/u,
+  );
 });

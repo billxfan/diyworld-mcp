@@ -6917,7 +6917,7 @@ export class SocialService {
             rule_claim_id: id,
           });
         }
-        if (!new Set(["unverified", "verified", "disproved"]).has(nextClaim.status)) {
+        if (!new Set(["unverified", "observed", "verified", "disproved"]).has(nextClaim.status)) {
           violation("Anomaly rule status is invalid.", {
             rule_claim_id: id,
           });
@@ -6937,7 +6937,7 @@ export class SocialService {
           });
         }
         if (
-          currentClaim.status !== "unverified" &&
+          new Set(["verified", "disproved"]).has(currentClaim.status) &&
           nextClaim.status !== currentClaim.status
         ) {
           violation("The Host cannot reverse a resolved anomaly rule status.", {
@@ -10804,6 +10804,8 @@ export class SocialService {
         Number(row.world_state_version) <
         Number(row.received_world_state_version ?? row.world_state_version),
       resolution_disposition: row.resolution_disposition ?? null,
+      host_attempt_count: Number(row.host_attempt_count ?? 0),
+      host_failed_at: row.host_failed_at ?? null,
       status: row.status,
       created_at: row.created_at,
       resolved_at: row.resolved_at ?? null,
@@ -10993,6 +10995,8 @@ export class SocialService {
     const effectiveGuidance =
       pendingInteractionGuidance ?? hostGuidance;
     const completed = judgementView !== null || outcomeView !== null;
+    const terminalHostFailure =
+      !completed && Boolean(input?.host_failed_at);
     const executor = this.db
       .prepare(`
         SELECT status, last_error, updated_at
@@ -11005,7 +11009,7 @@ export class SocialService {
         FROM world_host_runtimes WHERE space_id = ?
       `)
       .get(intent.space_id);
-    const queuePosition = !completed && input
+    const queuePosition = !completed && !terminalHostFailure && input
       ? Number(
           this.db
             .prepare(`
@@ -11022,37 +11026,45 @@ export class SocialService {
       : null;
     const processingState = completed
       ? "completed"
-      : pendingInteractionStatus === "collecting"
-        ? "collecting"
-        : executor?.status === "failed"
-          ? "host_error"
-          : hostRuntime?.active_executor === "creator_codex" &&
-              hostRuntime?.claimed_by_pet_id
-            ? "waiting_for_creator_host"
-            : "processing";
+      : terminalHostFailure
+        ? "host_failed"
+        : pendingInteractionStatus === "collecting"
+          ? "collecting"
+          : executor?.status === "failed"
+            ? "host_error"
+            : hostRuntime?.active_executor === "creator_codex" &&
+                hostRuntime?.claimed_by_pet_id
+              ? "waiting_for_creator_host"
+              : "processing";
     const processingMessage = completed
       ? "Host 已完成裁决，这是最终结果。"
-      : pendingInteractionMessage ||
-        (processingState === "host_error"
-          ? "行动已安全记录，但 Host 本次处理发生错误；系统可重试，行动不会丢失。"
-          : processingState === "waiting_for_creator_host"
-            ? "行动已记录，正在等待当前世界的创作者 Host 处理。"
-            : "行动已收到，Host 正在处理；Agent 应自动继续查询，直到取得最终裁决。");
+      : terminalHostFailure
+        ? "Host 在限定次数内仍未能生成可提交的裁决；这次行动已停止重试，不会阻塞后续行动。你可以稍后重新提交原行动。"
+        : pendingInteractionMessage ||
+          (processingState === "host_error"
+            ? "行动已安全记录，但 Host 本次处理发生错误；系统可重试，行动不会丢失。"
+            : processingState === "waiting_for_creator_host"
+              ? "行动已记录，正在等待当前世界的创作者 Host 处理。"
+              : "行动已收到，Host 正在处理；Agent 应自动继续查询，直到取得最终裁决。");
     const processing = {
       state: processingState,
       acknowledged: true,
-      final: completed,
-      should_retry: !completed,
-      retry_after_ms: completed ? null : 1500,
-      result_tool: completed ? null : "world_input_result",
+      final: completed || terminalHostFailure,
+      should_retry: !completed && !terminalHostFailure,
+      retry_after_ms: completed || terminalHostFailure ? null : 1500,
+      result_tool:
+        completed || terminalHostFailure ? null : "world_input_result",
       message: processingMessage,
       queue_position: queuePosition,
+      host_attempt_count: Number(input?.host_attempt_count ?? 0),
       elapsed_ms: input?.created_at
         ? Math.max(0, Date.now() - new Date(input.created_at).valueOf())
         : null,
       error:
-        processingState === "host_error"
-          ? executor?.last_error ?? "World Host processing failed."
+        processingState === "host_error" || processingState === "host_failed"
+          ? input?.host_last_error ??
+            executor?.last_error ??
+            "World Host processing failed."
           : null,
     };
     let delivery = null;

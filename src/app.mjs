@@ -667,6 +667,7 @@ export function createPetSocialApp(options = {}) {
           db: store.db,
           codexClient: options.worldHostCodexClient,
           maxConcurrency: options.worldHostMaxConcurrency ?? 2,
+          maxAttempts: options.worldHostMaxAttempts ?? 3,
           hostRoot: options.worldHostRoot,
           model: options.worldHostModel,
           effort: options.worldHostEffort,

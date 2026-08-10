@@ -612,7 +612,7 @@
     openConfirmation({
       title: "准备场馆联调场景",
       details:
-        "将依次执行：\n1. 创建阿球与豆包两个 Character\n2. 两个 Character 加入并进入「中心小镇」\n3. 阿球发送好友申请\n4. 豆包接受申请\n\n不会自动发送私聊消息。",
+        "将依次执行：\n1. 创建阿球与豆包两个 Character\n2. 两个 Character 加入并进入「晨雾镇」\n3. 阿球发送好友申请\n4. 豆包接受申请\n\n不会自动发送私聊消息。",
       confirmLabel: "开始准备",
       run: () => performVenueLab("prepare_to_chat")
     });
@@ -636,7 +636,7 @@
     openConfirmation({
       title: "发送场馆好友申请",
       details:
-        "发送方：阿球 · character_alice\n接收方：豆包 · character_bob\n来源：中心小镇\n\n确认发送好友申请？",
+        "发送方：阿球 · character_alice\n接收方：豆包 · character_bob\n来源：晨雾镇\n\n确认发送好友申请？",
       confirmLabel: "发送申请",
       run: () => performVenueLab("friend_request_send")
     });

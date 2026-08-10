@@ -711,7 +711,10 @@ export function migrateWorldRuntime(db) {
       created_by_pet_id TEXT NOT NULL REFERENCES pets(id),
       created_at TEXT NOT NULL,
       ready_at TEXT,
-      resolved_at TEXT
+      resolved_at TEXT,
+      host_attempt_count INTEGER NOT NULL DEFAULT 0,
+      host_last_error TEXT,
+      host_failed_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS world_interaction_resolutions (
@@ -758,6 +761,9 @@ export function migrateWorldRuntime(db) {
       resolution_disposition TEXT,
       interaction_id TEXT REFERENCES world_interactions(id) ON DELETE SET NULL,
       idempotency_key TEXT NOT NULL,
+      host_attempt_count INTEGER NOT NULL DEFAULT 0,
+      host_last_error TEXT,
+      host_failed_at TEXT,
       status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN (
           'pending', 'accepted', 'rejected', 'clarification', 'escalated'
@@ -1208,6 +1214,22 @@ export function migrateWorldRuntime(db) {
     "interaction_id",
     "TEXT REFERENCES world_interactions(id) ON DELETE SET NULL",
   );
+  ensureColumn(
+    db,
+    "world_inputs",
+    "host_attempt_count",
+    "INTEGER NOT NULL DEFAULT 0",
+  );
+  ensureColumn(db, "world_inputs", "host_last_error", "TEXT");
+  ensureColumn(db, "world_inputs", "host_failed_at", "TEXT");
+  ensureColumn(
+    db,
+    "world_interactions",
+    "host_attempt_count",
+    "INTEGER NOT NULL DEFAULT 0",
+  );
+  ensureColumn(db, "world_interactions", "host_last_error", "TEXT");
+  ensureColumn(db, "world_interactions", "host_failed_at", "TEXT");
   ensureColumn(
     db,
     "world_interactions",

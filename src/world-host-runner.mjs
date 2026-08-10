@@ -373,9 +373,13 @@ export function worldHostPrompt(work) {
     batchMode
       ? "Do not claim an actor Loop changed as part of collective settlement."
       : "result.loop_transition is a proposal until the server validates and commits it. Do not claim that it was applied merely because the World judgement was accepted. The server must return the applied transition receipt described by director_plan.loop_transition_contract.applied_receipt; only that receipt proves the Loop transition was applied.",
-    "For every accepted decision, result must also include effects, affected_entities, and 1-3 next_affordances arrays. next_affordances describe concrete actions the actor may attempt; they do not decide outcomes.",
+    "For every accepted decision, result must also include effects, affected_entities, and 1-3 next_affordances arrays. Every item in all three arrays must be a JSON object, never a bare string or ID. Use affected_entities items shaped like { entity_type, entity_id, effect_kind }; use next_affordances items shaped like { label, input_type, event_type, body_text, visibility }. next_affordances describe concrete actions the actor may attempt; they do not decide outcomes.",
     "result.impact_hints may describe semantic kind, reason, urgency, and relationship to the current Loop. Never provide recipient IDs, recipient lists, delivery decisions, delivery state, displayed state, or read state. The server impact router alone determines recipients and delivery timing from committed facts.",
     "If host.judgement_policy.world_mechanics.state_contract is present, patch only its declared top-level keys and preserve unrelated state. Apply the World-specific loop, tension, progression, and host directives when judging the result.",
+    "If host.judgement_policy.world_mechanics.settlement.hidden_rule_policy.mutable_after_first_observation is false, any existing observed or verified anomaly rule is immutable: copy its id and claim text exactly. A confirming observation may only advance metadata such as status or confirmations; put narrower conditions, interpretations, and unresolved causality in new_facts, opened_hooks, disputed records, or a new rule ID instead of rewriting the existing claim.",
+    work.host_retry?.attempt > 1
+      ? `This is bounded repair attempt ${work.host_retry.attempt} of ${work.host_retry.max_attempts}. The previous attempt failed server validation: ${JSON.stringify(work.host_retry.previous_error)}. Correct that exact contract error while independently judging the original input; do not claim the failed attempt changed the World.`
+      : "This is the first Host attempt for this input.",
     "For an accepted decision, result should include new_facts and opened_hooks arrays plus 2-3 next_actions derived from the actual outcome and current open threads. Each next action uses: label, input_type, event_type, body_text, visibility. Do not repeat generic starter choices when the scene has materially changed.",
     JSON.stringify({
       bound_world_id: work.bound_world_id,
@@ -391,6 +395,7 @@ export class LocalCodexWorldHostRunner {
     db,
     codexClient = new CodexAppServerClient(),
     maxConcurrency = 2,
+    maxAttempts = 3,
     hostRoot = resolve(process.cwd(), "data/world-hosts"),
     model,
     effort = "medium",
@@ -402,12 +407,16 @@ export class LocalCodexWorldHostRunner {
     if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 8) {
       throw new Error("World Host maxConcurrency must be between 1 and 8");
     }
+    if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 5) {
+      throw new Error("World Host maxAttempts must be between 1 and 5");
+    }
     if (threadIsolation !== "per_turn") {
       throw new Error("World Host threadIsolation must be per_turn");
     }
     this.db = db;
     this.codexClient = codexClient;
     this.maxConcurrency = maxConcurrency;
+    this.maxAttempts = maxAttempts;
     this.hostRoot = hostRoot;
     this.model = model;
     this.effort = effort;
@@ -557,7 +566,11 @@ export class LocalCodexWorldHostRunner {
       this.activeWorldIds.add(worldId);
       this.activeCount += 1;
       this.#runWorld(worldId)
-        .catch((error) => this.#recordFailure(worldId, error))
+        .catch((error) => {
+          if (!error?.worldHostFailureRecorded) {
+            this.#recordFailure(worldId, error);
+          }
+        })
         .finally(() => {
           this.activeWorldIds.delete(worldId);
           this.activeCount -= 1;
@@ -615,6 +628,139 @@ export class LocalCodexWorldHostRunner {
       .get(worldId);
   }
 
+  #beginAttempt(next) {
+    const interactionId = next.kind === "interaction" ? next.interaction_id : null;
+    const row = interactionId
+      ? this.db
+          .prepare(`
+            SELECT host_attempt_count, host_last_error
+            FROM world_interactions WHERE id = ? AND status = 'ready'
+          `)
+          .get(interactionId)
+      : this.db
+          .prepare(`
+            SELECT host_attempt_count, host_last_error
+            FROM world_inputs WHERE id = ? AND status = 'pending'
+          `)
+          .get(next.id);
+    if (!row) throw new Error("Pending World Host work changed before processing");
+    const attempt = Number(row.host_attempt_count ?? 0) + 1;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (interactionId) {
+        this.db
+          .prepare(`
+            UPDATE world_interactions
+            SET host_attempt_count = ?
+            WHERE id = ? AND status = 'ready'
+          `)
+          .run(attempt, interactionId);
+        this.db
+          .prepare(`
+            UPDATE world_inputs SET host_attempt_count = ?
+            WHERE interaction_id = ? AND status = 'pending'
+          `)
+          .run(attempt, interactionId);
+      } else {
+        this.db
+          .prepare(`
+            UPDATE world_inputs SET host_attempt_count = ?
+            WHERE id = ? AND status = 'pending'
+          `)
+          .run(attempt, next.id);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return {
+      attempt,
+      previousError: row.host_last_error ?? null,
+    };
+  }
+
+  #recordWorkFailure(worldId, next, error, attempt) {
+    const timestamp = new Date().toISOString();
+    const message = String(error?.message ?? error).slice(0, 2000);
+    const terminal = attempt >= this.maxAttempts;
+    const interactionId = next.kind === "interaction" ? next.interaction_id : null;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (interactionId) {
+        this.db
+          .prepare(`
+            UPDATE world_interactions
+            SET host_last_error = ?, host_failed_at = ?,
+              status = CASE WHEN ? = 1 THEN 'cancelled' ELSE status END,
+              resolved_at = CASE WHEN ? = 1 THEN ? ELSE resolved_at END
+            WHERE id = ? AND status = 'ready'
+          `)
+          .run(
+            message,
+            terminal ? timestamp : null,
+            terminal ? 1 : 0,
+            terminal ? 1 : 0,
+            timestamp,
+            interactionId,
+          );
+        this.db
+          .prepare(`
+            UPDATE world_inputs
+            SET host_last_error = ?, host_failed_at = ?,
+              status = CASE WHEN ? = 1 THEN 'escalated' ELSE status END,
+              resolved_at = CASE WHEN ? = 1 THEN ? ELSE resolved_at END
+            WHERE interaction_id = ? AND status = 'pending'
+          `)
+          .run(
+            message,
+            terminal ? timestamp : null,
+            terminal ? 1 : 0,
+            terminal ? 1 : 0,
+            timestamp,
+            interactionId,
+          );
+      } else {
+        this.db
+          .prepare(`
+            UPDATE world_inputs
+            SET host_last_error = ?, host_failed_at = ?,
+              status = CASE WHEN ? = 1 THEN 'escalated' ELSE status END,
+              resolved_at = CASE WHEN ? = 1 THEN ? ELSE resolved_at END
+            WHERE id = ? AND status = 'pending'
+          `)
+          .run(
+            message,
+            terminal ? timestamp : null,
+            terminal ? 1 : 0,
+            terminal ? 1 : 0,
+            timestamp,
+            next.id,
+          );
+      }
+      this.db
+        .prepare(`
+          UPDATE world_host_executors
+          SET status = ?, last_error = ?, updated_at = ?
+          WHERE space_id = ?
+        `)
+        .run(terminal ? "idle" : "failed", message, timestamp, worldId);
+      this.db.exec("COMMIT");
+    } catch (recordError) {
+      this.db.exec("ROLLBACK");
+      throw recordError;
+    }
+    this.onError?.(error, {
+      worldId,
+      inputId: next.id,
+      interactionId,
+      attempt,
+      maxAttempts: this.maxAttempts,
+      terminal,
+    });
+    return terminal;
+  }
+
   async #ensureThread(worldId, service) {
     service.ensureWorldHostRuntime(worldId);
     let executor = this.#executor(worldId);
@@ -647,103 +793,123 @@ export class LocalCodexWorldHostRunner {
     while (!this.closed) {
       const next = this.#nextWork(worldId);
       if (!next) break;
-      const service = new SocialService(this.db, next.actor_pet_id, {
-        identitySchema: "shared",
-        principalUserId: next.principal_user_id,
-        principalSessionId: `platform-host:${worldId}`,
-        platformHostExecutor: true,
-        platformHostMode: "local_codex",
-      });
-      const executor =
-        this.threadIsolation === "per_turn"
-          ? await this.#freshTurnThread(worldId, service)
-          : await this.#boundThread(worldId, service);
-      const work =
-        next.kind === "interaction"
-          ? service.localCodexHostInteractionWork({
-              worldId,
-              interactionId: next.interaction_id,
-            })
-          : service.localCodexHostWork({
-              worldId,
-              inputId: next.id,
-            });
-      const startedAt = new Date().toISOString();
-      this.db
-        .prepare(`
-          UPDATE world_host_executors
-          SET status = 'running', last_input_id = ?, last_started_at = ?,
-            last_error = NULL, updated_at = ?
-          WHERE space_id = ?
-        `)
-        .run(next.id, startedAt, startedAt, worldId);
-      const turn = await this.codexClient.runWorldHostTurn({
-        threadId: executor.codex_thread_id,
-        prompt: worldHostPrompt(work),
-        model: this.model,
-        effort: this.effort,
-        resume: this.threadIsolation !== "per_turn",
-        ephemeral: this.threadIsolation === "per_turn",
-      });
-      const decision = parseWorldHostDecision(turn.text, {
-        directorPlan: work.director_plan,
-        requireLoopContract: next.kind !== "interaction",
-        allowLoopTransition: next.kind !== "interaction",
-      });
-      if (next.kind === "interaction" && decision.memberStatePatch !== undefined) {
-        throw new Error(
-          "A collective World Host decision cannot include member_state_patch",
-        );
-      }
-      const resolution = {
-        ...decision,
-        result: {
-          ...decision.result,
-          host_executor: {
-            provider: "local_codex",
-            codex_thread_id: executor.codex_thread_id,
-            codex_turn_id: turn.turnId,
-            context_version: Number(executor.context_version),
-          },
-        },
-        expectedWorldStateVersion: work.world_state.version,
-        expectedHostRuntimeVersion: work.execution_fence.runtime_version,
-      };
-      const result =
-        next.kind === "interaction"
-          ? service.resolveLocalCodexHostInteraction({
-              worldId,
-              interactionId: next.interaction_id,
-              ...resolution,
-            })
-          : service.resolveLocalCodexHostInput({
-              worldId,
-              inputId: next.id,
-              ...resolution,
-              targetPetId: next.actor_pet_id,
-              expectedMemberStateVersion:
-                decision.memberStatePatch === undefined
-                  ? undefined
-                  : work.actor_member_state.version,
-            });
-      const completedAt = new Date().toISOString();
-      const latestSequence = Number(
+      const retry = this.#beginAttempt(next);
+      try {
+        const service = new SocialService(this.db, next.actor_pet_id, {
+          identitySchema: "shared",
+          principalUserId: next.principal_user_id,
+          principalSessionId: `platform-host:${worldId}`,
+          platformHostExecutor: true,
+          platformHostMode: "local_codex",
+        });
+        const executor =
+          this.threadIsolation === "per_turn"
+            ? await this.#freshTurnThread(worldId, service)
+            : await this.#boundThread(worldId, service);
+        const work =
+          next.kind === "interaction"
+            ? service.localCodexHostInteractionWork({
+                worldId,
+                interactionId: next.interaction_id,
+              })
+            : service.localCodexHostWork({
+                worldId,
+                inputId: next.id,
+              });
+        work.host_retry = {
+          attempt: retry.attempt,
+          max_attempts: this.maxAttempts,
+          previous_error: retry.previousError,
+        };
+        const startedAt = new Date().toISOString();
         this.db
           .prepare(`
-            SELECT COALESCE(MAX(sequence), 0) AS sequence
-            FROM world_events WHERE space_id = ?
+            UPDATE world_host_executors
+            SET status = 'running', last_input_id = ?, last_started_at = ?,
+              last_error = NULL, updated_at = ?
+            WHERE space_id = ?
           `)
-          .get(worldId).sequence,
-      );
-      this.db
-        .prepare(`
-          UPDATE world_host_executors
-          SET status = 'idle', last_turn_id = ?, last_event_sequence = ?,
-            last_completed_at = ?, last_error = NULL, updated_at = ?
-          WHERE space_id = ?
-        `)
-        .run(turn.turnId, latestSequence, completedAt, completedAt, worldId);
-      await this.onCommitted?.(result);
+          .run(next.id, startedAt, startedAt, worldId);
+        const turn = await this.codexClient.runWorldHostTurn({
+          threadId: executor.codex_thread_id,
+          prompt: worldHostPrompt(work),
+          model: this.model,
+          effort: this.effort,
+          resume: this.threadIsolation !== "per_turn",
+          ephemeral: this.threadIsolation === "per_turn",
+        });
+        const decision = parseWorldHostDecision(turn.text, {
+          directorPlan: work.director_plan,
+          requireLoopContract: next.kind !== "interaction",
+          allowLoopTransition: next.kind !== "interaction",
+        });
+        if (next.kind === "interaction" && decision.memberStatePatch !== undefined) {
+          throw new Error(
+            "A collective World Host decision cannot include member_state_patch",
+          );
+        }
+        const resolution = {
+          ...decision,
+          result: {
+            ...decision.result,
+            host_executor: {
+              provider: "local_codex",
+              codex_thread_id: executor.codex_thread_id,
+              codex_turn_id: turn.turnId,
+              context_version: Number(executor.context_version),
+            },
+          },
+          expectedWorldStateVersion: work.world_state.version,
+          expectedHostRuntimeVersion: work.execution_fence.runtime_version,
+        };
+        const result =
+          next.kind === "interaction"
+            ? service.resolveLocalCodexHostInteraction({
+                worldId,
+                interactionId: next.interaction_id,
+                ...resolution,
+              })
+            : service.resolveLocalCodexHostInput({
+                worldId,
+                inputId: next.id,
+                ...resolution,
+                targetPetId: next.actor_pet_id,
+                expectedMemberStateVersion:
+                  decision.memberStatePatch === undefined
+                    ? undefined
+                    : work.actor_member_state.version,
+              });
+        const completedAt = new Date().toISOString();
+        const latestSequence = Number(
+          this.db
+            .prepare(`
+              SELECT COALESCE(MAX(sequence), 0) AS sequence
+              FROM world_events WHERE space_id = ?
+            `)
+            .get(worldId).sequence,
+        );
+        this.db
+          .prepare(`
+            UPDATE world_host_executors
+            SET status = 'idle', last_turn_id = ?, last_event_sequence = ?,
+              last_completed_at = ?, last_error = NULL, updated_at = ?
+            WHERE space_id = ?
+          `)
+          .run(turn.turnId, latestSequence, completedAt, completedAt, worldId);
+        await this.onCommitted?.(result);
+      } catch (error) {
+        const terminal = this.#recordWorkFailure(
+          worldId,
+          next,
+          error,
+          retry.attempt,
+        );
+        if (terminal) continue;
+        const recordedError =
+          error instanceof Error ? error : new Error(String(error));
+        recordedError.worldHostFailureRecorded = true;
+        throw recordedError;
+      }
     }
   }
 
