@@ -280,7 +280,11 @@ export function resolveWorldDeliveryRecipients(db, row) {
     `).get(envelope.interactionId, worldId);
     const recipients = interaction?.scene_id
       ? interactionParticipants(db, worldId, envelope.interactionId)
-      : presentMembers(db, worldId).filter(
+      // A non-Scene collective window is asynchronous by design: every
+      // eligible member needs a durable invitation even if they are offline
+      // when it opens.  The snapshot created below then remains the audience
+      // for its outcome, rather than depending on later presence changes.
+      : activeMembers(db, worldId).filter(
           (petId) => petId !== interaction?.created_by_pet_id,
         );
     return uniqueDescriptors(recipients.map((petId) => descriptor(petId, {

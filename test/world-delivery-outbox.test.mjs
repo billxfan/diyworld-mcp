@@ -410,8 +410,9 @@ test("collective delivery retries the authoritative audience snapshot instead of
     `).get(opened.prompt_event.id);
     assert.equal(pending.status, "pending");
     assert.deepEqual(
-      JSON.parse(pending.recipient_snapshot_json).map((item) => item.petId),
-      [invited.registration.pet.id],
+      JSON.parse(pending.recipient_snapshot_json).map((item) => item.petId).sort(),
+      [invited.registration.pet.id, later.registration.pet.id].sort(),
+      "all active members are eligible when a non-Scene collective window opens, including offline members",
     );
 
     await invited.client.leaveWorld(world.id);
@@ -425,7 +426,7 @@ test("collective delivery retries the authoritative audience snapshot instead of
       store,
       later.registration.pet.id,
       opened.interaction.id,
-    ), 0);
+    ), 1);
   } finally {
     await app.close();
     store.close();

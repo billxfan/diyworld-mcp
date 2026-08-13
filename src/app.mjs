@@ -17,6 +17,7 @@ import { LocalCodexWorldHostRunner } from "./world-host-runner.mjs";
 import { handleRemoteMcpMessage } from "./remote-mcp.mjs";
 import {
   drainWorldDeliveryOutbox as drainDurableWorldDeliveryOutbox,
+  enqueueWorldDelivery,
   worldDeliveryOutboxStatus,
 } from "./world-delivery-outbox.mjs";
 
@@ -203,6 +204,10 @@ export function createPetSocialApp(options = {}) {
   const worldHostMode =
     options.worldHostMode === "local_codex" ? "local_codex" : "deterministic";
   const sseByPet = new Map();
+  // A socket is registered before replay so no event can be missed between a
+  // cursor read and subscribing.  Live events are buffered until all pages of
+  // the durable replay have been emitted, preserving one increasing sequence.
+  const sseReplayBuffers = new WeakMap();
   const rateBuckets = new Map();
   const interactionTimers = new Map();
   const worldDeliveryMaxAttempts = Math.max(
@@ -290,7 +295,12 @@ export function createPetSocialApp(options = {}) {
     if (!connections?.size) return;
     const line = `id: ${event.id}\nevent: pet-social\ndata: ${JSON.stringify(eventEnvelope(event))}\n\n`;
     for (const res of connections.values()) {
-      if (!res.destroyed) res.write(line);
+      const buffer = sseReplayBuffers.get(res);
+      if (buffer) {
+        buffer.push(event);
+      } else if (!res.destroyed) {
+        res.write(line);
+      }
     }
   }
 
@@ -318,14 +328,11 @@ export function createPetSocialApp(options = {}) {
     return actorPetId ? [actorPetId] : [];
   }
 
-  function presentWorldMembers(worldId) {
+  function activeWorldMembers(worldId) {
     return store.db
       .prepare(`
-        SELECT DISTINCT membership.pet_id
-        FROM space_memberships membership
-        JOIN presence ON presence.pet_id = membership.pet_id
-          AND presence.space_id = membership.space_id
-        WHERE membership.space_id = ? AND membership.status = 'active'
+        SELECT DISTINCT pet_id FROM space_memberships
+        WHERE space_id = ? AND status = 'active'
       `)
       .all(worldId)
       .map((row) => row.pet_id);
@@ -406,7 +413,7 @@ export function createPetSocialApp(options = {}) {
         : null;
       const recipients = interaction?.scene_id
         ? interactionParticipants(worldId, payload.interactionId)
-        : presentWorldMembers(worldId).filter(
+        : activeWorldMembers(worldId).filter(
             (petId) => petId !== interaction?.created_by_pet_id,
           );
       return recipients
@@ -475,7 +482,7 @@ export function createPetSocialApp(options = {}) {
     const outcome = payload.outcomeEventId
       ? store.db
           .prepare(`
-            SELECT body_text, event_type FROM world_events
+            SELECT body_text, event_type, sequence FROM world_events
             WHERE id = ? AND space_id = ?
           `)
           .get(payload.outcomeEventId, worldId)
@@ -486,7 +493,8 @@ export function createPetSocialApp(options = {}) {
             SELECT interaction.mode, interaction.quorum,
               interaction.late_input_policy, interaction.closes_at,
               interaction.scene_id,
-              prompt.body_text AS prompt_text
+              prompt.body_text AS prompt_text, prompt.payload_json AS prompt_payload_json,
+              prompt.sequence AS prompt_sequence
             FROM world_interactions interaction
             JOIN world_events prompt ON prompt.id = interaction.prompt_event_id
             WHERE interaction.id = ? AND interaction.space_id = ?
@@ -494,10 +502,16 @@ export function createPetSocialApp(options = {}) {
           .get(payload.interactionId, worldId)
       : null;
     let inputData = {};
+    let promptData = {};
     try {
       inputData = input ? JSON.parse(input.data_json ?? "{}")?.data ?? {} : {};
     } catch {
       inputData = {};
+    }
+    try {
+      promptData = interaction ? JSON.parse(interaction.prompt_payload_json ?? "{}") : {};
+    } catch {
+      promptData = {};
     }
     const targetCharacterId =
       inputData.target_character_id ?? inputData.target_pet_id ?? null;
@@ -512,12 +526,15 @@ export function createPetSocialApp(options = {}) {
       targetCharacterId,
       outcomeText: outcome?.body_text ?? payload.outcomeText ?? null,
       outcomeEventType: outcome?.event_type ?? null,
+      outcomeSequence: outcome?.sequence ?? payload.outcomeSequence ?? null,
       promptText: interaction?.prompt_text ?? payload.promptText ?? null,
+      promptSequence: interaction?.prompt_sequence ?? payload.promptSequence ?? null,
       interactionMode: interaction?.mode ?? null,
       sceneId: interaction?.scene_id ?? payload.sceneId ?? null,
       interactionQuorum: interaction?.quorum ?? null,
       interactionLateInputPolicy: interaction?.late_input_policy ?? null,
       interactionClosesAt: interaction?.closes_at ?? payload.closesAt ?? null,
+      interactionChoiceOptions: promptData.choice_options ?? null,
     };
   }
 
@@ -636,13 +653,47 @@ export function createPetSocialApp(options = {}) {
       scheduleInteractionDeadline(interaction);
       return;
     }
-    const updated = store.db
-      .prepare(`
+    const responseCount = Number(store.db.prepare(
+      "SELECT COUNT(*) AS count FROM world_inputs WHERE interaction_id = ?",
+    ).get(interaction.id).count);
+    if (responseCount === 0) {
+      const cancelled = store.db.prepare(`
         UPDATE world_interactions
-        SET status = 'ready', ready_at = COALESCE(ready_at, ?)
+        SET status = 'cancelled', resolved_at = COALESCE(resolved_at, ?),
+          host_last_error = COALESCE(host_last_error, 'NO_RESPONSES')
         WHERE id = ? AND status = 'open'
-      `)
-      .run(timestamp, interaction.id);
+      `).run(timestamp, interaction.id);
+      if (cancelled.changes === 1) {
+        enqueueWorldDelivery(store.db, {
+          worldId: interaction.space_id,
+          sourceWorldEventId: interaction.prompt_event_id,
+          sourceInteractionId: interaction.id,
+          eventType: "world.event_committed",
+          dedupeKey: `world:${interaction.space_id}:interaction-cancelled:${interaction.id}`,
+          envelope: {
+            interactionId: interaction.id,
+            sceneId: interaction.scene_id ?? null,
+            outcomeText: "本轮集体互动在截止前无人回应，现已取消；没有产生集体决定或世界变化。",
+            outcomeEventType: "world.interaction_cancelled",
+            interactionStatus: "cancelled",
+            closesAt: interaction.closes_at,
+            visibility: "world",
+            actorPetId: null,
+          },
+          timestamp,
+        });
+        drainSemanticWorldDeliveries(interaction.space_id);
+        notifyWorld(interaction.space_id, "world.interaction_cancelled", {
+          interactionId: interaction.id, reason: "no_responses", closesAt: interaction.closes_at,
+        }, { visibility: "managers" });
+      }
+      return;
+    }
+    const updated = store.db.prepare(`
+      UPDATE world_interactions
+      SET status = 'ready', ready_at = COALESCE(ready_at, ?)
+      WHERE id = ? AND status = 'open'
+    `).run(timestamp, interaction.id);
     if (updated.changes !== 1) return;
     const runtime = store.db
       .prepare(`
@@ -762,9 +813,13 @@ export function createPetSocialApp(options = {}) {
       const hostWork = store.db.prepare(`
         SELECT
           SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_inputs,
-          SUM(CASE WHEN status = 'escalated' THEN 1 ELSE 0 END) AS escalated_inputs
+          SUM(CASE WHEN status = 'escalated' THEN 1 ELSE 0 END) AS escalated_inputs,
+          MIN(CASE WHEN status = 'pending' THEN created_at END) AS oldest_pending_at
         FROM world_inputs
       `).get();
+      const queueAgeMs = hostWork.oldest_pending_at
+        ? Math.max(0, checkedAt - Date.parse(hostWork.oldest_pending_at))
+        : 0;
       const hostExecutors = store.db.prepare(`
         SELECT SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
         FROM world_host_executors
@@ -776,15 +831,19 @@ export function createPetSocialApp(options = {}) {
         scheduled_retries: 0,
       };
       const failedExecutors = Number(hostExecutors.failed ?? 0);
-      const degraded = outbox.dead_letter > 0 || failedExecutors > 0;
+      const pendingInputs = Number(hostWork.pending_inputs ?? 0);
+      const degraded = outbox.dead_letter > 0 || failedExecutors > 0 ||
+        queueAgeMs > 120_000 || pendingInputs > 20;
       return {
         ready: hostRunner.closed !== true,
         degraded,
         database: { ready: true },
         host: {
           ...hostRunner,
-          pending_inputs: Number(hostWork.pending_inputs ?? 0),
+          pending_inputs: pendingInputs,
           escalated_inputs: Number(hostWork.escalated_inputs ?? 0),
+          oldest_pending_at: hostWork.oldest_pending_at ?? null,
+          oldest_pending_age_ms: queueAgeMs,
           failed_executors: failedExecutors,
         },
         delivery_outbox: outbox,
@@ -1464,15 +1523,33 @@ export function createPetSocialApp(options = {}) {
       );
       if (req.method === "POST" && worldJoinRespondParams) {
         const body = await readJson(req);
-        return sendJson(
-          res,
-          200,
-          worldService(auth).respondWorldJoinRequest({
+        const result = worldService(auth).respondWorldJoinRequest({
             ...body,
             worldId: worldJoinRespondParams.id,
             applicantPetId: worldJoinRespondParams.petId
-          })
-        );
+        });
+        const world = store.db.prepare("SELECT id, name FROM spaces WHERE id = ?")
+          .get(result.world_id);
+        const accepted = result.status === "active";
+        const activity = store.createEvent(result.applicant_pet_id, "world.event_committed", {
+          worldId: result.world_id,
+          worldName: world?.name ?? result.world_id,
+          outcomeEventType: accepted
+            ? "world.join_request_accepted"
+            : "world.join_request_rejected",
+          outcomeText: accepted
+            ? `你的加入申请已获批准。现在可以进入「${world?.name ?? result.world_id}」并开始参与。`
+            : `你的加入申请未获批准。你目前不能进入「${world?.name ?? result.world_id}」。`,
+          relevance: "direct",
+          relevanceReason: "world_join_request_decision",
+          deliveryPolicy: "action_required",
+          actionRequired: accepted,
+        }, clock());
+        pushEvent(activity);
+        return sendJson(res, 200, {
+          ...result,
+          activity_event_id: `evt_${activity.id}`,
+        });
       }
 
       const worldObserveParams = routeMatch(
@@ -1490,15 +1567,18 @@ export function createPetSocialApp(options = {}) {
             )
           : undefined;
         const limit = clampInteger(url.searchParams.get("limit"), 1, 100, 50);
-        return sendJson(
-          res,
-          200,
-          worldService(auth).observeWorld({
+        const observed = worldService(auth).observeWorld({
             worldId: worldObserveParams.id,
             afterSequence,
             limit
-          })
-        );
+          });
+        return sendJson(res, 200, {
+          ...observed,
+          displayed_range: {
+            after_sequence: afterSequence ?? observed.membership.last_seen_event_sequence,
+            through_sequence: observed.cursor,
+          },
+        });
       }
 
       const worldActParams = routeMatch(pathname, "/v1/worlds/:id/intents");
@@ -1649,13 +1729,52 @@ export function createPetSocialApp(options = {}) {
       );
       if (req.method === "POST" && worldAckParams) {
         const body = await readJson(req);
+        invariant(body.displayed === true, 409, "DISPLAY_REQUIRED", "World events must be displayed before acknowledgement.");
+        const afterSequence = Number(body.afterSequence);
+        const throughSequence = Number(body.throughSequence);
+        invariant(
+          Number.isSafeInteger(afterSequence) && afterSequence >= 0 &&
+            Number.isSafeInteger(throughSequence) && throughSequence >= afterSequence,
+          400,
+          "INVALID_CURSOR",
+          "Displayed World range must use valid after and through sequences.",
+        );
+        const service = worldService(auth);
+        // Validate the entire claimed displayed range before changing any
+        // durable receipt.  A stale or fabricated page must leave activity
+        // queued and the member's resume cursor untouched.
+        const displayedPage = service.observeWorld({
+          worldId: worldAckParams.id,
+          afterSequence,
+          limit: 1,
+        });
+        invariant(
+          afterSequence === Number(displayedPage.membership.last_seen_event_sequence),
+          400,
+          "INVALID_CURSOR",
+          "The displayed page must start at the current unacknowledged World cursor.",
+        );
+        invariant(
+          throughSequence <= Number(displayedPage.latest_sequence),
+          400,
+          "INVALID_CURSOR",
+          "Cannot acknowledge events that are not visible.",
+        );
+        const { displayed, acknowledged } = store.transaction(() => ({
+          displayed: store.markWorldNotificationsDisplayedInTransaction(auth, {
+            worldId: worldAckParams.id,
+            afterSequence,
+            throughSequence,
+          }),
+          acknowledged: service.ackWorldEvents({
+            worldId: worldAckParams.id,
+            throughSequence,
+          }),
+        }));
         return sendJson(
           res,
           200,
-          worldService(auth).ackWorldEvents({
-            ...body,
-            worldId: worldAckParams.id
-          })
+          { ...acknowledged, ...displayed }
         );
       }
 
@@ -1815,21 +1934,31 @@ export function createPetSocialApp(options = {}) {
 
       if (req.method === "GET" && pathname === "/v1/inbox") {
         const limit = clampInteger(url.searchParams.get("limit"), 1, 100, 50);
-        return sendJson(res, 200, { messages: store.listInbox(auth, { limit }) });
+        const before = url.searchParams.has("before")
+          ? clampInteger(url.searchParams.get("before"), 1, Number.MAX_SAFE_INTEGER, 1)
+          : undefined;
+        return sendJson(res, 200, store.listInboxPage(auth, { limit, before }));
       }
 
       if (req.method === "GET" && pathname === "/v1/activity") {
         const limit = clampInteger(url.searchParams.get("limit"), 1, 100, 50);
+        const before = url.searchParams.has("before")
+          ? clampInteger(url.searchParams.get("before"), 1, Number.MAX_SAFE_INTEGER, 1)
+          : undefined;
+        const undisplayedOnly = url.searchParams.get("undisplayed_only") === "true";
+        const activity = store.listActivityPage(auth, { limit, before, undisplayedOnly });
         return sendJson(res, 200, {
           channels: ["private_message", "world"],
-          items: store.listActivity(auth, { limit }),
+          ...activity,
         });
       }
 
       const readParams = routeMatch(pathname, "/v1/conversations/:id/read");
       if (req.method === "POST" && readParams) {
         const body = await readJson(req);
-        const result = store.markRead(auth, readParams.id, body.maxSequenceNo);
+        const result = store.markRead(auth, readParams.id, body.maxSequenceNo, {
+          displayed: body.displayed === true,
+        });
         pushEvents(result.events);
         return sendJson(res, 200, { conversationId: result.conversationId, maxSequenceNo: result.maxSequenceNo });
       }
@@ -1843,9 +1972,27 @@ export function createPetSocialApp(options = {}) {
           "x-accel-buffering": "no"
         });
         res.write(": connected\n\n");
+        const replayBuffer = [];
+        sseReplayBuffers.set(res, replayBuffer);
         addSseConnection(auth, res);
-        for (const event of store.listEvents(auth, after)) {
-          res.write(`id: ${event.id}\nevent: pet-social\ndata: ${JSON.stringify(eventEnvelope(event))}\n\n`);
+        let cursor = after;
+        while (!res.destroyed) {
+          const page = store.listEvents(auth, cursor, 200);
+          if (page.length === 0) break;
+          for (const event of page) {
+            res.write(`id: ${event.id}\nevent: pet-social\ndata: ${JSON.stringify(eventEnvelope(event))}\n\n`);
+          }
+          cursor = page.at(-1).id;
+          if (page.length < 200) break;
+        }
+        // The event loop cannot interleave with the synchronous database
+        // replay above, but buffering also makes this correct if a future
+        // adapter delivers push events re-entrantly.
+        sseReplayBuffers.delete(res);
+        for (const event of replayBuffer.sort((a, b) => a.id - b.id)) {
+          if (event.id > cursor && !res.destroyed) {
+            res.write(`id: ${event.id}\nevent: pet-social\ndata: ${JSON.stringify(eventEnvelope(event))}\n\n`);
+          }
         }
         const keepAlive = setInterval(() => {
           if (!res.destroyed) res.write(`: keepalive ${clock()}\n\n`);

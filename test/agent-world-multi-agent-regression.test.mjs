@@ -246,12 +246,16 @@ test("Agent-neutral HTTP clients see the complete collective contract and one Ho
 
     const opened = await host.client.openWorldHostInteraction(world.id, {
       clientSessionId: "collective-host-session",
-      promptText: "先修复围墙，还是先疏通积水？",
+      promptText: "先修复围墙（公开 choice_id: repair_wall），还是先疏通积水（公开 choice_id: drain）？",
       mode: "quorum",
       quorum: 2,
       windowSeconds: 120,
       lateInputPolicy: "follow_up",
       coordinationRule: "若意见分歧，先处理已经发生的安全风险，其他方案保留为后续计划。",
+      choiceOptions: [
+        { choice_id: "repair_wall", label: "修复围墙" },
+        { choice_id: "drain", label: "疏通积水" },
+      ],
       expectedWorldStateVersion: 1
     });
     assert.match(opened.prompt_event.body_text, /回应完全可选/);
@@ -265,6 +269,7 @@ test("Agent-neutral HTTP clients see the complete collective contract and one Ho
       inputType: "choice",
       eventType: "collective.vote",
       bodyText: "先修围墙，防止更多碎石落下。",
+      data: { choice_id: "repair_wall" },
       replyToEventId: opened.prompt_event.id,
       visibility: "actor",
       idempotencyKey: "agent-world-collective-first"
@@ -279,6 +284,7 @@ test("Agent-neutral HTTP clients see the complete collective contract and one Ho
       inputType: "choice",
       eventType: "collective.vote",
       bodyText: "先疏通积水，避免通道继续受损。",
+      data: { choice_id: "drain" },
       replyToEventId: opened.prompt_event.id,
       visibility: "actor",
       idempotencyKey: "agent-world-collective-second"
@@ -299,8 +305,16 @@ test("Agent-neutral HTTP clients see the complete collective contract and one Ho
         clientSessionId: "collective-host-session",
         decision: "accepted",
         reasonText: "两种方案存在分歧；当前积水已经构成安全风险。",
-        outcomeText: "本轮先疏通积水；修复围墙被保留为下一项计划。",
-        result: { selected_plan: "drain", deferred_plan: "repair_wall" },
+        outcomeText: "双方存在分歧；本轮先疏通积水，修复围墙被保留为下一项计划。",
+        result: {
+          selected_plan: "drain",
+          deferred_plan: "repair_wall",
+          collective_semantics: {
+            unanimous: false,
+            material_disagreement: true,
+            choice_counts: { repair_wall: 1, drain: 1 },
+          },
+        },
         worldStatePatch: {
           courtyard: "draining",
           collective_plan: "drain",
@@ -441,6 +455,7 @@ test("two provider bindings remain one Character, one membership, and one collec
       windowSeconds: 120,
       lateInputPolicy: "expire",
       coordinationRule: "若意见不同，维持当前阶段并公开记录分歧。",
+      choiceOptions: [{ choice_id: "advance", label: "进入下一阶段" }],
       expectedWorldStateVersion: 1
     });
     const firstObserved = await primary.client.observeWorld(world.id);
@@ -448,6 +463,7 @@ test("two provider bindings remain one Character, one membership, and one collec
       inputType: "choice",
       eventType: "collective.vote",
       bodyText: "进入下一阶段。",
+      data: { choice_id: "advance" },
       replyToEventId: opened.prompt_event.id,
       visibility: "actor",
       observedWorldStateVersion: firstObserved.state_version,
@@ -462,6 +478,7 @@ test("two provider bindings remain one Character, one membership, and one collec
           inputType: "choice",
           eventType: "collective.vote",
           bodyText: "我从另一个运行端再投一次。",
+          data: { choice_id: "advance" },
           replyToEventId: opened.prompt_event.id,
           visibility: "actor",
           observedWorldStateVersion: duplicateObserved.state_version,
@@ -477,6 +494,7 @@ test("two provider bindings remain one Character, one membership, and one collec
       inputType: "choice",
       eventType: "collective.vote",
       bodyText: "进入下一阶段。",
+      data: { choice_id: "advance" },
       replyToEventId: opened.prompt_event.id,
       visibility: "actor",
       observedWorldStateVersion: otherObserved.state_version,

@@ -73,6 +73,33 @@ async function createPublishedWorld(
   });
 }
 
+test("SSE replays an offline backlog beyond 500 events completely and in order", async () => {
+  const store = new PetSocialStore();
+  const app = createPetSocialApp({ store });
+  const address = await app.listen();
+  try {
+    const recipient = await registerClient(address, "sse-backlog");
+    const expected = [];
+    for (let index = 0; index < 505; index += 1) {
+      expected.push(store.createEvent(recipient.registration.pet.id, "test.backlog", { index }));
+    }
+    const controller = new AbortController();
+    const received = [];
+    try {
+      for await (const event of recipient.client.events(0, controller.signal)) {
+        received.push(event);
+        if (received.length === expected.length) controller.abort();
+      }
+    } catch (error) {
+      assert.equal(error.name, "AbortError");
+    }
+    assert.deepEqual(received.map((event) => event.sequence), expected.map((event) => event.id));
+    assert.deepEqual(received.map((event) => event.payload.index), [...Array(505).keys()]);
+  } finally {
+    await app.close();
+  }
+});
+
 test("shared authenticated clients run a direct world through HTTP", async () => {
   const store = new PetSocialStore();
   const app = createPetSocialApp({ store });
@@ -174,12 +201,25 @@ test("shared authenticated clients run a direct world through HTTP", async () =>
 
     const retried = await visitor.client.actInWorld(world.id, {
       eventType: "build",
-      bodyText: "重试不应重复修改。",
-      proposedWorldStatePatch: { camp: { wood: 99 } },
+      bodyText: "我搭起一个挡雨棚。",
+      proposedWorldStatePatch: { camp: { wood: 3, shelter: true } },
+      proposedMemberStatePatch: { role: "builder" },
       expectedWorldStateVersion: 1,
+      expectedMemberStateVersion: 1,
       idempotencyKey: "remote-build-1"
     });
     assert.equal(retried.world_state.version, 2);
+
+    await assert.rejects(
+      () => visitor.client.actInWorld(world.id, {
+        eventType: "build",
+        bodyText: "重试不应重复修改。",
+        proposedWorldStatePatch: { camp: { wood: 99 } },
+        expectedWorldStateVersion: 1,
+        idempotencyKey: "remote-build-1"
+      }),
+      (error) => error?.code === "IDEMPOTENCY_CONFLICT",
+    );
 
     const observed = await owner.client.observeWorld(world.id, {
       afterSequence: 0
@@ -445,6 +485,7 @@ test("offline World members receive durable directed speech with monotonic recei
       target_character_id: target.registration.pet.id,
       body_text: "我把桥边的调查结果留给你，回来后可以从旧木桩继续。",
       idempotency_key: "directed-offline-world-speech",
+      confirmed: true,
     });
     assert.equal(spoken.status, "accepted");
     assert.equal(spoken.delivery.world_write, "written");
@@ -456,6 +497,7 @@ test("offline World members receive durable directed speech with monotonic recei
       target_character_id: target.registration.pet.id,
       body_text: "我把桥边的调查结果留给你，回来后可以从旧木桩继续。",
       idempotency_key: "directed-offline-world-speech",
+      confirmed: true,
     });
     assert.equal(
       repeatedSpeech.delivery.notification_event_id,
@@ -507,6 +549,12 @@ test("offline World members receive durable directed speech with monotonic recei
     );
     assert.ok(privateItem);
     assert.match(privateItem.summary, /地图背面|坐标/u);
+    await assert.rejects(
+      target.client.markEventReceipt(privateItem.eventId, "read"),
+      (error) => error.code === "DISPLAY_REQUIRED",
+    );
+    await target.client.markEventReceipt(privateItem.eventId, "delivered");
+    await target.client.markEventReceipt(privateItem.eventId, "displayed");
     await target.client.markEventReceipt(privateItem.eventId, "read");
     assert.equal(
       (await target.client.activity()).items.find((item) => item.eventId === privateItem.eventId)
@@ -617,9 +665,62 @@ test("the simple MCP flow publishes an open hidden World addressable by ID", asy
 
     const action = await callWorldTool(visitor.client, "world_act", {
       world_id: created.world_id,
-      body_text: "我先在门口看看周围。"
+      body_text: "我先在门口看看周围。",
+      idempotency_key: "hidden-simple-world-first-action",
     });
     assert.equal(action.status, "accepted");
+  } finally {
+    await app.close();
+    store.close();
+  }
+});
+
+test("standard MCP visit carries an invitation and never invents an action retry key", async () => {
+  const store = new PetSocialStore();
+  const app = createPetSocialApp({ store });
+  const address = await app.listen();
+  try {
+    const owner = await registerClient(address, "std-invite-owner");
+    const visitor = await registerClient(address, "std-invite-visitor");
+    const friendship = await owner.client.sendFriendRequest(visitor.registration.pet.id);
+    await visitor.client.respondFriendRequest(friendship.friendship.id, "accept");
+    const world = await createPublishedWorld(owner.client, { joinPolicy: "approval" });
+    const invitation = await owner.client.createWorldInvitation(world.id, {
+      targetPetId: visitor.registration.pet.id,
+      bypassApproval: true,
+    });
+
+    const visitTool = worldTools.find((tool) => tool.name === "world_visit");
+    assert.ok(visitTool.inputSchema.properties.invitation_id);
+    const listed = await callWorldTool(visitor.client, "world_invitation_list");
+    assert.equal(listed.invitations[0].id, invitation.id);
+    const entered = await callWorldTool(visitor.client, "world_visit", {
+      world_id: world.id,
+      confirmed: true,
+      confirmed_rule_version: world.rule_version,
+      invitation_id: invitation.id,
+    });
+    assert.equal(entered.status, "entered");
+    assert.equal(entered.membership.status, "active");
+
+    await assert.rejects(
+      () => callWorldTool(visitor.client, "world_act", {
+        world_id: world.id,
+        body_text: "我检查码头的旧灯。",
+      }),
+      (error) => error?.code === "MISSING_IDEMPOTENCY_KEY",
+    );
+    const action = await callWorldTool(visitor.client, "world_act", {
+      world_id: world.id,
+      body_text: "我检查码头的旧灯。",
+      idempotency_key: "standard-invited-action",
+    });
+    const replay = await callWorldTool(visitor.client, "world_act", {
+      world_id: world.id,
+      body_text: "我检查码头的旧灯。",
+      idempotency_key: "standard-invited-action",
+    });
+    assert.equal(replay.input.id, action.input.id);
   } finally {
     await app.close();
     store.close();

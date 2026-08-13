@@ -97,6 +97,10 @@ test("a World Host guides first entry, role setup, first contribution, and retur
     );
     assert.match(entered.host_guidance.message, /雨夜/);
     assert.match(entered.host_guidance.message, /选择一个旅馆相关身份/);
+    assert.equal(
+      entered.host_guidance.message.match(/选择一个旅馆相关身份，然后完成第一件实际参与。/gu)?.length,
+      1,
+    );
 
     const role = visitor.actInWorld({
       worldId,
@@ -245,6 +249,40 @@ test("generic non-game worlds receive guidance without requiring a role system",
       false,
     );
     assert.match(entered.host_guidance.free_input_prompt, /直接说/);
+  } finally {
+    db.close();
+  }
+});
+
+test("a simple World with an authored opening never shows template placeholder copy", () => {
+  const db = openDatabase(":memory:");
+  const owner = new SocialService(db, "simple-opening-owner");
+  const visitor = new SocialService(db, "simple-opening-visitor");
+  try {
+    owner.getOrCreatePet({ name: "雨港店主" });
+    visitor.getOrCreatePet({ name: "第一次靠岸的人" });
+    const world = owner.createWorld({
+      name: "雨港修船铺",
+      description: "潮水每天带来不同损坏的船。",
+      rulesText: "每个人只能决定自己的行动，结果由主持裁决。",
+      definitionText: "港口修船铺会留下修理和承诺的痕迹。",
+      entryPrompt: "傍晚潮水刚退，一艘漏水小船卡在船坞边，船主正焦急地向你求助。",
+    });
+    owner.publishWorld({
+      worldId: world.id,
+      expectedSpecVersion: 1,
+      expectedRuleVersion: 1,
+      expectedProfileVersion: 1,
+      expectedHostVersion: 1,
+    });
+    visitor.joinWorld({ worldId: world.id, ruleVersion: 1 });
+    const entered = visitor.enterWorld({ worldId: world.id, clientSessionId: "rain-port" });
+    const playerCopy = JSON.stringify(entered.host_guidance);
+    assert.match(entered.host_guidance.message, /漏水小船/u);
+    assert.doesNotMatch(playerCopy, /通用持久多人世界基座|信息不足|了解当前局势|领取可完成/u);
+    assert.doesNotMatch(playerCopy, /通用导演/u);
+    assert.match(entered.host_guidance.message, /雨港修船铺主持人欢迎/u);
+    assert.ok(entered.host_guidance.choices.every((choice) => /漏水小船|船坞|船主|眼前的情况/u.test(`${choice.label} ${choice.body_text}`)));
   } finally {
     db.close();
   }
