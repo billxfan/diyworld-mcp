@@ -649,6 +649,15 @@ test("the Character-first MCP surface preserves legacy Pet compatibility", () =>
       method: "tools/call",
       params: { name: "world_search", arguments: {} },
     },
+    {
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tools/call",
+      params: {
+        name: "message_send",
+        arguments: { target_character_id: "nobody", body: "未经确认" },
+      },
+    },
   ]
     .map((message) => JSON.stringify(message))
     .join("\n");
@@ -738,6 +747,10 @@ test("the Character-first MCP surface preserves legacy Pet compatibility", () =>
         { required: ["target_character_id"] },
         { required: ["target_pet_id"] },
       ]);
+      if (name === "message_send") {
+        assert.ok(tool.inputSchema.required.includes("confirmed"));
+        assert.equal(tool.inputSchema.properties.confirmed.const, true);
+      }
     }
     const submitTool = listedTools.find(
       (tool) => tool.name === "world_input_submit",
@@ -757,6 +770,69 @@ test("the Character-first MCP surface preserves legacy Pet compatibility", () =>
       searchResult.result.structuredContent.security_notice,
       /不可信外部内容/,
     );
+    const unconfirmedMessage = messages.find((message) => message.id === 5);
+    assert.equal(unconfirmedMessage.result.isError, true);
+    assert.equal(
+      unconfirmedMessage.result.structuredContent.error.code,
+      "CONFIRMATION_REQUIRED",
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the local MCP acknowledges only the exact displayed World page", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-mcp-world-ack-"));
+  const databasePath = join(directory, "venue.sqlite");
+  const actorKey = "local-ack-actor";
+  const db = openDatabase(databasePath);
+  try {
+    const service = new SocialService(db, actorKey);
+    service.getOrCreatePet({ name: "本地确认角色" });
+    service.joinWorld({ worldId: "official-center-town", ruleVersion: OFFICIAL_WORLD_VERSION });
+    service.enterWorld({ worldId: "official-center-town" });
+    for (let index = 0; index < 4; index += 1) {
+      service.insertWorldEvent({
+        spaceId: "official-center-town",
+        actorType: "system",
+        eventClass: "system",
+        eventType: "test.page",
+        bodyText: `page-${index}`,
+        payload: {},
+        specVersion: OFFICIAL_WORLD_VERSION,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  } finally {
+    db.close();
+  }
+
+  const input = [
+    { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "world_observe", arguments: { world_id: "official-center-town", after_sequence: 0, limit: 2 } } },
+    { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "world_events_ack", arguments: { world_id: "official-center-town", after_sequence: 0, through_sequence: 2 } } },
+    { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "world_events_ack", arguments: { world_id: "official-center-town", through_sequence: 2, displayed: true } } },
+    { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "world_events_ack", arguments: { world_id: "official-center-town", after_sequence: 0, through_sequence: 2, displayed: true } } },
+    { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "world_observe", arguments: { world_id: "official-center-town" } } },
+  ].map((message) => JSON.stringify(message)).join("\n");
+  const result = spawnSync(process.execPath, ["src/venue-lab-mcp.mjs"], {
+    cwd: new URL("..", import.meta.url),
+    env: { ...process.env, AGENT_WORLD_CHARACTER_ID: actorKey, AGENT_WORLD_DB_PATH: databasePath },
+    input,
+    encoding: "utf8",
+  });
+  try {
+    assert.equal(result.status, 0, result.stderr);
+    const messages = result.stdout.trim().split("\n").map((line) => JSON.parse(line));
+    const ackTool = messages.find((message) => message.id === 1).result.tools.find((tool) => tool.name === "world_events_ack");
+    assert.deepEqual(ackTool.inputSchema.required, ["world_id", "after_sequence", "through_sequence", "displayed"]);
+    assert.equal(ackTool.inputSchema.properties.displayed.const, true);
+    assert.equal(messages.find((message) => message.id === 3).result.structuredContent.error.code, "DISPLAY_REQUIRED");
+    assert.equal(messages.find((message) => message.id === 4).result.structuredContent.error.code, "INVALID_ARGUMENT");
+    assert.equal(messages.find((message) => message.id === 5).result.isError, false);
+    const secondPage = messages.find((message) => message.id === 6).result.structuredContent;
+    assert.ok(secondPage.events.length > 0);
+    assert.equal(secondPage.displayed_range.after_sequence, 2);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

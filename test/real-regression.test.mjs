@@ -107,7 +107,7 @@ test("real journey: Builder creation, visitor play, privacy, governance, and rer
     const replay = await visitor.client.submitWorldInput(world.id, {
       inputType: "action",
       eventType: "market.clean",
-      bodyText: "这次重试不应生成第二次清理。",
+      bodyText: "我把入口旁的空纸杯收进回收箱。",
       idempotencyKey: "real-market-clean",
     });
     assert.equal(replay.input.id, normal.input.id);

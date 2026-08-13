@@ -30,6 +30,7 @@ class FakeCodexWorldHosts {
     this.turns.push({ threadId, prompt, resume });
     const contextEnvelope = JSON.parse(prompt.split("\n\n").at(-1));
     const work = contextEnvelope.context_pack;
+    const inputText = work.input?.body_text ?? "本轮共同决定";
     const plan = work.director_plan;
     const current = plan?.loop_context?.current_loop;
     const transitionName = plan?.loop_transition_contract?.expected_default;
@@ -61,20 +62,33 @@ class FakeCodexWorldHosts {
         decision: "accepted",
         resolution_disposition: "apply",
         reason_text: "输入符合当前 World 规则。",
-        outcome_text: "世界主持已处理该输入。",
+        outcome_text: work.batch_mode
+          ? "参与者意见存在分歧；世界主持已按公开协调规则记录共同结果。"
+          : `你尝试“${inputText}”后，眼前出现了可以继续确认的具体变化。`,
         result: {
           resolution: "full_success",
           ...(loopTransition ? { loop_transition: loopTransition } : {}),
           ...(work.batch_mode
-            ? {}
+            ? {
+                effects: [{ kind: "collective_record", summary: "本轮共同结果已写入现场记录。" }],
+                affected_entities: [{ entity_type: "world", entity_id: work.bound_world_id, effect_kind: "collective_recorded" }],
+                next_affordances: [{ label: "查看共同结果记录", input_type: "action", event_type: "host.inspect_result", body_text: "我查看本轮共同结果写入的现场记录。", visibility: "world" }],
+                collective_semantics: {
+                  unanimous: false,
+                  material_disagreement: true,
+                  choice_counts: { left: 1, right: 1 },
+                },
+              }
             : {
-                effects: [],
-                affected_entities: [],
+                effects: [{ kind: "world_trace", summary: `“${inputText}”让眼前留下了可见痕迹。` }],
+                affected_entities: [{ entity_type: "world", entity_id: work.bound_world_id, effect_kind: "changed" }],
                 next_affordances: [
                   {
-                    label: "继续",
-                    event_type: "host.continue",
-                    body_text: "继续",
+                    label: `检查与“${inputText}”有关的痕迹`,
+                    input_type: "action",
+                    event_type: "host.inspect_trace",
+                    body_text: `我检查“${inputText}”之后留下的可见痕迹。`,
+                    visibility: "world",
                   },
                 ],
               }),
@@ -102,6 +116,38 @@ class PoisonInputCodexWorldHosts extends FakeCodexWorldHosts {
     }
     const decision = JSON.parse(turn.text);
     decision.result.affected_entities = ["character:broken"];
+    return { ...turn, text: JSON.stringify(decision) };
+  }
+}
+
+class GenericGroundingCodexWorldHosts extends FakeCodexWorldHosts {
+  async runWorldHostTurn(args) {
+    const turn = await super.runWorldHostTurn(args);
+    const contextEnvelope = JSON.parse(args.prompt.split("\n\n").at(-1));
+    const work = contextEnvelope.context_pack;
+    if (work.input?.body_text !== "我用铜钩捞起井底的蓝色布包。") return turn;
+    const decision = JSON.parse(turn.text);
+    decision.reason_text = "输入符合规则。";
+    decision.outcome_text = "远处的风铃响起，柜台上露出一本沾灰的账册。";
+    decision.result.effects = [{ kind: "reveal", summary: "柜台上多出一本沾灰的账册。" }];
+    decision.result.affected_entities = [{ entity_type: "object", entity_id: "dusty-ledger", effect_kind: "revealed" }];
+    decision.result.next_affordances = [{ label: "翻看沾灰的账册", input_type: "action", event_type: "ledger.inspect", body_text: "我翻看柜台上沾灰的账册。", visibility: "world" }];
+    return { ...turn, text: JSON.stringify(decision) };
+  }
+}
+
+class VacuousConsequenceCodexWorldHosts extends FakeCodexWorldHosts {
+  async runWorldHostTurn(args) {
+    const turn = await super.runWorldHostTurn(args);
+    const contextEnvelope = JSON.parse(args.prompt.split("\n\n").at(-1));
+    const work = contextEnvelope.context_pack;
+    if (work.input?.body_text !== "我用铜钩捞起井底的蓝色布包。") return turn;
+    const decision = JSON.parse(turn.text);
+    decision.reason_text = "输入符合规则。";
+    decision.outcome_text = "蓝色布包的状态已经更新。";
+    decision.result.effects = [{ kind: "state", summary: "蓝色布包已有变化。" }];
+    decision.result.affected_entities = [{ entity_type: "object", entity_id: "blue-cloth-bundle", effect_kind: "changed" }];
+    decision.result.next_affordances = [{ label: "检查蓝色布包状态", input_type: "action", event_type: "bundle.inspect", body_text: "我检查蓝色布包的状态。", visibility: "world" }];
     return { ...turn, text: JSON.stringify(decision) };
   }
 }
@@ -373,7 +419,7 @@ test("a submitted action is acknowledged and its final Host result is waitable",
     assert.equal(completed.processing.state, "completed");
     assert.equal(completed.processing.final, true);
     assert.equal(completed.status, "accepted");
-    assert.match(completed.host_response.outcome_text, /已处理该输入/u);
+    assert.match(completed.host_response.outcome_text, /检查回声来自哪里/u);
   } finally {
     await app.close();
     store.close();
@@ -477,6 +523,8 @@ test("bounded Host failures terminalize a poison input and release later work", 
     const failed = await client.worldInputResult(world.id, poison.input.id, {
       waitMs: 2_000,
     });
+    assert.equal(failed.processing.error, "Host 暂时无法完成这次处理；行动已安全记录。");
+    assert.doesNotMatch(JSON.stringify(failed.processing), /affected_entities|JSON object|schema/i);
     await app.worldHostRunner.whenIdle();
     assert.equal(failed.status, "escalated");
     assert.equal(failed.processing.state, "host_failed");
@@ -513,6 +561,96 @@ test("bounded Host failures terminalize a poison input and release later work", 
     assert.equal(rows[0].host_attempt_count, 2);
     assert.ok(rows[0].host_failed_at);
     assert.equal(rows[1].host_attempt_count, 1);
+  } finally {
+    await app.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("live Host runner bounded-retries a structurally valid but ungrounded outcome", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-grounding-"));
+  const store = new PetSocialStore(join(directory, "social.sqlite"));
+  const codex = new GenericGroundingCodexWorldHosts();
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostCodexClient: codex,
+    worldHostRetryBaseDelayMs: 10,
+    worldHostMaxAttempts: 2,
+    worldHostRoot: join(directory, "hosts"),
+  });
+  const address = await app.listen();
+  try {
+    const registration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-grounding@example.test",
+      displayName: "具体结果验收者",
+      agentProvider: "codex",
+    });
+    const client = new AgentWorldClient({ serverUrl: address.url, token: registration.token });
+    const world = await createPublishedWorld(client, "琥珀世界", "GROUNDING_ONLY");
+    await client.enterWorld(world.id, { clientSessionId: "grounding-session" });
+    const observed = await client.observeWorld(world.id);
+    const pending = await client.submitWorldInput(world.id, {
+      inputType: "action",
+      eventType: "well.retrieve_bundle",
+      bodyText: "我用铜钩捞起井底的蓝色布包。",
+      observedWorldStateVersion: observed.world_state.version,
+      observedMemberStateVersion: observed.member_state.version,
+      idempotencyKey: "grounding:generic-outcome",
+    });
+    const failed = await client.worldInputResult(world.id, pending.input.id, { waitMs: 2_000 });
+    await app.worldHostRunner.whenIdle();
+    assert.equal(failed.processing.state, "host_failed");
+    assert.equal(failed.processing.host_attempt_count, 2);
+    assert.equal(codex.turns.length, 2);
+    assert.match(codex.turns[1].prompt, /bounded repair attempt 2 of 2/u);
+    assert.match(codex.turns[1].prompt, /must name a concrete entity or fact/u);
+  } finally {
+    await app.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("live Host runner bounded-retries an entity-grounded but consequence-free outcome", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-consequence-"));
+  const store = new PetSocialStore(join(directory, "social.sqlite"));
+  const codex = new VacuousConsequenceCodexWorldHosts();
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostCodexClient: codex,
+    worldHostRetryBaseDelayMs: 10,
+    worldHostMaxAttempts: 2,
+    worldHostRoot: join(directory, "hosts"),
+  });
+  const address = await app.listen();
+  try {
+    const registration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-consequence@example.test",
+      displayName: "可感知后果验收者",
+      agentProvider: "codex",
+    });
+    const client = new AgentWorldClient({ serverUrl: address.url, token: registration.token });
+    const world = await createPublishedWorld(client, "琥珀世界", "CONSEQUENCE_ONLY");
+    await client.enterWorld(world.id, { clientSessionId: "consequence-session" });
+    const observed = await client.observeWorld(world.id);
+    const pending = await client.submitWorldInput(world.id, {
+      inputType: "action",
+      eventType: "well.retrieve_bundle",
+      bodyText: "我用铜钩捞起井底的蓝色布包。",
+      observedWorldStateVersion: observed.world_state.version,
+      observedMemberStateVersion: observed.member_state.version,
+      idempotencyKey: "consequence:empty-outcome",
+    });
+    const failed = await client.worldInputResult(world.id, pending.input.id, { waitMs: 2_000 });
+    await app.worldHostRunner.whenIdle();
+    assert.equal(failed.processing.state, "host_failed");
+    assert.equal(failed.processing.host_attempt_count, 2);
+    assert.equal(codex.turns.length, 2);
+    assert.match(codex.turns[1].prompt, /bounded repair attempt 2 of 2/u);
+    assert.match(codex.turns[1].prompt, /status update alone is not a consequence/u);
   } finally {
     await app.close();
     store.close();
@@ -725,6 +863,7 @@ test("a ready collective interaction is settled in a fresh isolated World Host t
       mode: "quorum",
       quorum: 2,
       windowSeconds: 120,
+      choiceOptions: [{ choice_id: "left", label: "左路" }, { choice_id: "right", label: "右路" }],
       expectedWorldStateVersion: 1,
     });
     await owner.releaseWorldHost(world.id, {
@@ -740,6 +879,7 @@ test("a ready collective interaction is settled in a fresh isolated World Host t
         inputType: "choice",
         eventType: "collective.vote",
         bodyText: reply,
+        data: { choice_id: key === "owner" ? "left" : "right" },
         replyToEventId: opened.prompt_event.id,
         visibility: "actor",
         observedWorldStateVersion: observed.world_state.version,
@@ -824,6 +964,7 @@ test("a terminal collective Host failure closes the batch and its pending inputs
       mode: "quorum",
       quorum: 2,
       windowSeconds: 120,
+      choiceOptions: [{ choice_id: "confirm", label: "确认执行" }],
       expectedWorldStateVersion: 1,
     });
     await owner.releaseWorldHost(world.id, {
@@ -836,6 +977,7 @@ test("a terminal collective Host failure closes the batch and its pending inputs
         inputType: "choice",
         eventType: "collective.vote",
         bodyText: "确认。",
+        data: { choice_id: "confirm" },
         replyToEventId: opened.prompt_event.id,
         visibility: "actor",
         observedWorldStateVersion: observed.world_state.version,
@@ -930,6 +1072,206 @@ test("World Host decisions accept the v1 Loop result contract", () => {
   assert.equal(parsed.loopTransition.transition, "continue");
   assert.equal(parsed.effects.length, 1);
   assert.equal(parsed.nextAffordances.length, 1);
+});
+
+test("accepted Host decisions enforce player-facing consequences and hide runtime terms", () => {
+  const base = {
+    decision: "accepted",
+    resolution_disposition: "apply",
+    reason_text: "你的行动符合眼前的规则。",
+    outcome_text: "木门被你推开，里面的风铃响了一声，柜台后露出一封未寄出的信。",
+    result: {
+      loop_transition: {
+        contract_version: 1,
+        loop_id: "personal:shop",
+        scope: "personal",
+        from_phase: "active",
+        transition: "continue",
+        to_phase: "active",
+        reason: "柜台后的新发现让你可以继续调查。",
+      },
+      effects: [{ kind: "new_clue", summary: "发现一封未寄出的信。" }],
+      affected_entities: [{ entity_type: "location", entity_id: "shop:counter", effect_kind: "revealed" }],
+      next_affordances: [{ label: "查看未寄出的信", input_type: "action", event_type: "shop.inspect_letter", body_text: "我拿起柜台后的未寄出的信，查看收件人和日期。", visibility: "world" }],
+    },
+  };
+  assert.doesNotThrow(() => parseWorldHostDecision(JSON.stringify(base), { requireLoopContract: true }));
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({
+      ...base,
+      outcome_text: "world_progress 已更新。",
+    }), { requireLoopContract: true }),
+    /must not expose World Host internal terminology/u,
+  );
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({
+      ...base,
+      result: { ...base.result, effects: [] },
+    }), { requireLoopContract: true }),
+    /result\.effects must contain 1-50 items/u,
+  );
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({
+      ...base,
+      result: { ...base.result, effects: [{}] },
+    }), { requireLoopContract: true }),
+    /result\.effects\[0\]\.kind must be a string/u,
+  );
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({
+      ...base,
+      result: {
+        ...base.result,
+        next_affordances: [
+          ...base.result.next_affordances,
+          { label: "离开", event_type: "leave", body_text: "我离开这里。" },
+          { label: "等待", event_type: "wait", body_text: "我先在这里等待。" },
+          { label: "记录", event_type: "note", body_text: "我把眼前的变化记下来。" },
+        ],
+      },
+    }), { requireLoopContract: true }),
+    /result\.next_affordances must contain 1-3 items/u,
+  );
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({
+      ...base,
+      result: {
+        ...base.result,
+        next_affordances: [{ label: "继续", input_type: "action", event_type: "continue", body_text: "继续", visibility: "world" }],
+      },
+    }), { requireLoopContract: true }),
+    /concrete fact, effect, hook, or affected entity/u,
+  );
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({
+      ...base,
+      result: { ...base.result, next_affordances: [{ label: "检查远处码头", input_type: "action", event_type: "harbor.inspect", body_text: "我检查远处码头。", visibility: "world" }] },
+    }), { requireLoopContract: true }),
+    /concrete fact, effect, hook, or affected entity/u,
+  );
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({
+      ...base,
+      reason_text: "输入符合规则。",
+      outcome_text: "世界主持已经处理了这次行动，现场留下了可见痕迹。",
+      result: {
+        ...base.result,
+        effects: [{ kind: "trace", summary: "现场留下了可见痕迹。" }],
+        affected_entities: [{ entity_type: "world", entity_id: "world:test", effect_kind: "changed" }],
+        next_affordances: [{ label: "检查现场痕迹", input_type: "action", event_type: "inspect", body_text: "我检查现场留下的痕迹。", visibility: "world" }],
+      },
+    }), {
+      requireLoopContract: true,
+      groundingContext: {
+        input: { body_text: "我登上渡船查看驾驶舱里的航海日志。" },
+        world: { name: "雨港修船铺", description: "船坞里停着一艘漏水小船。" },
+      },
+    }),
+    /(?:must name a concrete entity or fact|status update alone is not a consequence)/u,
+  );
+  const genericAmberDecision = {
+    ...base,
+    reason_text: "输入符合规则。",
+    outcome_text: "琥珀世界的现场状态已经发生了具体变化。",
+    result: {
+      ...base.result,
+      effects: [{ kind: "state", summary: "现场状态已经更新。" }],
+      affected_entities: [{ entity_type: "scene", entity_id: "scene:current", effect_kind: "changed" }],
+      next_affordances: [{ label: "检查现场状态", input_type: "action", event_type: "scene.inspect", body_text: "我检查现场状态。", visibility: "world" }],
+    },
+  };
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({
+      ...genericAmberDecision,
+      outcome_text: "蓝色布包的状态已经更新。",
+      result: {
+        ...genericAmberDecision.result,
+        effects: [{ kind: "state", summary: "蓝色布包已有变化。" }],
+        affected_entities: [{ entity_type: "object", entity_id: "blue-cloth-bundle", effect_kind: "changed" }],
+        next_affordances: [{ label: "检查蓝色布包状态", input_type: "action", event_type: "bundle.inspect", body_text: "我检查蓝色布包的状态。", visibility: "world" }],
+      },
+    }), {
+      requireLoopContract: true,
+      groundingContext: {
+        input: { body_text: "我用铜钩捞起井底的蓝色布包。" },
+        world: { name: "琥珀世界" },
+      },
+    }),
+    /status update alone is not a consequence/u,
+  );
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify(genericAmberDecision), {
+      requireLoopContract: true,
+      groundingContext: {
+        input: { body_text: "我用铜钩捞起井底的蓝色布包。" },
+        world: { name: "琥珀世界" },
+      },
+    }),
+    /(?:must name a concrete entity or fact|status update alone is not a consequence)/u,
+  );
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({
+      ...genericAmberDecision,
+      outcome_text: "琥珀世界已经回应了你的行动。",
+      result: {
+        ...genericAmberDecision.result,
+        effects: [{ kind: "state", summary: "琥珀世界已经发生变化。" }],
+        next_affordances: [{ label: "继续探索琥珀世界", input_type: "action", event_type: "world.explore", body_text: "我继续探索琥珀世界。", visibility: "world" }],
+      },
+    }), {
+      requireLoopContract: true,
+      groundingContext: {
+        input: { body_text: "我用铜钩捞起井底的蓝色布包。" },
+        world: { name: "琥珀世界" },
+      },
+    }),
+    /(?:must name a concrete entity or fact|status update alone is not a consequence)/u,
+  );
+  assert.doesNotThrow(
+    () => parseWorldHostDecision(JSON.stringify({
+      ...genericAmberDecision,
+      outcome_text: "铜钩勾住蓝色布包的绑绳，你把仍在滴水的布包拖到了井沿。",
+      result: {
+        ...genericAmberDecision.result,
+        effects: [{ kind: "retrieval", summary: "蓝色布包已经离开井水，绑绳上粘着黑色苔藓。" }],
+        affected_entities: [{ entity_type: "object", entity_id: "blue-cloth-bundle", effect_kind: "retrieved" }],
+        next_affordances: [{ label: "检查布包上的黑色苔藓", input_type: "action", event_type: "bundle.inspect_moss", body_text: "我检查蓝色布包绑绳上的黑色苔藓。", visibility: "world" }],
+      },
+    }), {
+      requireLoopContract: true,
+      groundingContext: {
+        input: { body_text: "我用铜钩捞起井底的蓝色布包。" },
+        world: { name: "琥珀世界" },
+      },
+    }),
+  );
+  assert.doesNotThrow(
+    () => parseWorldHostDecision(JSON.stringify(base), {
+      requireLoopContract: true,
+      groundingContext: {
+        input: { body_text: "我推开木门，查看柜台后的东西。" },
+        world: { name: "旧信铺", description: "门后挂着风铃。" },
+      },
+    }),
+  );
+});
+
+test("non-accepted Host decisions allow only player-facing, grounded repair affordances", () => {
+  const base = {
+    decision: "clarification",
+    resolution_disposition: "apply",
+    reason_text: "信封上的收件人尚未确定。",
+    outcome_text: "你发现柜台后的信封没有署名，暂时无法投递。",
+    result: {
+      new_facts: ["信封没有署名。"],
+      repair_affordances: [{ label: "检查没有署名的信封", input_type: "action", event_type: "shop.inspect_envelope", body_text: "我仔细检查这只没有署名的信封的封口和背面。", visibility: "world" }],
+    },
+  };
+  assert.doesNotThrow(() => parseWorldHostDecision(JSON.stringify(base), { requireLoopContract: true }));
+  assert.throws(
+    () => parseWorldHostDecision(JSON.stringify({ ...base, result: { ...base.result, repair_affordances: [{ ...base.result.repair_affordances[0], label: "下一步", body_text: "下一步" }] } }), { requireLoopContract: true }),
+    /concrete fact, effect, hook, or affected entity/u,
+  );
 });
 
 test("Director Runtime authorizes resume only from the actor's suspended Loop candidates", () => {

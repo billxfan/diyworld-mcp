@@ -502,12 +502,17 @@ export class PetSocialClient {
     });
   }
 
-  inbox(limit = 50) {
-    return this.request(`/v1/inbox?limit=${encodeURIComponent(limit)}`);
+  inbox(limit = 50, { before } = {}) {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (before !== undefined) query.set("before", String(before));
+    return this.request(`/v1/inbox?${query}`);
   }
 
-  activity(limit = 50) {
-    return this.request(`/v1/activity?limit=${encodeURIComponent(limit)}`);
+  activity(limit = 50, { before, undisplayedOnly } = {}) {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (before !== undefined) query.set("before", String(before));
+    if (undisplayedOnly !== undefined) query.set("undisplayed_only", String(undisplayedOnly));
+    return this.request(`/v1/activity?${query}`);
   }
 
   markEventReceipt(eventId, state) {
@@ -517,10 +522,10 @@ export class PetSocialClient {
     });
   }
 
-  markRead(conversationId, maxSequenceNo) {
+  markRead(conversationId, maxSequenceNo, { displayed } = {}) {
     return this.request(`/v1/conversations/${encodeURIComponent(conversationId)}/read`, {
       method: "POST",
-      body: JSON.stringify({ maxSequenceNo })
+      body: JSON.stringify({ maxSequenceNo, ...(displayed === undefined ? {} : { displayed }) })
     });
   }
 

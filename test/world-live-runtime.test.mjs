@@ -471,17 +471,26 @@ test("the Host collects a quorum and resolves the whole interaction atomically",
     const opened = owner.openWorldHostInteraction({
       worldId,
       clientSessionId: "collective-owner",
-      promptText: "今晚应该优先修屋顶，还是扩建厨房？",
+      promptText: "今晚应该优先修屋顶（choice_id: repair_roof），还是扩建厨房（choice_id: expand_kitchen）？",
       mode: "quorum",
       quorum: 2,
       windowSeconds: 120,
       lateInputPolicy: "expire",
       coordinationRule:
         "若意见分歧，先处理当前已经发生的安全风险，其他有效方案保留为后续计划。",
+      choiceOptions: [
+        { choice_id: "repair_roof", label: "先修屋顶" },
+        { choice_id: "expand_kitchen", label: "扩建厨房" },
+      ],
       expectedWorldStateVersion: 1,
     });
     assert.equal(opened.interaction.status, "open");
     assert.equal(opened.interaction.response_count, 0);
+    assert.deepEqual(opened.interaction.choice_options, [
+      { choice_id: "repair_roof", label: "先修屋顶" },
+      { choice_id: "expand_kitchen", label: "扩建厨房" },
+    ]);
+    assert.match(opened.prompt_event.body_text, /公开选项.*先修屋顶.*repair_roof/s);
     assert.match(opened.prompt_event.body_text, /回应完全可选/);
     assert.match(opened.prompt_event.body_text, /法定人数（quorum）/);
     assert.match(opened.prompt_event.body_text, /当前已收到 0 份回应/);
@@ -500,7 +509,26 @@ test("the Host collects a quorum and resolves the whole interaction atomically",
     const first = visitor.actInWorld({
       worldId,
       eventType: "collective.vote",
-      bodyText: "先修屋顶，雨季快到了。",
+      bodyText: "我的病况是HIV阳性；请将这项私人说明留在汇总之外。",
+      data: {
+        choice_id: "repair_roof",
+        private_context: {
+          medical_note: "HIV阳性",
+          nested: ["我的住址在月光巷17号"],
+          flags: { "HIV阳性": true, preference: true, value: false },
+          HIV: true,
+          q7: "仅主持可见的短随机字段",
+          value: 432109876,
+          selected_option: "secret_medical_hiv",
+          bank_account_987654: "仅主持可见",
+          secret_token_xyz: "仅主持可见",
+          email_address: "仅主持可见",
+          a9K7_qL2vX8: "仅主持可见",
+        },
+        selected_option: "repair_roof",
+        preference: "repair_roof",
+        explanation: "先处理公开列出的雨季风险。",
+      },
       replyToEventId: opened.prompt_event.id,
       observedWorldStateVersion: firstObserved.state_version,
       observedMemberStateVersion: firstObserved.member_state_version,
@@ -539,6 +567,7 @@ test("the Host collects a quorum and resolves the whole interaction atomically",
       worldId,
       eventType: "collective.vote",
       bodyText: "也先修屋顶，厨房可以之后扩建。",
+      data: { choice_id: "repair_roof" },
       replyToEventId: opened.prompt_event.id,
       visibility: "world",
       observedWorldStateVersion: secondObserved.state_version,
@@ -588,6 +617,77 @@ test("the Host collects a quorum and resolves the whole interaction atomically",
       "COLLECTIVE_PRIVATE_DATA_LEAK",
     );
 
+    for (const [publicField, value] of [
+      ["outcomeText", "公开摘要：\uFF28\uFF29\uFF36\u200B阳性"],
+      ["result", { private_context: { medical_note: "HIV阳性" } }],
+      ["worldStatePatch", { leaked_address: "月光巷17号" }],
+      ["result", { selected_plan: "HIV阳性" }],
+      ["result", { selected_option: "secret_medical_hiv" }],
+      ["result", { aggregate: { "H\u200bIV阳性": true } }],
+      ["worldStatePatch", { aggregate: { "HIV阳性": true } }],
+      ["result", { reported_HIV_status: true }],
+      ["worldStatePatch", { reported_q7_status: "已处理" }],
+      ["result", { aggregate: 432109876 }],
+      ["result", { preference: true }],
+      ["worldStatePatch", { value: false }],
+    ]) {
+      expectCode(
+        () => owner.resolveWorldHostInteraction({
+          worldId,
+          interactionId: opened.interaction.id,
+          clientSessionId: "collective-owner",
+          decision: "accepted",
+          reasonText: "尝试把私有结构化输入写进公共结果。",
+          outcomeText: "仅用于验证私有参数不会泄漏。",
+          [publicField]: value,
+          expectedWorldStateVersion: 1,
+        }),
+        "COLLECTIVE_PRIVATE_DATA_LEAK",
+      );
+    }
+
+    // A member-controlled object key is private evidence as well as its
+    // value. These deliberately avoid a vocabulary of known sensitive words:
+    // keys may be account-like, contact-like, or simply high-entropy labels.
+    // Check both result and the state patch, including NFKC/zero-width forms.
+    for (const [publicField, value] of [
+      ["result", { bank_account_987654: "已汇总" }],
+      ["worldStatePatch", { bank_account_987654: "已汇总" }],
+      ["result", { secret_token_xyz: true }],
+      ["worldStatePatch", { secret_token_xyz: true }],
+      ["result", { email_address: "已处理" }],
+      ["worldStatePatch", { email_address: "已处理" }],
+      ["result", { a9K7_qL2vX8: "已处理" }],
+      ["worldStatePatch", { "ｂａｎｋ\u200b＿ａｃｃｏｕｎｔ＿９８７６５４": "已处理" }],
+    ]) {
+      expectCode(
+        () => owner.resolveWorldHostInteraction({
+          worldId,
+          interactionId: opened.interaction.id,
+          clientSessionId: "collective-owner",
+          decision: "accepted",
+          reasonText: "尝试把成员私有对象字段名写进公开投影。",
+          outcomeText: "仅用于验证公开结果不会暴露私有字段名。",
+          [publicField]: value,
+          expectedWorldStateVersion: 1,
+        }),
+        "COLLECTIVE_PRIVATE_DATA_LEAK",
+      );
+    }
+
+    expectCode(
+      () => owner.resolveWorldHostInteraction({
+        worldId,
+        interactionId: opened.interaction.id,
+        clientSessionId: "collective-owner",
+        decision: "accepted",
+        reasonText: "尝试公开短敏感片段。",
+        outcomeText: "公开摘要：HIV阳性",
+        expectedWorldStateVersion: 1,
+      }),
+      "COLLECTIVE_PRIVATE_DATA_LEAK",
+    );
+
     const resolved = owner.resolveWorldHostInteraction({
       worldId,
       interactionId: opened.interaction.id,
@@ -595,11 +695,18 @@ test("the Host collects a quorum and resolves the whole interaction atomically",
       decision: "accepted",
       reasonText: "两位成员都选择先处理雨季风险。",
       outcomeText: "大家决定先修屋顶，木料已经运到阁楼。",
-      result: { selected_plan: "repair_roof" },
+      result: {
+        selected_plan: "repair_roof",
+        selected_option: "repair_roof",
+        preference: "repair_roof",
+        explanation: "两票都对应公开的修屋顶选项。",
+      },
       worldStatePatch: { collective_plan: "repair_roof" },
       expectedWorldStateVersion: 1,
     });
     assert.equal(resolved.interaction.status, "resolved");
+    assert.equal(resolved.inputs.length, 2,
+      "two different members can use the same public ID for the same choice");
     assert.equal(resolved.inputs.length, 2);
     assert.equal(resolved.world_state.version, 2);
     assert.equal(resolved.world_state.value.collective_plan, "repair_roof");
@@ -640,12 +747,61 @@ test("the Host collects a quorum and resolves the whole interaction atomically",
         }),
       "WORLD_INTERACTION_CLOSED",
     );
+
+    const privateChoice = owner.openWorldHostInteraction({
+      worldId,
+      clientSessionId: "collective-owner",
+      promptText: "是否登记下一项工作？公开选项只有 choice_id: inspect_damage。",
+      mode: "quorum",
+      quorum: 2,
+      windowSeconds: 120,
+      choiceOptions: [{ choice_id: "inspect_damage", label: "检查损坏" }],
+      expectedWorldStateVersion: 2,
+    });
+    for (const [member, key] of [[visitor, "first"], [second, "second"]]) {
+      const observed = member.observeWorld({ worldId });
+      expectCode(
+        () => member.actInWorld({
+          worldId,
+          inputType: "choice",
+          eventType: "collective.private_choice",
+          bodyText: "我提交一个私人标记。",
+          data: { choice_id: "approve" },
+          replyToEventId: privateChoice.prompt_event.id,
+          observedWorldStateVersion: observed.state_version,
+          observedMemberStateVersion: observed.member_state_version,
+          idempotencyKey: `private-choice-${key}`,
+          requireLive: true,
+        }),
+        "COLLECTIVE_CHOICE_NOT_OFFERED",
+      );
+      member.actInWorld({
+        worldId,
+        inputType: "speech",
+        eventType: "collective.private_suggestion",
+        bodyText: "我提交一个私人建议。",
+        replyToEventId: privateChoice.prompt_event.id,
+        observedWorldStateVersion: observed.state_version,
+        observedMemberStateVersion: observed.member_state_version,
+        idempotencyKey: `private-suggestion-${key}`,
+        requireLive: true,
+      });
+    }
+    const privateChoiceResolved = owner.resolveWorldHostInteraction({
+      worldId,
+      interactionId: privateChoice.interaction.id,
+      clientSessionId: "collective-owner",
+      decision: "accepted",
+      outcomeText: "本轮收到两份私人回应；主持将另行提供不暴露个人标记的后续选项。",
+      expectedWorldStateVersion: 2,
+    });
+    assert.equal(privateChoiceResolved.interaction.status, "resolved");
   } finally {
     db.close();
   }
 });
 
-test("a response window becomes ready at its deadline and late follow-ups stay immediate", () => {
+test("an empty response window cancels at its deadline and late follow-ups stay immediate", () => {
   const { db, owner, visitor, worldId } = createLiveFixture();
   try {
     owner.enterWorld({ worldId, clientSessionId: "window-owner" });
@@ -664,6 +820,22 @@ test("a response window becomes ready at its deadline and late follow-ups stay i
       coordinationRule: "Host 按当前公开事实协调分歧，并保留未采用意见。",
       expectedWorldStateVersion: 1,
     });
+    const beforeChoice = visitor.observeWorld({ worldId });
+    expectCode(
+      () => visitor.actInWorld({
+        worldId,
+        inputType: "choice",
+        eventType: "collective.unlisted_choice",
+        bodyText: "我想投票。",
+        data: { choice_id: "yes" },
+        replyToEventId: opened.prompt_event.id,
+        observedWorldStateVersion: beforeChoice.state_version,
+        observedMemberStateVersion: beforeChoice.member_state_version,
+        idempotencyKey: "window-unlisted-choice",
+        requireLive: true,
+      }),
+      "COLLECTIVE_CHOICE_OPTIONS_REQUIRED",
+    );
     assert.match(opened.prompt_event.body_text, /回应完全可选/);
     assert.match(opened.prompt_event.body_text, /限时窗口（windowed）/);
     assert.match(opened.prompt_event.body_text, /60 秒后截止/);
@@ -695,25 +867,18 @@ test("a response window becomes ready at its deadline and late follow-ups stay i
     assert.match(lateFollowUp.host_response.reason_text, /原集体回应窗口已经截止/);
     assert.match(lateFollowUp.host_response.outcome_text, /不计入已经结束的集体批次/);
 
-    const ready = owner.nextWorldHostInput({
+    const afterDeadline = owner.nextWorldHostInput({
       worldId,
       clientSessionId: "window-owner",
     });
-    assert.equal(ready.batch_mode, true);
-    assert.equal(ready.input_batch.length, 0);
-    owner.resolveWorldHostInteraction({
-      worldId,
-      interactionId: opened.interaction.id,
-      clientSessionId: "window-owner",
-      decision: "rejected",
-      outcomeText: "本轮没有在截止前收到安排，活动保持原计划。",
-      expectedWorldStateVersion: 1,
-    });
-    const nextImmediate = owner.nextWorldHostInput({
-      worldId,
-      clientSessionId: "window-owner",
-    });
-    assert.equal(nextImmediate.input.id, lateFollowUp.input.id);
+    assert.equal(afterDeadline.batch_mode ?? false, false);
+    assert.deepEqual(afterDeadline.active_interactions ?? [], []);
+    assert.equal(afterDeadline.input.id, lateFollowUp.input.id);
+    const cancelled = db.prepare(
+      "SELECT status, host_last_error FROM world_interactions WHERE id = ?",
+    ).get(opened.interaction.id);
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(cancelled.host_last_error, "NO_RESPONSES");
   } finally {
     db.close();
   }
@@ -996,6 +1161,7 @@ test("the shared MCP exposes direct World entry and creator Host takeover", asyn
         mode: "windowed",
         window_seconds: 60,
         late_input_policy: "follow_up",
+        choice_options: [{ choice_id: "approve_tea_day", label: "设为公共品茶日" }],
         expected_world_state_version: 1,
       },
     );
@@ -1007,6 +1173,7 @@ test("the shared MCP exposes direct World entry and creator Host takeover", asyn
         input_type: "choice",
         event_type: "collective.choice",
         body_text: "我赞成公共品茶日。",
+        data: { choice_id: "approve_tea_day" },
         reply_to_event_id: interaction.prompt_event.id,
         visibility: "actor",
         observed_world_state_version: visitorEntry.state_version,
@@ -1074,6 +1241,76 @@ test("the shared MCP exposes direct World entry and creator Host takeover", asyn
       world_id: world.id,
     });
     assert.equal(left.left, true);
+  } finally {
+    await app.close();
+    store.close();
+  }
+});
+
+test("an invited member receives the durable no-response cancellation", async () => {
+  const store = new PetSocialStore();
+  let deadlineCallback = null;
+  const app = createPetSocialApp({
+    store,
+    setTimeout(callback) {
+      deadlineCallback = callback;
+      return { unref() {} };
+    },
+    clearTimeout() {},
+  });
+  const address = await app.listen();
+  try {
+    const owner = await registerClient(address, "empty-window-owner");
+    const visitor = await registerClient(address, "empty-window-visitor");
+    const world = await owner.client.createWorld({
+      name: "空窗口通知世界",
+      rulesText: "回应完全可选。",
+      definitionText: "验证无人回应时参与者仍能看到明确结局。",
+      resolutionMode: "direct",
+    });
+    await owner.client.publishWorld(world.id, {
+      expectedSpecVersion: 1,
+      expectedRuleVersion: 1,
+      expectedProfileVersion: 1,
+      expectedHostVersion: 1,
+    });
+    await visitor.client.joinWorld(world.id, { ruleVersion: 1 });
+    await owner.client.enterWorld(world.id, { clientSessionId: "empty-owner" });
+    await visitor.client.enterWorld(world.id, { clientSessionId: "empty-visitor" });
+    await owner.client.takeoverWorldHost(world.id, {
+      clientSessionId: "empty-owner",
+    });
+    const opened = await owner.client.openWorldHostInteraction(world.id, {
+      clientSessionId: "empty-owner",
+      promptText: "有人愿意补充明天的安排吗？",
+      mode: "windowed",
+      windowSeconds: 60,
+      expectedWorldStateVersion: 1,
+    });
+    store.db.prepare(`
+      UPDATE world_interactions SET closes_at = '2000-01-01T00:00:00.000Z'
+      WHERE id = ?
+    `).run(opened.interaction.id);
+    assert.equal(typeof deadlineCallback, "function");
+    deadlineCallback();
+    const cancellation = store.db.prepare(`
+      SELECT payload_json FROM events
+      WHERE pet_id = ? AND event_type = 'world.event_committed'
+        AND json_extract(payload_json, '$.interactionId') = ?
+      ORDER BY id DESC LIMIT 1
+    `).get(visitor.registration.pet.id, opened.interaction.id);
+    assert.ok(cancellation);
+    const payload = JSON.parse(cancellation.payload_json);
+    assert.equal(payload.interactionStatus, "cancelled");
+    assert.match(payload.outcomeText, /无人回应.*没有产生集体决定/u);
+    const activity = await visitor.client.activity();
+    const item = activity.items.find(
+      (candidate) => candidate.interactionId === opened.interaction.id &&
+        candidate.eventType === "world.event_committed",
+    );
+    assert.ok(item);
+    assert.equal(item.actionRequired, false);
+    assert.equal(item.reply.available, false);
   } finally {
     await app.close();
     store.close();

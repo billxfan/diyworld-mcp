@@ -72,6 +72,50 @@ const OFFICIAL_WORLD_ORDER_SQL = OFFICIAL_WORLDS.map(
   (world, index) => `WHEN '${world.id}' THEN ${index}`,
 ).join("\n");
 
+// A simple World may be published with only a concrete opening scene.  The
+// default template's product-language buttons are useful while building, but
+// are not a credible first thing for a visitor to see.  Keep this fallback
+// deliberately literal: it only repeats facts supplied by the creator rather
+// than inventing people, places, or stakes.
+function isGenericOnboardingChoices(choices) {
+  return Array.isArray(choices) && choices.length === 3 && choices.every(
+    (choice) => ["observe", "act", "free"].includes(choice?.id),
+  );
+}
+
+function sceneGroundedStarterChoices(entryPrompt) {
+  const scene = entryPrompt.trim().replace(/\s+/gu, " ").slice(0, 80);
+  return [
+    {
+      id: "entry-inspect-scene",
+      label: `查看眼前这件事：${scene}`,
+      input_type: "action",
+      event_type: "host.entry.inspect_scene",
+      body_text: `我先仔细查看眼前的情况：${scene}`,
+      data: {},
+      visibility: "world",
+    },
+    {
+      id: "entry-respond-scene",
+      label: `回应眼前的情况：${scene}`,
+      input_type: "action",
+      event_type: "host.entry.respond_scene",
+      body_text: `我先回应眼前正在发生的事：${scene}`,
+      data: {},
+      visibility: "world",
+    },
+    {
+      id: "entry-act-in-scene",
+      label: "提出自己在此刻的行动",
+      input_type: "action",
+      event_type: "host.entry.free_action",
+      body_text: `根据眼前的情况，我想这样行动：${scene}`,
+      data: {},
+      visibility: "world",
+    },
+  ];
+}
+
 function now() {
   return new Date().toISOString();
 }
@@ -148,6 +192,22 @@ function stableLoopKey(...parts) {
     .slice(0, 32);
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map((item) => canonicalJson(item));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value).sort().map((key) => [key, canonicalJson(value[key])]),
+    );
+  }
+  return value;
+}
+
+function idempotencyFingerprint(request) {
+  return createHash("sha256")
+    .update(JSON.stringify(canonicalJson(request)))
+    .digest("hex");
+}
+
 function jsonObject(value, field, { max = 32_000 } = {}) {
   if (
     value === null ||
@@ -198,18 +258,350 @@ function jsonStringLeaves(value, output = []) {
   return output;
 }
 
-function assertCollectivePublicProjection({ outcomeText, result, worldStatePatch, privateValues }) {
-  const publicStrings = jsonStringLeaves({ outcomeText, result, worldStatePatch });
+// These are the only member-data keys with a documented collective meaning.
+// Everything else is player-provided structure, not a public field name.  Do
+// not turn this into a sensitive-word list: a key such as "bank_account_42"
+// or a random identifier is still private evidence even when its spelling is
+// not recognisably sensitive.
+const COLLECTIVE_PROTOCOL_DATA_KEYS = new Set([
+  "choiceid", "choice", "optionid", "selectedoption", "selectedplan",
+  "deferredplan", "aggregate", "privatecontext", "preference",
+  "explanation", "reason", "comment", "response", "value", "label",
+]);
+const COLLECTIVE_PRIVATE_CONTAINER_KEYS = new Set(["privatecontext"]);
+
+function normalizePrivacyKey(key) {
+  return normalizePrivacyText(key).replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+function isPrivateCollectiveDataKey(key) {
+  return !COLLECTIVE_PROTOCOL_DATA_KEYS.has(normalizePrivacyKey(key));
+}
+
+function jsonPrivacyStrings(value, {
+  includeKeys = false,
+  output = [],
+} = {}) {
+  if (typeof value === "string") {
+    output.push(value);
+  } else if (Array.isArray(value)) {
+    for (const child of value) {
+      jsonPrivacyStrings(child, { includeKeys, output });
+    }
+  } else if (value && typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      if (includeKeys) output.push(key);
+      jsonPrivacyStrings(child, { includeKeys, output });
+    }
+  }
+  return output;
+}
+
+function jsonPrivacyScalars(value, output = []) {
+  if (typeof value === "number" || typeof value === "boolean") {
+    output.push(value);
+  } else if (Array.isArray(value)) {
+    for (const child of value) jsonPrivacyScalars(child, output);
+  } else if (value && typeof value === "object") {
+    for (const child of Object.values(value)) jsonPrivacyScalars(child, output);
+  }
+  return output;
+}
+
+function jsonPrivacyKeys(value, output = []) {
+  if (Array.isArray(value)) {
+    for (const child of value) jsonPrivacyKeys(child, output);
+  } else if (value && typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      output.push(key);
+      jsonPrivacyKeys(child, output);
+    }
+  }
+  return output;
+}
+
+function privacyKeyTokens(value) {
+  if (typeof value !== "string") return [];
+  return value
+    .normalize("NFKC")
+    .toLocaleLowerCase("und")
+    .replace(/\p{Cf}/gu, "")
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean);
+}
+
+function privateKeyAppearsInPublicKey(privateKey, publicKey) {
+  const normalizedPrivate = normalizePrivacyKey(privateKey);
+  if (!normalizedPrivate) return false;
+  const publicTokens = privacyKeyTokens(publicKey);
+  // Separators are meaningful here: even a one-character or random private
+  // key is unsafe when it becomes a named component such as `reported_x`.
+  if (publicTokens.includes(normalizedPrivate)) return true;
+  const normalizedPublic = normalizePrivacyKey(publicKey);
+  // Also catch explicit compact prefix/suffix projections (for example
+  // `hivstatus`), while avoiding arbitrary one/two-character substring
+  // matches in ordinary words such as `aggregate`.
+  return normalizedPrivate.length >= 3 &&
+    (normalizedPublic.startsWith(normalizedPrivate) ||
+      normalizedPublic.endsWith(normalizedPrivate));
+}
+
+function jsonPrivateCollectiveDataKeys(value, output = []) {
+  jsonPrivateCollectiveDataEvidence(value)
+    .filter(({ key }) => isPrivateCollectiveDataKey(key))
+    .forEach((entry) => output.push(entry.key));
+  return output;
+}
+
+// A protocol-looking key has its documented meaning only at the public top
+// level. Once a member puts it below a private/custom container, it is their
+// private evidence again: `{private_context: {preference: true}}` must never
+// authorize a public `{preference: true}` projection.
+function jsonPrivateCollectiveDataEvidence(value, {
+  inheritedPrivate = false,
+  path = [],
+  output = [],
+} = {}) {
+  if (Array.isArray(value)) {
+    for (const [index, child] of value.entries()) {
+      jsonPrivateCollectiveDataEvidence(child, {
+        inheritedPrivate,
+        path: [...path, String(index)],
+        output,
+      });
+    }
+  } else if (value && typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      const normalizedKey = normalizePrivacyKey(key);
+      const privateHere = inheritedPrivate ||
+        isPrivateCollectiveDataKey(key) ||
+        COLLECTIVE_PRIVATE_CONTAINER_KEYS.has(normalizedKey);
+      if (privateHere) output.push({ key, path: [...path, key], value: child });
+      jsonPrivateCollectiveDataEvidence(child, {
+        inheritedPrivate: privateHere,
+        path: [...path, key],
+        output,
+      });
+    }
+  }
+  return output;
+}
+
+function jsonPublicScalarEntries(value, {
+  key = null,
+  path = [],
+  output = [],
+} = {}) {
+  if (typeof value === "number" || typeof value === "boolean") {
+    output.push({ key, path, value });
+  } else if (Array.isArray(value)) {
+    for (const [index, child] of value.entries()) {
+      jsonPublicScalarEntries(child, { key: String(index), path: [...path, String(index)], output });
+    }
+  } else if (value && typeof value === "object") {
+    for (const [childKey, child] of Object.entries(value)) {
+      jsonPublicScalarEntries(child, { key: childKey, path: [...path, childKey], output });
+    }
+  }
+  return output;
+}
+
+// Compare player-visible text in the form a reader sees, rather than in its
+// storage spelling.  In particular, compatibility characters and zero-width
+// format characters must not provide a way to quote a private response while
+// evading the collective-publication guard.
+function normalizePrivacyText(value) {
+  if (typeof value !== "string") return "";
+  return value
+    .normalize("NFKC")
+    .toLocaleLowerCase("und")
+    .replace(/[\p{Cf}\s，。！？；：、,.!?;:'"“”‘’（）()【】\[\]{}<>《》「」]/gu, "");
+}
+
+function collectivePrivateResponseTexts(input, actorName) {
+  const stored = parseJsonObject(input.data_json);
+  // Data is private evidence too. A choice_id becomes publishable only when
+  // its complete normalized token was already announced in the public prompt
+  // or coordination rule (assertCollectivePublicProjection checks that
+  // context). An ASCII-looking token is not public authorization by itself.
+  return [
+    input.id,
+    input.actor_pet_id,
+    actorName,
+    input.body_text,
+    ...jsonPrivacyStrings(stored.data ?? {}),
+    // Object keys are player content too. Keep only fixed protocol keys out
+    // of this evidence set, so normal public choice/result schema remains
+    // usable while arbitrary nested keys cannot reappear in public output.
+    ...jsonPrivateCollectiveDataKeys(stored.data ?? {}),
+  ].filter((value) => typeof value === "string" && value.length > 0);
+}
+
+function assertCollectivePublicProjection({
+  outcomeText,
+  result,
+  worldStatePatch,
+  privateValues,
+  privateTextValues = [],
+  privateDataKeys = [],
+  privateScalarValues = [],
+  privateScalarEntries = [],
+  publicContextValues = [],
+}) {
+  // Result and patch keys are player-visible structured output too. Include
+  // every key, rather than trying to recognize sensitive names, so a private
+  // key cannot be smuggled into an object name under a new spelling.
+  const publicStrings = jsonPrivacyStrings(
+    { outcomeText, result, worldStatePatch },
+    { includeKeys: true },
+  );
+  const publicKeys = jsonPrivacyKeys({ result, worldStatePatch });
+  const publicContext = publicContextValues
+    .filter((value) => typeof value === "string")
+    .join("\n");
+  const normalizedPublicContext = normalizePrivacyText(publicContext);
+  const normalizedPublicStrings = publicStrings.map(normalizePrivacyText);
+  const isAlreadyPublic = (value) => {
+    const normalized = normalizePrivacyText(value);
+    return normalized.length > 0 && normalizedPublicContext.includes(normalized);
+  };
+  const normalizedPrivateFragments = privateValues
+    .filter((value) => typeof value === "string")
+    .flatMap((value) => value
+      .split(/[\s，。！？；：、,.!?;:]+/u)
+      .map((fragment) => fragment.trim())
+      .filter((fragment) => [...fragment].length >= 8 && !isAlreadyPublic(fragment))
+      .map(normalizePrivacyText)
+      .filter(Boolean));
+  const privateKeys = privateDataKeys.filter((value) => typeof value === "string");
+  if (privateKeys.some((privateKey) =>
+    publicKeys.some((publicKey) => privateKeyAppearsInPublicKey(privateKey, publicKey)))) {
+    fail(
+      "COLLECTIVE_PRIVATE_DATA_LEAK",
+      "A public collective outcome must not derive a field name from a private response field.",
+    );
+  }
+  // Numeric values are just as identifying as strings. Boolean values are
+  // intentionally not globally compared (true/false carry no identity by
+  // themselves); the key-projection check above ties them to private fields.
+  const privateNumbers = privateScalarValues.filter((value) =>
+    typeof value === "number" && Number.isFinite(value));
+  const publicNumbers = jsonPrivacyScalars(
+    { outcomeText, result, worldStatePatch },
+  ).filter((value) => typeof value === "number" && Number.isFinite(value));
+  if (privateNumbers.some((value) => publicNumbers.includes(value))) {
+    fail(
+      "COLLECTIVE_PRIVATE_DATA_LEAK",
+      "A public collective outcome must not reproduce a private numeric response value.",
+    );
+  }
+  const publicScalarEntries = jsonPublicScalarEntries({ result, worldStatePatch });
+  if (privateScalarEntries.some(({ key, value }) =>
+    typeof value === "boolean" && publicScalarEntries.some((publicEntry) =>
+      publicEntry.value === value && privateKeyAppearsInPublicKey(key, publicEntry.key)))) {
+    fail(
+      "COLLECTIVE_PRIVATE_DATA_LEAK",
+      "A public collective outcome must not reproduce a private field's boolean value.",
+    );
+  }
   for (const privateValue of privateValues) {
-    if (typeof privateValue !== "string" || privateValue.length === 0) continue;
-    if (publicStrings.some((candidate) =>
-      candidate === privateValue ||
-      (privateValue.length >= 8 && candidate.includes(privateValue)))) {
+    const normalizedPrivate = normalizePrivacyText(privateValue);
+    if (!normalizedPrivate || isAlreadyPublic(privateValue)) continue;
+    if (normalizedPublicStrings.some((candidate) =>
+      candidate === normalizedPrivate ||
+      (normalizedPrivate.length >= 8 && candidate.includes(normalizedPrivate)))) {
       fail(
         "COLLECTIVE_PRIVATE_DATA_LEAK",
         "A public collective outcome must not quote or identify a private response.",
       );
     }
+  }
+  if (normalizedPublicStrings.some((candidate) =>
+    normalizedPrivateFragments.some((fragment) => candidate.includes(fragment)))) {
+    fail(
+      "COLLECTIVE_PRIVATE_DATA_LEAK",
+      "A public collective outcome must not quote a distinctive fragment of a private response.",
+    );
+  }
+  // Short secrets can be highly sensitive (for example an HIV status or a
+  // compact account/identity marker). Detect any four-codepoint verbatim
+  // overlap unless that same phrase was already present in the public prompt
+  // or coordination rule. This permits legitimate aggregation of public
+  // option wording without treating private free text as publishable.
+  const privateNgrams = new Set();
+  for (const value of privateTextValues) {
+    if (typeof value !== "string") continue;
+    const compact = [...normalizePrivacyText(value)];
+    for (let index = 0; index + 4 <= compact.length; index += 1) {
+      const fragment = compact.slice(index, index + 4).join("");
+      if (!normalizedPublicContext.includes(fragment)) privateNgrams.add(fragment);
+    }
+  }
+  if (normalizedPublicStrings.some((candidate) => {
+    return [...privateNgrams].some((fragment) => candidate.includes(fragment));
+  })) {
+    fail(
+      "COLLECTIVE_PRIVATE_DATA_LEAK",
+      "A public collective outcome must not reproduce a private response fragment that was absent from the public prompt.",
+    );
+  }
+}
+
+function structuredCollectiveChoice(input) {
+  if (input.input_type !== "choice") return null;
+  const data = parseJsonObject(input.data_json).data ?? {};
+  for (const key of ["choice_id", "choice", "value", "option_id"]) {
+    if (typeof data[key] === "string" && data[key].trim()) {
+      return data[key].trim().slice(0, 160);
+    }
+  }
+  return null;
+}
+
+function collectiveChoiceOptions(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length < 1 || value.length > 20) {
+    fail("INVALID_COLLECTIVE_CHOICE_OPTIONS", "choice_options must contain between 1 and 20 public options.");
+  }
+  const ids = new Set();
+  return value.map((option) => {
+    if (!option || typeof option !== "object" || Array.isArray(option)) {
+      fail("INVALID_COLLECTIVE_CHOICE_OPTIONS", "Each collective choice option must be an object.");
+    }
+    const choiceId = text(option.choice_id, "choice option id", { min: 1, max: 160 });
+    const label = text(option.label, "choice option label", { min: 1, max: 240 });
+    if (!/^[a-z][a-z0-9_-]*$/iu.test(choiceId) || ids.has(choiceId)) {
+      fail("INVALID_COLLECTIVE_CHOICE_OPTIONS", "Each choice option needs a unique stable ASCII choice_id.");
+    }
+    ids.add(choiceId);
+    return { choice_id: choiceId, label };
+  });
+}
+
+function assertCollectiveDisagreementSemantics({ inputs, result, outcomeText, coordinationRule }) {
+  const choices = inputs.map(structuredCollectiveChoice).filter(Boolean);
+  const distinct = [...new Set(choices)];
+  if (distinct.length < 2) return;
+  const semantics = result.collective_semantics;
+  if (!semantics || typeof semantics !== "object" || Array.isArray(semantics)) {
+    fail("COLLECTIVE_DISAGREEMENT_SEMANTICS_REQUIRED", "Different structured choices require a public aggregate disagreement summary.");
+  }
+  if (semantics.unanimous === true || semantics.material_disagreement !== true) {
+    fail("COLLECTIVE_FALSE_UNANIMOUS", "Different structured choices cannot be settled as unanimous.");
+  }
+  const reported = semantics.choice_counts;
+  if (!reported || typeof reported !== "object" || Array.isArray(reported)) {
+    fail("COLLECTIVE_DISAGREEMENT_SEMANTICS_REQUIRED", "The aggregate disagreement summary must include choice_counts.");
+  }
+  const actual = Object.fromEntries(distinct.map((choice) => [
+    choice,
+    choices.filter((item) => item === choice).length,
+  ]));
+  if (Object.keys(actual).some((key) => Number(reported[key]) !== actual[key])) {
+    fail("COLLECTIVE_DISAGREEMENT_SEMANTICS_INVALID", "choice_counts does not match the server-recorded structured choices.");
+  }
+  if (!/分歧|不同意见|未一致/u.test(outcomeText) || !coordinationRule.trim()) {
+    fail("COLLECTIVE_DISAGREEMENT_DISCLOSURE_REQUIRED", "A materially split batch must publicly acknowledge disagreement and its coordination rule.");
   }
 }
 
@@ -3737,6 +4129,10 @@ export class SocialService {
     });
     const actor = this.requirePet();
     const world = this.requireSpace(worldId);
+    // A mystery truth must exist before the player can observe or investigate
+    // the opening scene. Sealing on entry is independent of the event label an
+    // MCP client happens to choose for natural-language investigation.
+    this.sealPendingMysteryTruths(world.id);
     const existingGuidance = result.already_present
       ? this.latestWorldHostGuidance(world.id, actor.id)
       : null;
@@ -4503,7 +4899,7 @@ export class SocialService {
     const collectiveReply = normalizedReply
       ? this.db
           .prepare(`
-            SELECT id FROM world_interactions
+            SELECT id, status FROM world_interactions
             WHERE space_id = ? AND prompt_event_id = ?
           `)
           .get(world.id, normalizedReply)
@@ -4559,13 +4955,48 @@ export class SocialService {
         }
       }
     }
+    if (
+      collectiveReply?.status === "open" &&
+      normalizedInputType === "choice" &&
+      !(typeof normalizedData.choice_id === "string" && normalizedData.choice_id.trim())
+    ) {
+      fail(
+        "COLLECTIVE_CHOICE_ID_REQUIRED",
+        "A collective choice response must include data.choice_id so the server can distinguish agreement from disagreement without guessing from private text.",
+      );
+    }
+    const requestFingerprint = idempotencyFingerprint({
+      input_type: normalizedInputType,
+      event_type: normalizedType,
+      body_text: normalizedBody,
+      data: normalizedData,
+      proposed_world_state_patch: worldPatch,
+      proposed_member_state_patch: memberPatch,
+      reply_to_event_id: normalizedReply,
+      scene_id: normalizedSceneId,
+      visibility: normalizedVisibility,
+      correlation_id: normalizedCorrelation ?? normalizedReply,
+    });
     const existing = this.db
       .prepare(`
-        SELECT id FROM world_events
-        WHERE space_id = ? AND actor_pet_id = ? AND idempotency_key = ?
+        SELECT input.id, input.idempotency_fingerprint
+        FROM world_inputs input
+        WHERE input.space_id = ? AND input.actor_pet_id = ? AND input.idempotency_key = ?
       `)
       .get(world.id, actor.id, normalizedKey);
-    if (existing) return this.worldIntentResult(existing.id);
+    if (existing) {
+      // Pre-fingerprint rows are a deliberate compatibility exception. They
+      // cannot be compared safely, but preserve the historical replay contract.
+      if (
+        existing.idempotency_fingerprint &&
+        existing.idempotency_fingerprint !== requestFingerprint
+      ) {
+        fail("IDEMPOTENCY_CONFLICT", "This idempotency key was already used for a different World action.", {
+          idempotency_key: normalizedKey,
+        });
+      }
+      return this.worldIntentResult(existing.id);
+    }
 
     this.refreshWorldInteractions(world.id, timestamp);
     let interaction = null;
@@ -4604,6 +5035,18 @@ export class SocialService {
             { interaction_id: interaction.id, input_id: priorResponse.id },
           );
         }
+        if (normalizedInputType === "choice") {
+          const prompt = this.db.prepare("SELECT payload_json FROM world_events WHERE id = ?")
+            .get(interaction.prompt_event_id);
+          const options = parseJsonObject(prompt?.payload_json).choice_options ?? [];
+          if (!Array.isArray(options) || options.length === 0) {
+            fail("COLLECTIVE_CHOICE_OPTIONS_REQUIRED", "This collective interaction has no public choice options; submit speech or action instead.");
+          }
+          const choiceId = normalizedData.choice_id;
+          if (!options.some((option) => option?.choice_id === choiceId)) {
+            fail("COLLECTIVE_CHOICE_NOT_OFFERED", "Choose one of the public choice_ids announced for this interaction.");
+          }
+        }
       } else if (interaction) {
         if (interaction.late_input_policy === "expire") {
           fail(
@@ -4620,6 +5063,9 @@ export class SocialService {
     const audiencePetId =
       normalizedVisibility === "actor" ? actor.id : null;
     this.ensureWorldMemberState(world.id, actor.id, timestamp);
+    // Entry normally seals mystery truth. This fallback also protects direct
+    // protocol clients that submit without a live entry flow.
+    this.sealPendingMysteryTruths(world.id, timestamp);
     const worldStateBefore = this.worldStateView(world.id);
     const memberStateBefore = this.worldMemberStateView(world.id, actor.id);
     const hasObservedWorldVersion = observedWorldStateVersion !== undefined;
@@ -4754,10 +5200,11 @@ export class SocialService {
             correlation_id, visibility, rule_version, spec_version,
             world_state_version, member_state_version,
             received_world_state_version, received_member_state_version,
-            context_version_source, interaction_id, idempotency_key, status,
+            context_version_source, interaction_id, idempotency_key,
+            idempotency_fingerprint, status,
             intent_event_id, created_at
           ) VALUES (?, ?, ?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, 'pending', ?, ?)
+            ?, ?, ?, ?, 'pending', ?, ?)
         `)
         .run(
           intentId,
@@ -4785,6 +5232,7 @@ export class SocialService {
           contextVersionSource,
           interaction?.id ?? null,
           normalizedKey,
+          requestFingerprint,
           intentId,
           timestamp,
         );
@@ -6235,6 +6683,46 @@ export class SocialService {
   }
 
   refreshWorldInteractions(spaceId, timestamp = now()) {
+    // An empty collective window has no authoritative evidence to adjudicate.
+    // Cancel it at its deadline instead of queuing a Host turn that can never
+    // produce a participant-grounded outcome. This also releases the unique
+    // active-window constraint after restart.
+    const emptyExpired = this.db.prepare(`
+        SELECT interaction.* FROM world_interactions interaction
+        WHERE interaction.space_id = ? AND interaction.status = 'open'
+          AND interaction.closes_at <= ?
+          AND NOT EXISTS (
+            SELECT 1 FROM world_inputs input
+            WHERE input.interaction_id = interaction.id
+          )
+      `).all(spaceId, timestamp);
+    for (const interaction of emptyExpired) {
+      const cancelled = this.db.prepare(`
+        UPDATE world_interactions
+        SET status = 'cancelled', resolved_at = COALESCE(resolved_at, ?),
+          host_last_error = COALESCE(host_last_error, 'NO_RESPONSES')
+        WHERE id = ? AND status = 'open'
+      `).run(timestamp, interaction.id);
+      if (cancelled.changes !== 1) continue;
+      enqueueWorldDelivery(this.db, {
+        worldId: interaction.space_id,
+        sourceWorldEventId: interaction.prompt_event_id,
+        sourceInteractionId: interaction.id,
+        eventType: "world.event_committed",
+        dedupeKey: `world:${interaction.space_id}:interaction-cancelled:${interaction.id}`,
+        envelope: {
+          interactionId: interaction.id,
+          sceneId: interaction.scene_id ?? null,
+          outcomeText: "本轮集体互动在截止前无人回应，现已取消；没有产生集体决定或世界变化。",
+          outcomeEventType: "world.interaction_cancelled",
+          interactionStatus: "cancelled",
+          closesAt: interaction.closes_at,
+          visibility: "world",
+          actorPetId: null,
+        },
+        timestamp,
+      });
+    }
     this.db
       .prepare(`
         UPDATE world_interactions
@@ -6294,6 +6782,7 @@ export class SocialService {
         : null,
       prompt_text: promptText,
       coordination_rule: promptPayload.coordination_rule ?? "",
+      choice_options: Array.isArray(promptPayload.choice_options) ? promptPayload.choice_options : [],
       mode: row.mode,
       status: row.status,
       base_world_state_version: Number(row.base_world_state_version),
@@ -6346,6 +6835,7 @@ export class SocialService {
     coordinationRule,
     expectedWorldStateVersion,
     sceneId,
+    choiceOptions,
   }) {
     const actor = this.requirePet();
     const world = this.requireSpace(worldId);
@@ -6400,6 +6890,7 @@ export class SocialService {
         max: 600,
       }) ??
       "Host 将忠实呈现不同意见，并依据集体问题中已公开的世界事实和安全优先级协调；未采用的有效意见会保留为后续选项。";
+    const normalizedChoiceOptions = collectiveChoiceOptions(choiceOptions);
     const expectedVersion = integer(
       expectedWorldStateVersion,
       "expected world state version",
@@ -6420,6 +6911,9 @@ export class SocialService {
         : "截止后的内容不会计入本批次。";
     const publicPrompt = [
       normalizedPrompt,
+      normalizedChoiceOptions.length > 0
+        ? `公开选项：${normalizedChoiceOptions.map((option) => `${option.label}（choice_id: ${option.choice_id}）`).join("；")}。选择时必须复制其中一个 choice_id；不同文字表述同一选项也使用同一 ID。`
+        : "本轮未公布固定选项；请用 speech 或 action 表达建议，不能提交 choice。",
       "参与说明：回应完全可选；不回应不会被视为同意或反对，也不会阻塞你的独立行动。",
       `收集方式：${normalizedMode === "quorum" ? "法定人数（quorum）" : "限时窗口（windowed）"}；当前已收到 0 份回应。`,
       collectionRule,
@@ -6483,6 +6977,7 @@ export class SocialService {
           closes_at: closesAt,
           late_input_policy: normalizedLatePolicy,
           coordination_rule: normalizedCoordinationRule,
+          choice_options: normalizedChoiceOptions,
         },
         correlationId: interactionId,
         sceneId: normalizedSceneId,
@@ -6660,6 +7155,81 @@ export class SocialService {
     };
   }
 
+  sealPendingMysteryTruths(worldId, timestamp = now()) {
+    const host = hostConfigView(this.currentWorldHostConfig(worldId));
+    if (host.judgement_policy?.world_mechanics?.family !== "mystery") return;
+    const cases = this.worldStateView(worldId).value.mystery?.active_cases ?? [];
+    const insert = this.db.prepare(`
+      INSERT OR IGNORE INTO world_host_private_facts
+        (space_id, fact_key, value_json, sealed_at)
+      VALUES (?, ?, ?, ?)
+    `);
+    const pending = cases.filter((item) => item?.id && item.truth_commitment === "pending_seal");
+    if (pending.length === 0) return;
+    withTransaction(this.db, () => {
+      for (const item of pending) {
+        // This durable package is Host-only. Its public counterpart is only a
+        // commitment identifier; no resolution text enters state or events.
+        const digest = createHash("sha256").update(`${worldId}:${item.id}:truth-v1`).digest("hex");
+        const truth = item.id === "missing-cat"
+          ? {
+              case_id: item.id, truth_version: 1,
+              resolution: "The cat sheltered beneath the sealed ferry pier after following a fishmonger cart; no crime occurred.",
+              timeline: ["dawn: cart passed the lane", "morning: rain drove the cat under the pier"],
+              evidence_paths: [["wet pawprints", "fish scale near the cart route"], ["ferry watchman testimony", "cat collar snagged below the pier"]],
+              red_herrings: ["the old seven-mark carving is unrelated to the cat's disappearance"],
+            }
+          : {
+              case_id: item.id, truth_version: 1,
+              resolution: `Fixed case resolution variant ${digest.slice(0, 12)}.`,
+              timeline: [`origin:${digest.slice(12, 20)}`, `turning-point:${digest.slice(20, 28)}`],
+              evidence_paths: [[`physical:${digest.slice(28, 36)}`, `record:${digest.slice(36, 44)}`]],
+              red_herrings: [`coincidence:${digest.slice(44, 52)}`],
+            };
+        insert.run(worldId, `sealed_truth:${item.id}`, JSON.stringify(truth), timestamp);
+      }
+      const commitments = new Map(
+        this.db.prepare(`
+          SELECT fact_key, value_json FROM world_host_private_facts
+          WHERE space_id = ? AND fact_key LIKE 'sealed_truth:%'
+        `).all(worldId).map((row) => [
+          row.fact_key.slice("sealed_truth:".length),
+          `sealed:sha256:${createHash("sha256").update(row.value_json).digest("hex")}`,
+        ]),
+      );
+      const current = this.worldStateView(worldId);
+      const next = structuredClone(current.value);
+      for (const item of next.mystery?.active_cases ?? []) {
+        if (item.truth_commitment === "pending_seal" && commitments.has(item.id)) {
+          item.truth_commitment = commitments.get(item.id);
+        }
+      }
+      this.db.prepare(`
+        UPDATE world_states SET version = ?, state_json = ?,
+          updated_by_world_agent_id = ?, updated_at = ?
+        WHERE space_id = ? AND version = ?
+      `).run(current.version + 1, JSON.stringify(next), this.requireWorldAgent(worldId).id, timestamp, worldId, current.version);
+    });
+  }
+
+  hostPrivateSealedTruths(worldId) {
+    const available = this.db.prepare(`
+      SELECT COUNT(*) AS count FROM sqlite_master
+      WHERE type = 'table' AND name = 'world_host_private_facts'
+    `).get().count;
+    // Older in-memory fixtures and pre-migration deployments have no private
+    // fact table. Treat that as an empty package; it is never player data.
+    if (!available) return [];
+    return this.db.prepare(`
+      SELECT fact_key, value_json, sealed_at FROM world_host_private_facts
+      WHERE space_id = ? AND fact_key LIKE 'sealed_truth:%' ORDER BY fact_key
+    `).all(worldId).map((row) => ({
+      fact_key: row.fact_key,
+      value: parseJsonObject(row.value_json),
+      sealed_at: row.sealed_at,
+    }));
+  }
+
   worldInputConcurrency(world, input, currentWorldState) {
     const observedVersion = Number(input.world_state_version);
     const receivedVersion = Number(
@@ -6776,6 +7346,7 @@ export class SocialService {
         ...context,
         input_concurrency: concurrency,
       },
+      host_private_truths: this.hostPrivateSealedTruths(world.id),
       director_plan: buildDirectorTurnPlan({
         host,
         worldState,
@@ -6835,6 +7406,7 @@ export class SocialService {
     worldId,
     worldStatePatch,
     memberStatePatch,
+    memberPetId = this.actorKey,
   }) {
     const host = hostConfigView(this.currentWorldHostConfig(worldId));
     const contract =
@@ -6849,7 +7421,10 @@ export class SocialService {
       if (!Array.isArray(declaredKeys)) continue;
       const allowed = new Set(declaredKeys);
       const undeclared = Object.keys(jsonObject(patch, label)).filter(
-        (key) => !allowed.has(key),
+        // `role` is the legacy onboarding projection mirrored into member
+        // state by the server itself. Official family-specific progress still
+        // lives under the declared journey/mechanic keys.
+        (key) => !allowed.has(key) && !(label === "member state patch" && key === "role"),
       );
       if (undeclared.length > 0) {
         fail(
@@ -6870,7 +7445,7 @@ export class SocialService {
     const currentMemberState =
       memberStatePatch === undefined || memberStatePatch === null
         ? {}
-        : this.worldMemberStateView(worldId, this.actorKey).value;
+        : this.worldMemberStateView(worldId, memberPetId).value;
     const nextMemberState =
       memberStatePatch === undefined || memberStatePatch === null
         ? {}
@@ -6965,6 +7540,45 @@ export class SocialService {
           violation("The Host cannot alter or remove a sealed case truth commitment.", {
             case_id: id,
           });
+        }
+      }
+    }
+
+    if (mechanicFamily === "social") {
+      const town = nextWorldState.town;
+      const currentTown = currentWorldState.town ?? {};
+      if (!town || typeof town !== "object") violation("The Host cannot remove the town state.");
+      boundedNumber(town.day, "town.day", 1);
+      boundedNumber(town.prosperity, "town.prosperity", 0, 100);
+      const currentProjects = new Map((currentTown.community_projects ?? []).map((item) => [item.id, item]));
+      const nextProjects = new Map((town.community_projects ?? []).map((item) => [item.id, item]));
+      for (const [id, project] of currentProjects) {
+        const replacement = nextProjects.get(id);
+        if (!replacement) violation("The Host cannot remove a tracked community project.", { project_id: id });
+        boundedNumber(replacement.progress, `town.community_projects.${id}.progress`, 0, replacement.target);
+        if (replacement.target !== project.target) violation("The Host cannot change a tracked community project target.", { project_id: id });
+      }
+    }
+
+    if (mechanicFamily === "quest") {
+      const adventure = nextWorldState.adventure;
+      const currentAdventure = currentWorldState.adventure ?? {};
+      if (!adventure || typeof adventure !== "object") violation("The Host cannot remove the adventure state.");
+      boundedNumber(adventure.guild_level, "adventure.guild_level", 1);
+      boundedNumber(adventure.guild_funds, "adventure.guild_funds", 0);
+      for (const [id, value] of Object.entries(adventure.facilities ?? {})) {
+        boundedNumber(value, `adventure.facilities.${id}`, 0);
+      }
+      const currentQuests = new Map((currentAdventure.quest_board ?? []).map((item) => [item.id, item]));
+      const nextQuests = new Map((adventure.quest_board ?? []).map((item) => [item.id, item]));
+      const order = ["open", "accepted", "prepared", "challenging", "returning", "resolved"];
+      for (const [id, quest] of currentQuests) {
+        const replacement = nextQuests.get(id);
+        if (!replacement) violation("The Host cannot remove a tracked quest.", { quest_id: id });
+        const before = order.indexOf(quest.status);
+        const after = order.indexOf(replacement.status);
+        if (before >= 0 && after >= 0 && after > before + 1) {
+          violation("A quest cannot skip a progression stage without cause.", { quest_id: id, from: quest.status, to: replacement.status });
         }
       }
     }
@@ -7365,6 +7979,7 @@ export class SocialService {
         ...context,
         input_concurrency: concurrency,
       },
+      host_private_truths: this.hostPrivateSealedTruths(world.id),
       director_plan: buildDirectorTurnPlan({
         host,
         worldState,
@@ -7519,11 +8134,10 @@ export class SocialService {
         },
       );
     }
-    const promptPayload = parseJsonObject(
-      this.db
-        .prepare("SELECT payload_json FROM world_events WHERE id = ?")
-        .get(interaction.prompt_event_id)?.payload_json,
-    );
+    const promptRow = this.db
+      .prepare("SELECT payload_json, body_text FROM world_events WHERE id = ?")
+      .get(interaction.prompt_event_id);
+    const promptPayload = parseJsonObject(promptRow?.payload_json);
     const coordinationRule = promptPayload.coordination_rule ?? "";
     const normalizedDecision = enumValue(
       decision,
@@ -7544,6 +8158,10 @@ export class SocialService {
     if (normalizedDecision !== "accepted" && normalizedPatch !== undefined) {
       fail("INVALID_ARGUMENT", "Only an accepted batch can change World state.");
     }
+    this.enforceWorldMechanicStateContract({
+      worldId: world.id,
+      worldStatePatch: normalizedPatch,
+    });
     const expectedVersion = integer(
       expectedWorldStateVersion,
       "expected world state version",
@@ -7567,13 +8185,53 @@ export class SocialService {
       const actorName = this.db
         .prepare(`SELECT ${this.petNameColumn} AS name FROM pets WHERE id = ?`)
         .get(input.actor_pet_id)?.name;
-      return [input.id, input.actor_pet_id, actorName, input.body_text];
+      return collectivePrivateResponseTexts(input, actorName);
     });
+    const privateResponseDataEvidence = responseInputs.flatMap((input) =>
+      jsonPrivateCollectiveDataEvidence(parseJsonObject(input.data_json).data ?? {}));
+    // Protocol field names retain their public schema meaning at the top
+    // level (for example selected_option). Nested instances are private for
+    // scalar matching below, but are not by themselves evidence that the
+    // schema key name was leaked.
+    const privateResponseDataKeys = privateResponseDataEvidence
+      .map(({ key }) => key)
+      .filter(isPrivateCollectiveDataKey);
+    const privateResponseScalars = privateResponseDataEvidence.flatMap(({ value }) =>
+      jsonPrivacyScalars(value));
     assertCollectivePublicProjection({
       outcomeText: normalizedOutcome,
       result: normalizedResult,
       worldStatePatch: normalizedPatch,
       privateValues: privateResponseValues,
+      privateDataKeys: privateResponseDataKeys,
+      privateScalarValues: privateResponseScalars,
+      privateScalarEntries: privateResponseDataEvidence.flatMap(({ key, value }) =>
+        jsonPrivacyScalars(value).map((scalar) => ({ key, value: scalar }))),
+      // Short-fragment protection applies to natural-language response text
+      // and non-choice private data only. Choice IDs are guarded by exact and
+      // distinctive-fragment matching, and may surface only when declared in
+      // public interaction context.
+      privateTextValues: responseInputs.flatMap((input) => [
+        input.body_text,
+        ...jsonStringLeaves(parseJsonObject(input.data_json).data ?? {})
+          .filter((value) => value !== parseJsonObject(input.data_json).data?.choice_id),
+      ]),
+      publicContextValues: [
+        promptRow?.body_text,
+        promptPayload.coordination_rule,
+        ...(Array.isArray(promptPayload.choice_options)
+          ? promptPayload.choice_options.flatMap((option) => [
+              option?.choice_id,
+              option?.label,
+            ])
+          : []),
+      ],
+    });
+    assertCollectiveDisagreementSemantics({
+      inputs: responseInputs,
+      result: normalizedResult,
+      outcomeText: normalizedOutcome,
+      coordinationRule,
     });
     const needsReconciliation =
       Number(interaction.base_world_state_version) < currentWorldState.version ||
@@ -8430,11 +9088,27 @@ export class SocialService {
           WHERE space_id = ? AND pet_id = ? AND status = 'completed'
         `).get(spaceId, petId).count,
       );
+      const concretePublicThread = this.db.prepare(`
+        SELECT title FROM world_story_loops
+        WHERE space_id = ? AND scope = 'public' AND status = 'active'
+        ORDER BY created_at ASC, id ASC LIMIT 1
+      `).get(spaceId)?.title;
+      const worldIdentity = this.db.prepare(`
+        SELECT name, description FROM spaces WHERE id = ?
+      `).get(spaceId);
+      const worldGroundedOpening = worldIdentity
+        ? `${worldIdentity.name}：${worldIdentity.description}`.trim().slice(0, 500)
+        : null;
       const title = journey.participation_intent?.trim()
         ? journey.participation_intent.trim().slice(0, 500)
         : journey.current_role?.trim()
-          ? `继续“${journey.current_role.trim().slice(0, 160)}”的个人旅程`
-          : "继续你的个人旅程";
+          ? `以“${journey.current_role.trim().slice(0, 160)}”身份处理${worldIdentity?.name ?? "当前世界"}的局势`
+          : concretePublicThread?.trim() || worldGroundedOpening;
+      // Every participant needs an internal personal anchor so a deliberate
+      // directed interaction can form a Scene on the first visit. Ground that
+      // anchor in authored World identity instead of exposing the old empty
+      // "continue your journey" placeholder to the player.
+      if (!title) return;
       const loop = this.insertWorldStoryLoop({
         spaceId,
         ownerPetId: petId,
@@ -9070,27 +9744,56 @@ export class SocialService {
     const deliveryMode = this.db.prepare(`
       SELECT delivery_mode FROM spaces WHERE id = ?
     `).get(spaceId)?.delivery_mode ?? "legacy_broadcast";
+    const boundedLimit = Math.max(1, Math.min(limit, 50));
+    // A resume bundle is a foreground recovery surface, not a raw event
+    // cursor.  In particular, a player who was offline must not have a live
+    // collective invitation pushed out by an arbitrarily long backlog of
+    // ambient updates.  Select unanswered, still-open invitations first,
+    // then use the remaining bounded space for the oldest unseen context.
+    // Keeping both sets bounded makes repeated visits stable without turning
+    // the visit response into an unbounded activity feed.
     const rows = this.db.prepare(`
-      SELECT event.*, receipt.delivered_at, receipt.displayed_at, receipt.read_at
-      FROM events event
-      LEFT JOIN event_receipts receipt
-        ON receipt.event_id = event.id AND receipt.device_id = ?
-      WHERE event.pet_id = ?
-        AND event.event_type IN ('world.event_committed', 'world.interaction_opened')
-        AND json_extract(event.payload_json, '$.worldId') = ?
-        AND COALESCE(json_extract(event.payload_json, '$.relevance'), '')
-          IN ('direct', 'contextual', 'collective',
-            CASE WHEN ? = 'legacy_broadcast' THEN 'legacy' ELSE '' END)
-        AND receipt.displayed_at IS NULL
-        AND receipt.read_at IS NULL
-      ORDER BY event.id ASC
+      WITH eligible AS (
+        SELECT event.*, receipt.delivered_at, receipt.displayed_at, receipt.read_at,
+          CASE WHEN event.event_type = 'world.interaction_opened'
+            AND interaction.status = 'open'
+            AND NOT EXISTS (
+              SELECT 1 FROM world_inputs input
+              WHERE input.interaction_id = interaction.id
+                AND input.actor_pet_id = event.pet_id
+            )
+            THEN 0
+            WHEN COALESCE(json_extract(event.payload_json, '$.actionRequired'), 0) = 1
+              THEN 0
+            ELSE 1
+          END AS resume_priority
+        FROM events event
+        LEFT JOIN event_receipts receipt
+          ON receipt.event_id = event.id AND receipt.device_id = ?
+        LEFT JOIN world_interactions interaction
+          ON interaction.id = json_extract(event.payload_json, '$.interactionId')
+            AND interaction.space_id = ?
+        WHERE event.pet_id = ?
+          AND event.event_type IN ('world.event_committed', 'world.interaction_opened')
+          AND json_extract(event.payload_json, '$.worldId') = ?
+          AND COALESCE(json_extract(event.payload_json, '$.relevance'), '')
+            IN ('direct', 'contextual', 'collective',
+              CASE WHEN ? = 'legacy_broadcast' THEN 'legacy' ELSE '' END)
+          AND receipt.displayed_at IS NULL
+          AND receipt.read_at IS NULL
+      )
+      SELECT * FROM eligible
+      ORDER BY resume_priority ASC,
+        CASE WHEN resume_priority = 0 THEN id END DESC,
+        CASE WHEN resume_priority = 1 THEN id END ASC
       LIMIT ?
     `).all(
       this.principalSessionId,
+      spaceId,
       petId,
       spaceId,
       deliveryMode,
-      Math.max(1, Math.min(limit, 50)),
+      boundedLimit,
     );
     return rows.map((row) => {
       const payload = parseJsonObject(row.payload_json);
@@ -9129,6 +9832,7 @@ export class SocialService {
         interaction_mode: payload.interactionMode ?? null,
         interaction_quorum: payload.interactionQuorum ?? null,
         interaction_closes_at: payload.interactionClosesAt ?? null,
+        interaction_choice_options: payload.interactionChoiceOptions ?? null,
         created_at: row.created_at,
         delivery: {
           state: row.read_at != null
@@ -9714,22 +10418,17 @@ export class SocialService {
   }
 
   worldStateSnapshotSummary(spaceId) {
-    const state = this.worldStateView(spaceId).value;
-    const entries = Object.entries(state).slice(0, 6);
-    if (entries.length === 0) {
-      return "这个世界刚刚开始，还没有发生需要回顾的事件。";
-    }
-    const rendered = entries.map(([key, value]) => {
-      if (["string", "number", "boolean"].includes(typeof value)) {
-        return `${key}：${String(value)}`;
-      }
-      if (Array.isArray(value)) return `${key}：${value.length} 项`;
-      if (value && typeof value === "object") {
-        return `${key}：${Object.keys(value).slice(0, 5).join("、") || "暂无内容"}`;
-      }
-      return key;
-    });
-    return `当前世界状态：${rendered.join("；")}`.slice(0, 1200);
+    // State keys are an implementation detail.  On entry there may be no
+    // event recap yet, so use the world's authored, player-facing opening
+    // instead of serializing an object such as world_progress/open_threads.
+    const world = this.requireSpace(spaceId);
+    const spec = this.currentWorldSpec(spaceId);
+    const opening = typeof spec?.entry_prompt === "string"
+      ? spec.entry_prompt.trim()
+      : "眼前有一件值得你亲自决定如何回应的事。";
+    // Entry guidance renders entry_prompt directly, while return guidance
+    // replaces this fallback with an explicit "no new changes" recap.
+    return `${world.name}目前没有需要补充的公开变化。${opening}`.slice(0, 1200);
   }
 
   worldContextSummary(spaceId, options = 3) {
@@ -9958,6 +10657,16 @@ export class SocialService {
       petId,
     );
     const waitingForOthers = participationContext.current_mode === "waiting";
+    const officialWorld = OFFICIAL_WORLD_BY_ID.has(world.id);
+    const hasConcreteEntryScene = spec.entry_prompt.trim().length > 0;
+    const genericCustomOnboarding =
+      !officialWorld &&
+      hasConcreteEntryScene &&
+      isGenericOnboardingChoices(onboarding.solo_choices) &&
+      isGenericOnboardingChoices(onboarding.starter_choices);
+    const playerFacingHostName = genericCustomOnboarding
+      ? `${world.name}主持人`
+      : config.name;
     const independentVisit =
       liveContext.other_present_count === 0 &&
       config.participation_policy.solo_enabled;
@@ -9983,14 +10692,15 @@ export class SocialService {
           : Number(journeyRow.last_departure_sequence ?? 0),
       },
     );
-    if (!firstVisit && contextSummary.startsWith("这个世界刚刚开始")) {
+    if (!firstVisit && contextSummary.includes("目前没有需要补充的公开变化")) {
       contextSummary = journeyRow.current_role
         ? `你离开后没有新的公开变化；当前身份仍是“${journeyRow.current_role}”，可以从上次进度继续。`
         : "你离开后没有新的公开变化，可以从上次进度继续。";
     }
+    const replayEntryScene = !firstVisit && !journeyRow.last_meaningful_at && hasConcreteEntryScene;
     const messageParts = waitingForOthers
       ? [
-          `${config.name}${firstVisit ? "欢迎你来到" : "欢迎你回到"}${world.name}。`,
+          `${playerFacingHostName}${firstVisit ? "欢迎你来到" : "欢迎你回到"}${world.name}。`,
           firstVisit ? onboarding.welcome_text : "",
           intersectionSummary,
           onboarding.solo_message || "你可以先选择参与方向。",
@@ -9998,12 +10708,12 @@ export class SocialService {
         ]
       : firstVisit
         ? [
-            `${config.name}欢迎你来到${world.name}。`,
-            onboarding.welcome_text,
-            contextSummary && !contextSummary.startsWith("这个世界刚刚开始")
-              ? `当前局势：${contextSummary}`
-              : "",
-            openLoops.length > 0
+            `${playerFacingHostName}欢迎你来到${world.name}。`,
+            genericCustomOnboarding ? "" : onboarding.welcome_text,
+            // Loop migration uses stable machine IDs for old open threads.
+            // The entry scene already supplies the player's immediate goal;
+            // never turn those IDs into first-visit copy.
+            !officialWorld && !genericCustomOnboarding && openLoops.length > 0
               ? `当前未解目标：${openLoops.slice(-3).join("；")}`
               : "",
             intersectionSummary,
@@ -10011,9 +10721,10 @@ export class SocialService {
             spec.entry_prompt,
           ]
         : [
-            `${config.name}欢迎你回到${world.name}。`,
+            `${playerFacingHostName}欢迎你回到${world.name}。`,
             contextSummary ? `上次之后：${contextSummary}` : "",
-            openLoops.length > 0
+            replayEntryScene ? spec.entry_prompt : "",
+            !replayEntryScene && !officialWorld && openLoops.length > 0
               ? `仍未解决：${openLoops.slice(-2).join("；")}`
               : "",
             intersectionSummary,
@@ -10024,10 +10735,20 @@ export class SocialService {
         )
       : firstVisit
         ? this.normalizeStoredHostChoices(
-            independentVisit && Array.isArray(onboarding.solo_choices)
+            genericCustomOnboarding
+              ? sceneGroundedStarterChoices(spec.entry_prompt)
+              : independentVisit && Array.isArray(onboarding.solo_choices)
               ? onboarding.solo_choices
               : onboarding.starter_choices,
           )
+        : replayEntryScene
+          ? this.normalizeStoredHostChoices(
+              genericCustomOnboarding
+                ? sceneGroundedStarterChoices(spec.entry_prompt)
+                : independentVisit && Array.isArray(onboarding.solo_choices)
+                  ? onboarding.solo_choices
+                  : onboarding.starter_choices,
+            )
         : this.normalizeStoredHostChoices(facilitation.next_actions);
     const choices = participationContext.consent_required
       ? [...this.multiplayerConsentChoices(), ...baseChoices].slice(0, 6)
@@ -10040,6 +10761,10 @@ export class SocialService {
     const objective = waitingForOthers
       ? onboarding.waiting_objective_text ||
         "先建立自己的方向；出现明确邀请或因果交汇时再决定是否回应。"
+      : replayEntryScene
+        ? spec.entry_prompt
+      : genericCustomOnboarding
+        ? spec.entry_prompt
       : independentVisit && onboarding.solo_objective_text
         ? onboarding.solo_objective_text
       : facilitation.objective_text || "找到一个适合自己的参与方式。";
@@ -10085,9 +10810,33 @@ export class SocialService {
       },
       input: { id: `entry:${world.id}:${petId}:${journeyRow.visit_count}`, event_type: "host.entry", body_text: objective },
     });
+    const playerFacingHost = genericCustomOnboarding
+      ? {
+          ...config,
+          name: playerFacingHostName,
+          onboarding_policy: {
+            ...config.onboarding_policy,
+            welcome_text: spec.entry_prompt,
+            setup_prompt: spec.entry_prompt,
+            solo_objective_text: spec.entry_prompt,
+            starter_choices: choices.map((choice) => ({ ...choice })),
+            solo_choices: choices.map((choice) => ({ ...choice })),
+          },
+          facilitation_policy: {
+            ...config.facilitation_policy,
+            objective_text: spec.entry_prompt,
+            next_actions: choices.map((choice) => ({ ...choice })),
+            free_input_prompt: freeInputPrompt,
+          },
+        }
+      : config;
     return {
       ...guidance,
-      host: config,
+      // This is the player-facing entry projection, not the administrator's
+      // immutable Host configuration. A concrete creator-authored opening
+      // must not carry generic builder placeholder copy into a standard
+      // world_visit response through nested metadata.
+      host: playerFacingHost,
       journey: this.worldMemberJourney(world.id, petId),
       loop_context: entryLoopContext,
       live_context: liveContext,
@@ -10296,6 +11045,10 @@ export class SocialService {
       }
     } else {
       kind = "clarification";
+      // Rejected/clarification/escalated turns must either offer Host-authored
+      // repairs tied to this failure or no buttons at all. Falling back to
+      // opening starters breaks the player's current situation.
+      offerNextActions = true;
       message = [
         judgement.outcome_text,
         judgement.reason_text ? `原因：${judgement.reason_text}` : "",
@@ -10317,12 +11070,21 @@ export class SocialService {
         : undefined;
     const judgedNextActions =
       judgement?.decision === "accepted" &&
-      Array.isArray(judgementResult.next_actions)
-        ? judgementResult.next_actions
-        : undefined;
+      Array.isArray(judgementResult.next_affordances)
+        ? judgementResult.next_affordances
+        : Array.isArray(judgementResult.next_actions)
+          ? judgementResult.next_actions
+          : undefined;
+    const repairNextActions =
+      judgement?.decision !== "accepted" &&
+      Array.isArray(judgementResult.repair_affordances)
+        ? judgementResult.repair_affordances
+        : [];
     const choices = this.normalizeStoredHostChoices(
       offerNextActions
-        ? Array.isArray(judgedNextActions) && judgedNextActions.length > 0
+        ? judgement?.decision !== "accepted"
+          ? repairNextActions
+          : Array.isArray(judgedNextActions) && judgedNextActions.length > 0
           ? judgedNextActions
           : Array.isArray(eventNextActions)
             ? eventNextActions
@@ -10639,6 +11401,15 @@ export class SocialService {
         },
       );
     }
+    // Enforce official mechanic invariants at the authoritative commit layer.
+    // Platform and creator-host entry points both converge here, so neither a
+    // lower-level API nor a future wrapper can bypass the same state contract.
+    this.enforceWorldMechanicStateContract({
+      worldId: world.id,
+      worldStatePatch,
+      memberStatePatch,
+      memberPetId: targetId,
+    });
     const beforeWorld = this.worldStateView(world.id);
     const beforeMember = targetId
       ? this.worldMemberStateView(world.id, targetId)
@@ -11187,11 +11958,11 @@ export class SocialService {
       elapsed_ms: input?.created_at
         ? Math.max(0, Date.now() - new Date(input.created_at).valueOf())
         : null,
+      // Exact executor/schema diagnostics stay in world_inputs and
+      // world_host_executors for operators. They are not player-facing text.
       error:
         processingState === "host_error" || processingState === "host_failed"
-          ? input?.host_last_error ??
-            executor?.last_error ??
-            "World Host processing failed."
+          ? "Host 暂时无法完成这次处理；行动已安全记录。"
           : null,
     };
     let delivery = null;

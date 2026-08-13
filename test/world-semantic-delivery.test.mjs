@@ -162,10 +162,11 @@ test("collective prompts and closure reach the snapshotted invited audience", as
     });
     const opened = await host.client.openWorldHostInteraction(world.id, {
       clientSessionId: "semantic-host",
-      promptText: "是否共同打开水闸？",
+      promptText: "是否共同打开水闸？公开选项 choice_id: open_gate。",
       mode: "quorum",
       quorum: 2,
       windowSeconds: 120,
+      choiceOptions: [{ choice_id: "open_gate", label: "打开水闸" }],
       expectedWorldStateVersion: 1,
     });
     for (const member of [first, second, observer]) {
@@ -202,6 +203,33 @@ test("collective prompts and closure reach the snapshotted invited audience", as
       (payload) => payload.interactionId === opened.interaction.id,
     ).length, 0, "the initiating Host is not interrupted by its own prompt");
 
+    const offlinePromptEvents = semanticEvents(
+      store,
+      offline.registration.pet.id,
+      "world.interaction_opened",
+      (payload) => payload.interactionId === opened.interaction.id,
+    );
+    assert.equal(offlinePromptEvents.length, 1,
+      "an eligible member who was offline when the window opened keeps a durable invitation");
+    const offlineActivity = (await offline.client.activity()).items.find(
+      (item) => item.interactionId === opened.interaction.id,
+    );
+    assert.equal(offlineActivity.replyToEventId, opened.prompt_event.id);
+    assert.deepEqual(offlineActivity.interactionChoiceOptions, [
+      { choice_id: "open_gate", label: "打开水闸" },
+    ]);
+    const offlineReturn = await offline.client.enterWorld(world.id, {
+      clientSessionId: "collective-offline-return-before-deadline",
+    });
+    const offlineInvitation = offlineReturn.resume_bundle.relevant_updates.find(
+      (update) => update.interaction_id === opened.interaction.id,
+    );
+    assert.equal(offlineInvitation.reply_to_event_id, opened.prompt_event.id);
+    assert.ok(offlineInvitation.interaction_closes_at);
+    assert.deepEqual(offlineInvitation.interaction_choice_options, [
+      { choice_id: "open_gate", label: "打开水闸" },
+    ]);
+
     for (const [member, key] of [[first, "first"], [second, "second"]]) {
       const resumed = await member.client.enterWorld(world.id, {
         clientSessionId: `collective-resume-${key}`,
@@ -216,6 +244,7 @@ test("collective prompts and closure reach the snapshotted invited audience", as
         inputType: "choice",
         eventType: "collective.vote",
         bodyText: `${key} agrees`,
+        data: { choice_id: "open_gate" },
         replyToEventId: invitation.reply_to_event_id,
         sceneId: invitation.scene_id ?? undefined,
         visibility: "actor",
@@ -267,29 +296,110 @@ test("collective prompts and closure reach the snapshotted invited audience", as
       (payload) => payload.outcomeEventId === resolved.outcome.id,
     );
     assert.equal(observerResults.length, 1);
+    const offlineResults = semanticEvents(
+      store,
+      offline.registration.pet.id,
+      "world.event_committed",
+      (payload) => payload.outcomeEventId === resolved.outcome.id,
+    );
+    assert.equal(offlineResults.length, 1,
+      "the collective result reuses the opening audience snapshot");
     assert.equal(
       JSON.parse(observerResults[0].payload_json).relevanceReason,
       "collective_participant_result",
     );
-    const offlineReturn = await offline.client.enterWorld(world.id, {
+    const offlineAfterResolution = await offline.client.enterWorld(world.id, {
       clientSessionId: "semantic-offline-return",
     });
-    assert.equal(offlineReturn.world_state.value.phase, "gate_open");
-    const offlineUpdate = offlineReturn.resume_bundle.relevant_updates.find(
-      (update) => update.relevance_reason === "shared_world_state_changed",
+    assert.equal(offlineAfterResolution.world_state.value.phase, "gate_open");
+    const offlineUpdate = offlineAfterResolution.resume_bundle.relevant_updates.find(
+      (update) => update.outcome_event_id === resolved.outcome.id,
     );
     assert.ok(offlineUpdate);
-    assert.equal(offlineUpdate.relevance_reason, "shared_world_state_changed");
+    assert.equal(offlineUpdate.relevance_reason, "collective_participant_result");
     const rawOfflinePayload = JSON.stringify(JSON.parse(semanticEvents(
       store,
       offline.registration.pet.id,
       "world.event_committed",
-      (payload) => payload.relevanceReason === "shared_world_state_changed",
+      (payload) => payload.outcomeEventId === resolved.outcome.id,
     )[0].payload_json));
-    assert.doesNotMatch(rawOfflinePayload, new RegExp(resolved.outcome.id));
+    assert.match(rawOfflinePayload, new RegExp(resolved.outcome.id));
     assert.doesNotMatch(rawOfflinePayload, /inputIds|participant_character_ids|participant_pet_ids/u);
     assert.doesNotMatch(rawOfflinePayload, new RegExp(first.registration.pet.id));
     assert.doesNotMatch(rawOfflinePayload, new RegExp(second.registration.pet.id));
+  } finally {
+    await app.close();
+    store.close();
+  }
+});
+
+test("resume prioritizes an unanswered collective invitation over an old ambient backlog", async () => {
+  const store = new PetSocialStore();
+  const app = createPetSocialApp({ store });
+  const address = await app.listen();
+  try {
+    const host = await registerClient(address, "resume-priority-host");
+    const offline = await registerClient(address, "resume-priority-offline");
+    const world = await createWorld(host.client, "resume-priority");
+    await host.client.enterWorld(world.id, { clientSessionId: "resume-priority-host" });
+    await offline.client.joinWorld(world.id, { ruleVersion: 1 });
+
+    // Simulate a long time away: these are valid unseen story updates, but
+    // none asks the returning player to make a decision.
+    for (let index = 0; index < 24; index += 1) {
+      store.createEvent(offline.registration.pet.id, "world.event_committed", {
+        worldId: world.id,
+        relevance: "contextual",
+        relevanceReason: "world_story_update",
+        deliveryPolicy: "ambient",
+        actionRequired: false,
+        outcomeText: `旧背景变化 ${index + 1}`,
+      });
+    }
+
+    await host.client.takeoverWorldHost(world.id, {
+      clientSessionId: "resume-priority-host",
+    });
+    const opened = await host.client.openWorldHostInteraction(world.id, {
+      clientSessionId: "resume-priority-host",
+      promptText: "请决定是否打开水闸。",
+      mode: "quorum",
+      quorum: 2,
+      windowSeconds: 120,
+      choiceOptions: [{ choice_id: "open_gate", label: "打开水闸" }],
+      expectedWorldStateVersion: 1,
+    });
+
+    for (const clientSessionId of ["resume-priority-first", "resume-priority-repeat"]) {
+      const entered = await offline.client.enterWorld(world.id, { clientSessionId });
+      const invitation = entered.resume_bundle.relevant_updates.find(
+        (update) => update.interaction_id === opened.interaction.id,
+      );
+      assert.ok(invitation, "a live collective invitation survives a >20 ambient backlog");
+      assert.equal(invitation.reply_to_event_id, opened.prompt_event.id);
+      assert.deepEqual(invitation.interaction_choice_options, [
+        { choice_id: "open_gate", label: "打开水闸" },
+      ]);
+      assert.ok(entered.resume_bundle.relevant_updates.length <= 20);
+    }
+
+    const resumed = await offline.client.enterWorld(world.id, {
+      clientSessionId: "resume-priority-act",
+    });
+    const invitation = resumed.resume_bundle.relevant_updates.find(
+      (update) => update.interaction_id === opened.interaction.id,
+    );
+    const response = await offline.client.actInWorld(world.id, {
+      inputType: "choice",
+      eventType: "collective.vote",
+      bodyText: "我选择打开水闸。",
+      data: { choice_id: invitation.interaction_choice_options[0].choice_id },
+      replyToEventId: invitation.reply_to_event_id,
+      sceneId: invitation.scene_id ?? undefined,
+      visibility: "actor",
+      idempotencyKey: "resume-priority-offline-response",
+    });
+    assert.equal(response.input.interaction_id, opened.interaction.id);
   } finally {
     await app.close();
     store.close();
@@ -334,6 +444,7 @@ test("Scene collective notifications reach participants and isolate unrelated me
       mode: "quorum",
       quorum: 2,
       windowSeconds: 120,
+      choiceOptions: [{ choice_id: "accept_scene_outcome", label: "接受当前结果" }],
       expectedWorldStateVersion: 1,
     });
     for (const participant of [first, second]) {
@@ -370,6 +481,7 @@ test("Scene collective notifications reach participants and isolate unrelated me
         inputType: "choice",
         eventType: "scene.collective_response",
         bodyText: `${key}在私有场景中回应。`,
+        data: { choice_id: "accept_scene_outcome" },
         replyToEventId: opened.prompt_event.id,
         sceneId,
         visibility: "actor",

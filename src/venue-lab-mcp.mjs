@@ -3,9 +3,10 @@
 import readline from "node:readline";
 
 import { addCharacterAliases } from "./character-aliases.mjs";
+import { actionableMcpError } from "./mcp-guidance.mjs";
 import { formatWorldCatalog } from "./world-tools.mjs";
 import { openDatabase } from "./venue-lab-core/database.js";
-import { asErrorPayload } from "./venue-lab-core/errors.js";
+import { fail } from "./venue-lab-core/errors.js";
 import { SocialService } from "./venue-lab-core/social-service.js";
 
 const WORLD_CONTENT_SECURITY_NOTICE =
@@ -54,9 +55,7 @@ const jsonObject = (description) => ({
 
 function requireExplicitConfirmation(args, action) {
   if (args?.confirmed === true) return;
-  const error = new Error(`${action} requires explicit confirmation.`);
-  error.code = "CONFIRMATION_REQUIRED";
-  throw error;
+  fail("CONFIRMATION_REQUIRED", `${action} requires explicit confirmation.`);
 }
 
 const tools = [
@@ -700,13 +699,19 @@ const tools = [
   },
   {
     name: "world_events_ack",
-    description: "在事件已经展示给用户后，持久记录该世界的已读游标。",
+    description: "仅在当前调用已实际展示 world_observe 返回的这一页后，按该页精确起止游标持久确认；不会把事件标成已读。",
     inputSchema: objectSchema(
       {
         world_id: text("准确的世界 ID。", 100),
-        through_sequence: integer("已展示到的事件游标。", 0, 2147483647),
+        after_sequence: integer("本次展示页的起始游标；原样复制 world_observe.displayed_range.after_sequence。", 0, 2147483647),
+        through_sequence: integer("本次展示页的末尾游标；原样复制 world_observe.displayed_range.through_sequence。", 0, 2147483647),
+        displayed: {
+          type: "boolean",
+          const: true,
+          description: "当前调用已把这一页的世界事件实际展示给用户。",
+        },
       },
-      ["world_id", "through_sequence"],
+      ["world_id", "after_sequence", "through_sequence", "displayed"],
     ),
   },
   {
@@ -911,8 +916,13 @@ const tools = [
           target_character_id: text("准确的好友 Character ID。", 100),
           target_pet_id: text("兼容字段：好友 Character 的旧 pet ID。", 100),
           body: text("准确的消息正文。", 4000),
+          confirmed: {
+            type: "boolean",
+            const: true,
+            description: "用户已看过准确收件人、私信频道和全文并明确确认发送。",
+          },
         },
-        ["body"],
+        ["body", "confirmed"],
       ),
       anyOf: [
         { required: ["target_character_id"] },
@@ -1176,14 +1186,22 @@ function callTool(name, args = {}) {
     case "world_enter":
       return service.enterWorld({ worldId: args.world_id });
     case "world_observe":
-      return {
-        security_notice: WORLD_CONTENT_SECURITY_NOTICE,
-        ...service.observeWorld({
+      {
+        const observed = service.observeWorld({
           worldId: args.world_id,
           afterSequence: args.after_sequence,
           limit: args.limit ?? 50,
-        }),
-      };
+        });
+        return {
+        security_notice: WORLD_CONTENT_SECURITY_NOTICE,
+          ...observed,
+          displayed_range: {
+            after_sequence:
+              args.after_sequence ?? observed.membership.last_seen_event_sequence,
+            through_sequence: observed.cursor,
+          },
+        };
+      }
     case "world_input_submit":
       return service.actInWorld({
         worldId: args.world_id,
@@ -1235,11 +1253,25 @@ function callTool(name, args = {}) {
         expectedMemberStateVersion: args.expected_member_state_version,
         applyProposedState: args.apply_proposed_state ?? true,
       });
-    case "world_events_ack":
+    case "world_events_ack": {
+      if (args.displayed !== true) {
+        fail("DISPLAY_REQUIRED", "World events must be displayed before acknowledgement.");
+      }
+      if (!Number.isInteger(args.after_sequence)) {
+        fail("INVALID_ARGUMENT", "after_sequence is required for the displayed World page.");
+      }
+      const current = service.observeWorld({ worldId: args.world_id, limit: 1 });
+      if (Number(args.after_sequence) !== Number(current.membership.last_seen_event_sequence)) {
+        fail(
+          "INVALID_CURSOR",
+          "The displayed page must start at the current unacknowledged World cursor.",
+        );
+      }
       return service.ackWorldEvents({
         worldId: args.world_id,
         throughSequence: args.through_sequence,
       });
+    }
     case "world_delegation_set":
       return service.setWorldDelegation({
         worldId: args.world_id,
@@ -1314,6 +1346,7 @@ function callTool(name, args = {}) {
         targetPetId: args.target_character_id ?? args.target_pet_id,
       });
     case "message_send":
+      requireExplicitConfirmation(args, "Sending a private message");
       return service.sendMessage({
         targetPetId: args.target_character_id ?? args.target_pet_id,
         body: args.body,
@@ -1390,7 +1423,7 @@ async function handle(message) {
         },
       });
     } catch (error) {
-      const value = asErrorPayload(error);
+      const value = actionableMcpError(error);
       send({
         jsonrpc: "2.0",
         id: message.id,

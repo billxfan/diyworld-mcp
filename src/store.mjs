@@ -1334,6 +1334,47 @@ export class PetSocialStore {
     })).reverse();
   }
 
+  listInboxPage(auth, { limit = 50, before = null } = {}) {
+    const boundedLimit = Math.max(1, Math.min(Number(limit) || 50, 100));
+    const cursor = before == null ? null : Number(before);
+    invariant(
+      cursor == null || (Number.isSafeInteger(cursor) && cursor > 0),
+      400,
+      "INVALID_CURSOR",
+      "Inbox cursor must be a positive stable cursor.",
+    );
+    const rows = this.db.prepare(`
+      SELECT m.rowid AS cursor_id, m.*, sp.display_name AS sender_name, sp.handle AS sender_handle,
+             rp.display_name AS recipient_name, rp.handle AS recipient_handle
+      FROM messages m
+      JOIN pets sp ON sp.id = m.sender_pet_id
+      JOIN pets rp ON rp.id = m.recipient_pet_id
+      WHERE (m.sender_pet_id = ? OR m.recipient_pet_id = ?)
+        AND (? IS NULL OR m.rowid < ?)
+      ORDER BY m.rowid DESC
+      LIMIT ?
+    `).all(auth.pet_id, auth.pet_id, cursor, cursor, boundedLimit + 1);
+    const hasMore = rows.length > boundedLimit;
+    const page = rows.slice(0, boundedLimit);
+    return {
+      messages: page.map((row) => ({
+        id: row.id,
+        conversationId: row.conversation_id,
+        sequenceNo: row.sequence_no,
+        direction: row.sender_pet_id === auth.pet_id ? "outgoing" : "incoming",
+        sender: { id: row.sender_pet_id, name: row.sender_name, handle: `@${row.sender_handle}` },
+        recipient: { id: row.recipient_pet_id, name: row.recipient_name, handle: `@${row.recipient_handle}` },
+        text: row.content_text,
+        status: row.status,
+        createdAt: row.created_at,
+      })),
+      order: "newest_first",
+      has_more: hasMore,
+      next_cursor: hasMore ? String(page[page.length - 1].cursor_id) : null,
+      complete: !hasMore,
+    };
+  }
+
   listEvents(auth, afterId = 0, limit = 200) {
     return this.db.prepare(`
       SELECT event.*, receipt.delivered_at, receipt.displayed_at,
@@ -1364,8 +1405,15 @@ export class PetSocialStore {
     }));
   }
 
-  listActivity(auth, { limit = 50 } = {}) {
+  listActivity(auth, { limit = 50, before = null, undisplayedOnly = false } = {}) {
     const boundedLimit = Math.max(1, Math.min(Number(limit) || 50, 100));
+    const cursor = before == null ? null : Number(before);
+    invariant(
+      cursor == null || (Number.isSafeInteger(cursor) && cursor > 0),
+      400,
+      "INVALID_CURSOR",
+      "Activity cursor must be a positive stable cursor.",
+    );
     const events = this.db.prepare(`
       SELECT event.*, receipt.delivered_at, receipt.displayed_at,
         receipt.read_at
@@ -1378,9 +1426,11 @@ export class PetSocialStore {
           OR event.event_type = 'world.event_committed'
           OR event.event_type = 'world.interaction_opened'
         )
+        AND (? IS NULL OR event.id < ?)
+        AND (? = 0 OR receipt.displayed_at IS NULL)
       ORDER BY event.id DESC
       LIMIT ?
-    `).all(auth.device_id, auth.pet_id, boundedLimit);
+    `).all(auth.device_id, auth.pet_id, cursor, cursor, undisplayedOnly ? 1 : 0, boundedLimit);
     return events.map((row) => {
       const payload = parseJson(row.payload_json, {});
       const delivery = {
@@ -1461,6 +1511,7 @@ export class PetSocialStore {
         interactionMode: payload.interactionMode ?? null,
         interactionQuorum: payload.interactionQuorum ?? null,
         interactionClosesAt: payload.interactionClosesAt ?? null,
+        interactionChoiceOptions: payload.interactionChoiceOptions ?? null,
         relevance:
           payload.relevance ??
           (payload.targetCharacterId === auth.pet_id ? "direct" : "legacy"),
@@ -1496,6 +1547,104 @@ export class PetSocialStore {
     });
   }
 
+  listActivityPage(auth, { limit = 50, before = null, undisplayedOnly = false } = {}) {
+    const boundedLimit = Math.max(1, Math.min(Number(limit) || 50, 100));
+    const cursor = before == null ? null : Number(before);
+    invariant(
+      cursor == null || (Number.isSafeInteger(cursor) && cursor > 0),
+      400,
+      "INVALID_CURSOR",
+      "Activity cursor must be a positive stable cursor.",
+    );
+    const events = this.db.prepare(`
+      SELECT event.id
+      FROM events event
+      LEFT JOIN event_receipts receipt
+        ON receipt.event_id = event.id AND receipt.device_id = ?
+      WHERE event.pet_id = ?
+        AND event.id IN (
+          SELECT id FROM events
+          WHERE pet_id = ?
+            AND (
+              event_type = 'message.created'
+              OR event_type = 'world.event_committed'
+              OR event_type = 'world.interaction_opened'
+            )
+        )
+        AND (? IS NULL OR event.id < ?)
+        AND (? = 0 OR receipt.displayed_at IS NULL)
+      ORDER BY event.id DESC
+      LIMIT ?
+    `).all(auth.device_id, auth.pet_id, auth.pet_id, cursor, cursor, undisplayedOnly ? 1 : 0, boundedLimit + 1);
+    const hasMore = events.length > boundedLimit;
+    const page = events.slice(0, boundedLimit);
+    const upper = page.length ? Number(page[0].id) + 1 : (cursor ?? Number.MAX_SAFE_INTEGER);
+    return {
+      items: this.listActivity(auth, { limit: boundedLimit, before: upper, undisplayedOnly }),
+      order: "newest_first",
+      has_more: hasMore,
+      next_cursor: hasMore ? String(page[page.length - 1].id) : null,
+      complete: !hasMore,
+    };
+  }
+
+  markWorldNotificationsDisplayed(auth, { worldId, afterSequence, throughSequence }) {
+    const after = Number(afterSequence);
+    const through = Number(throughSequence);
+    invariant(
+      Number.isSafeInteger(after) && after >= 0 && Number.isSafeInteger(through) && through >= after,
+      400,
+      "INVALID_CURSOR",
+      "Displayed World range must use valid after and through sequences.",
+    );
+    return this.transaction(() =>
+      this.markWorldNotificationsDisplayedInTransaction(auth, {
+        worldId,
+        afterSequence: after,
+        throughSequence: through,
+      }),
+    );
+  }
+
+  // The caller has already opened the encompassing transaction.  Keep receipt
+  // writes here so an acknowledgement can atomically advance its World cursor
+  // and mark only the page the client actually displayed.
+  markWorldNotificationsDisplayedInTransaction(auth, { worldId, afterSequence, throughSequence }) {
+    const after = Number(afterSequence);
+    const through = Number(throughSequence);
+    invariant(
+      Number.isSafeInteger(after) && after >= 0 && Number.isSafeInteger(through) && through >= after,
+      400,
+      "INVALID_CURSOR",
+      "Displayed World range must use valid after and through sequences.",
+    );
+    const timestamp = this.now();
+    const rows = this.db.prepare(`
+      SELECT event.id
+      FROM events event
+      WHERE event.pet_id = ?
+        AND event.event_type IN ('world.event_committed', 'world.interaction_opened')
+        AND json_extract(event.payload_json, '$.worldId') = ?
+        AND (
+          (
+            event.event_type = 'world.event_committed'
+            AND CAST(json_extract(event.payload_json, '$.outcomeSequence') AS INTEGER) > ?
+            AND CAST(json_extract(event.payload_json, '$.outcomeSequence') AS INTEGER) <= ?
+          )
+          OR (
+            event.event_type = 'world.interaction_opened'
+            AND CAST(json_extract(event.payload_json, '$.promptSequence') AS INTEGER) > ?
+            AND CAST(json_extract(event.payload_json, '$.promptSequence') AS INTEGER) <= ?
+          )
+        )
+    `).all(auth.pet_id, worldId, after, through, after, through);
+    for (const row of rows) {
+      this._recordEventReceipt(auth, row.id, "delivered", timestamp);
+      this._recordEventReceipt(auth, row.id, "displayed", timestamp);
+    }
+    return { displayed_event_ids: rows.map((row) => `evt_${row.id}`) };
+  }
+
   _recordEventReceipt(auth, eventId, state, timestamp) {
     invariant(
       new Set(["delivered", "displayed", "read"]).has(state),
@@ -1507,8 +1656,21 @@ export class PetSocialStore {
       .prepare("SELECT * FROM events WHERE id = ? AND pet_id = ?")
       .get(eventId, auth.pet_id);
     invariant(event, 404, "EVENT_NOT_FOUND", "Event was not found.");
+    const existing = this.db.prepare(`
+      SELECT delivered_at, displayed_at, read_at
+      FROM event_receipts WHERE event_id = ? AND device_id = ?
+    `).get(eventId, auth.device_id);
+    // Receipts describe what this particular client has actually done.  Do not
+    // manufacture intermediate states: a reader must first have displayed the
+    // activity on this same device.
+    if (state === "displayed" && !existing?.delivered_at && !existing?.displayed_at) {
+      throw new AppError(409, "DELIVERY_REQUIRED", "Mark this activity delivered before marking it displayed.");
+    }
+    if (state === "read" && !existing?.displayed_at && !existing?.read_at) {
+      throw new AppError(409, "DISPLAY_REQUIRED", "Display this activity on the current device before marking it read.");
+    }
     const deliveredAt = timestamp;
-    const displayedAt = state === "displayed" || state === "read" ? timestamp : null;
+    const displayedAt = state === "displayed" ? timestamp : null;
     const readAt = state === "read" ? timestamp : null;
     this.db.prepare(`
       INSERT INTO event_receipts (
@@ -1586,12 +1748,16 @@ export class PetSocialStore {
       const event = this.db.prepare("SELECT * FROM events WHERE id = ? AND pet_id = ?").get(eventId, auth.pet_id);
       invariant(event, 404, "EVENT_NOT_FOUND", "Event was not found.");
       this.db.prepare("INSERT OR IGNORE INTO event_acks (event_id, device_id, acked_at) VALUES (?, ?, ?)").run(eventId, auth.device_id, now);
+      // An acknowledgement means the bridge has both received and shown the
+      // item, but retain the two state transitions so the invariant is shared
+      // with the explicit receipt endpoint.
+      this._recordEventReceipt(auth, eventId, "delivered", now);
       const receipt = this._recordEventReceipt(auth, eventId, "displayed", now);
       return { acked: true, receipt, events: receipt.events };
     });
   }
 
-  markRead(auth, conversationId, maxSequenceNo) {
+  markRead(auth, conversationId, maxSequenceNo, { displayed = false } = {}) {
     const now = this.now();
     return this.transaction(() => {
       const conversation = this.db.prepare("SELECT * FROM conversations WHERE id = ?").get(conversationId);
@@ -1608,40 +1774,68 @@ export class PetSocialStore {
       const storedCurrent = this.db.prepare("SELECT max_sequence_no FROM read_cursors WHERE conversation_id = ? AND pet_id = ?").get(conversationId, auth.pet_id)?.max_sequence_no ?? 0;
       const current = Math.min(storedCurrent, maximum);
       const next = Math.max(current, Math.min(requested, maximum));
+      if (next === current) return { conversationId, maxSequenceNo: next, events: [] };
+      if (displayed === true) {
+        const eventIds = this.db.prepare(`
+          SELECT event.id FROM events event
+          JOIN messages message
+            ON message.id = json_extract(event.payload_json, '$.messageId')
+          WHERE event.pet_id = ? AND event.event_type = 'message.created'
+            AND message.conversation_id = ? AND message.recipient_pet_id = ?
+            AND message.sequence_no > ? AND message.sequence_no <= ?
+          ORDER BY message.sequence_no ASC
+        `).all(auth.pet_id, conversationId, auth.pet_id, current, next);
+        for (const { id } of eventIds) {
+          this._recordEventReceipt(auth, id, "delivered", now);
+          this._recordEventReceipt(auth, id, "displayed", now);
+        }
+      }
+      const undisplayed = this.db.prepare(`
+        SELECT message.id
+        FROM messages message
+        JOIN events event
+          ON event.pet_id = ? AND event.event_type = 'message.created'
+          AND json_extract(event.payload_json, '$.messageId') = message.id
+        LEFT JOIN event_receipts receipt
+          ON receipt.event_id = event.id AND receipt.device_id = ?
+        WHERE message.conversation_id = ? AND message.recipient_pet_id = ?
+          AND message.sequence_no > ? AND message.sequence_no <= ?
+          AND receipt.displayed_at IS NULL
+        LIMIT 1
+      `).get(auth.pet_id, auth.device_id, conversationId, auth.pet_id, current, next);
+      invariant(
+        !undisplayed,
+        409,
+        "DISPLAY_REQUIRED",
+        "Display every message on the current device before marking this conversation read.",
+      );
       this.db.prepare(`
         INSERT INTO read_cursors (conversation_id, pet_id, max_sequence_no, updated_at)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(conversation_id, pet_id)
         DO UPDATE SET max_sequence_no = excluded.max_sequence_no, updated_at = excluded.updated_at
       `).run(conversationId, auth.pet_id, next, now);
-      if (next === current) return { conversationId, maxSequenceNo: next, events: [] };
       this.db.prepare(`
         UPDATE messages SET status = 'read', read_at = COALESCE(read_at, ?)
         WHERE conversation_id = ? AND recipient_pet_id = ?
           AND sequence_no > ? AND sequence_no <= ?
       `).run(now, conversationId, auth.pet_id, current, next);
       this.db.prepare(`
-        INSERT INTO event_receipts (
-          event_id, device_id, delivered_at, displayed_at, read_at, updated_at
-        )
-        SELECT event.id, ?, ?, ?, ?, ?
-        FROM events event
-        JOIN messages message
-          ON message.id = json_extract(event.payload_json, '$.messageId')
-        WHERE event.pet_id = ? AND event.event_type = 'message.created'
-          AND message.conversation_id = ? AND message.recipient_pet_id = ?
-          AND message.sequence_no > ? AND message.sequence_no <= ?
-        ON CONFLICT(event_id, device_id) DO UPDATE SET
-          delivered_at = COALESCE(event_receipts.delivered_at, excluded.delivered_at),
-          displayed_at = COALESCE(event_receipts.displayed_at, excluded.displayed_at),
-          read_at = COALESCE(event_receipts.read_at, excluded.read_at),
-          updated_at = excluded.updated_at
+        UPDATE event_receipts
+        SET read_at = COALESCE(read_at, ?), updated_at = ?
+        WHERE device_id = ? AND displayed_at IS NOT NULL
+          AND event_id IN (
+            SELECT event.id FROM events event
+            JOIN messages message
+              ON message.id = json_extract(event.payload_json, '$.messageId')
+            WHERE event.pet_id = ? AND event.event_type = 'message.created'
+              AND message.conversation_id = ? AND message.recipient_pet_id = ?
+              AND message.sequence_no > ? AND message.sequence_no <= ?
+          )
       `).run(
+        now,
+        now,
         auth.device_id,
-        now,
-        now,
-        now,
-        now,
         auth.pet_id,
         conversationId,
         auth.pet_id,

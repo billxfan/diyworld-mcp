@@ -43,6 +43,37 @@ function expectCode(fn, code) {
   );
 }
 
+test("an idempotency key cannot be reused for a different normalized World action", () => {
+  const { db, visitor, worldId } = createFixture();
+  try {
+    const first = visitor.actInWorld({
+      worldId,
+      eventType: "speak",
+      bodyText: "我先去码头看看。",
+      data: { route: "dock", tags: ["观察"] },
+      idempotencyKey: "semantic-idempotency-key",
+    });
+    const replay = visitor.actInWorld({
+      worldId,
+      eventType: "speak",
+      bodyText: "我先去码头看看。",
+      // Key order must not turn an exact replay into a conflict.
+      data: { tags: ["观察"], route: "dock" },
+      idempotencyKey: "semantic-idempotency-key",
+    });
+    assert.equal(replay.input.id, first.input.id);
+    expectCode(() => visitor.actInWorld({
+      worldId,
+      eventType: "speak",
+      bodyText: "我改去灯塔看看。",
+      data: { route: "lighthouse", tags: ["观察"] },
+      idempotencyKey: "semantic-idempotency-key",
+    }), "IDEMPOTENCY_CONFLICT");
+  } finally {
+    db.close();
+  }
+});
+
 test("world profile, behavior spec, and member rules have independent versions", () => {
   const { db, owner, visitor, worldId } = createFixture();
   try {
@@ -198,8 +229,10 @@ test("direct worlds atomically commit intent, outcome, local state, and retry sa
       worldId,
       eventType: "build",
       bodyText: "我用木头搭一个挡雨棚。",
-      proposedWorldStatePatch: { camp: { wood: 99 } },
+      proposedWorldStatePatch: { camp: { wood: 3, shelter: true } },
+      proposedMemberStatePatch: { role: "scout", stamina: 8 },
       expectedWorldStateVersion: 1,
+      expectedMemberStateVersion: 1,
       idempotencyKey: "build-shelter-1",
     });
     assert.equal(retried.world_state.version, 2);

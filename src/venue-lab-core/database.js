@@ -452,6 +452,16 @@ export function openDatabase(path = ":memory:") {
       updated_at TEXT NOT NULL
     );
 
+    -- Server-only facts are deliberately separate from world_states and
+    -- world_events: those stores have player/collective projections.
+    CREATE TABLE IF NOT EXISTS world_host_private_facts (
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      fact_key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      sealed_at TEXT NOT NULL,
+      PRIMARY KEY (space_id, fact_key)
+    );
+
     CREATE TABLE IF NOT EXISTS world_member_states (
       space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
       pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
@@ -548,6 +558,17 @@ export function openDatabase(path = ":memory:") {
     "publication_status",
     "TEXT NOT NULL DEFAULT 'published'",
   );
+  // Kept outside the public state/event projection. CREATE IF NOT EXISTS above
+  // upgrades existing installations without rewriting their saved Worlds.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS world_host_private_facts (
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      fact_key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      sealed_at TEXT NOT NULL,
+      PRIMARY KEY (space_id, fact_key)
+    );
+  `);
   ensureColumn(db, "spaces", "definition_text", "TEXT NOT NULL DEFAULT ''");
   ensureColumn(db, "spaces", "published_at", "TEXT");
   ensureColumn(db, "spaces", "profile_version", "INTEGER NOT NULL DEFAULT 1");
@@ -594,6 +615,15 @@ export function openDatabase(path = ":memory:") {
 
 export function migrateWorldRuntime(db) {
   const timestamp = new Date().toISOString();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS world_host_private_facts (
+      space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+      fact_key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      sealed_at TEXT NOT NULL,
+      PRIMARY KEY (space_id, fact_key)
+    );
+  `);
   ensureColumn(
     db,
     "spaces",
@@ -764,6 +794,7 @@ export function migrateWorldRuntime(db) {
       host_attempt_count INTEGER NOT NULL DEFAULT 0,
       host_last_error TEXT,
       host_failed_at TEXT,
+      idempotency_fingerprint TEXT,
       status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN (
           'pending', 'accepted', 'rejected', 'clarification', 'escalated'
@@ -1222,6 +1253,10 @@ export function migrateWorldRuntime(db) {
   );
   ensureColumn(db, "world_inputs", "host_last_error", "TEXT");
   ensureColumn(db, "world_inputs", "host_failed_at", "TEXT");
+  // Null is intentionally retained for inputs created before this migration:
+  // those idempotency keys remain replayable, while all new inputs bind a key
+  // to the normalized request semantics.
+  ensureColumn(db, "world_inputs", "idempotency_fingerprint", "TEXT");
   ensureColumn(
     db,
     "world_interactions",

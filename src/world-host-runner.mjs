@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 
 import { CodexAppServerClient } from "./codex-app-server.mjs";
 import { SocialService } from "./venue-lab-core/social-service.js";
+import { enqueueWorldDelivery } from "./world-delivery-outbox.mjs";
 import {
   WORLD_LOOP_CONTRACT_VERSION,
   WORLD_LOOP_SCOPES,
@@ -63,6 +64,217 @@ const FORBIDDEN_DELIVERY_RESULT_FIELDS = new Set([
   "audience_pet_id",
   "target_pet_id",
 ]);
+
+// These words name runtime machinery, not anything a player can perceive in a
+// scene.  Keep this deliberately narrow: fictional uses of words such as
+// "状态" are fine, while leaking a contract or state-machine label is not.
+const PLAYER_FACING_INTERNAL_TERMS = /(?:world_progress|open_threads|member_state|world_state|next_affordances|next_actions|loop_transition|状态机|内部字段|\b(?:Loop|Beat|Truth Package)\b)/iu;
+const PLAYER_ACTION_INPUT_TYPES = new Set(["speech", "action", "choice"]);
+const PLAYER_ACTION_VISIBILITIES = new Set(["world", "actor", "managers"]);
+const GENERIC_ACTION = /^(?:继续|下一步|看看|看一看|等待|等等|继续看看|继续前进|继续探索|先看看|再看看|continue|next|look|wait|keep going|go on)[！!。,.，、\s]*$/iu;
+const GENERIC_GROUNDING_TERMS = new Set([
+  "世界", "主持", "行动", "输入", "结果", "现场", "痕迹", "变化", "尝试",
+  "处理", "继续", "下一步", "当前", "这里", "那里", "事情", "情况",
+  "状态", "具体", "发生", "已经", "更新", "完成", "可以", "进行", "相关",
+  "眼前", "本轮", "这次", "这个", "那个", "查看", "检查", "确认", "玩家",
+  "world", "host", "action", "input", "result", "scene", "trace", "change",
+]);
+const GENERIC_GROUNDING_PHRASES = [
+  "现场状态", "具体变化", "发生变化", "已经发生", "已经更新", "状态更新",
+  "当前状态", "世界状态", "处理结果", "完成处理", "留下痕迹", "可见痕迹",
+  "眼前情况", "相关情况", "继续确认", "具体行动",
+];
+// Naming an object is not, by itself, a consequence.  These are the common
+// Host-shaped status messages that sound like an acknowledgement while giving
+// a player nothing they can picture, react to, or build on.  This deliberately
+// matches only a whole short clause: "the bundle is still dripping" and "the
+// bundle was pulled onto the rim" remain valid, as do normal English results.
+const VACUOUS_CONSEQUENCE_STATEMENT = /^(?:[^,，。；;:：!?！？]*?)(?:的)?(?:状态|情况|现场|结果)?(?:已经|已|已有|有了|发生(?:了)?|正在)?(?:更新|改变|变化|处理|回应|完成|记录)(?:了)?[。!！]?$/iu;
+
+function playerFacingText(value, field, { min = 1, max = 4000 } = {}) {
+  const text = string(value, field, { min, max });
+  if (PLAYER_FACING_INTERNAL_TERMS.test(text)) {
+    throw new Error(`${field} must not expose World Host internal terminology`);
+  }
+  return text;
+}
+
+function actionAnchors(result) {
+  const values = [
+    ...(Array.isArray(result.effects) ? result.effects.map((item) => item?.summary) : []),
+    ...(Array.isArray(result.new_facts) ? result.new_facts : []),
+    ...(Array.isArray(result.opened_hooks) ? result.opened_hooks : []),
+    ...(Array.isArray(result.affected_entities) ? result.affected_entities.flatMap((item) => [item?.entity_id, item?.effect_kind]) : []),
+  ].filter((value) => typeof value === "string").join(" ").toLocaleLowerCase();
+  return values;
+}
+
+function actionIsGrounded(item, anchors) {
+  const action = `${item.label ?? ""} ${item.body_text ?? ""}`.trim().toLocaleLowerCase();
+  if (GENERIC_ACTION.test(action) || !anchors) return false;
+  const latin = action.match(/[a-z0-9][a-z0-9_-]{2,}/giu) ?? [];
+  if (latin.some((token) => anchors.includes(token.toLocaleLowerCase()))) return true;
+  // Chinese has no whitespace token boundary. Require a meaningful 3-character
+  // shared fragment so generic verbs such as “查看” cannot anchor themselves.
+  const han = action.match(/[\p{Script=Han}]{3,}/gu) ?? [];
+  return han.some((token) => [...token].some((_, index) => index + 3 <= [...token].length && anchors.includes([...token].slice(index, index + 3).join(""))));
+}
+
+function groundingTokens(value) {
+  let normalized = String(value ?? "").normalize("NFKC").toLocaleLowerCase();
+  for (const phrase of GENERIC_GROUNDING_PHRASES) {
+    normalized = normalized.replaceAll(phrase, " ");
+  }
+  const tokens = new Set();
+  for (const token of normalized.match(/[a-z0-9][a-z0-9_-]{2,}/giu) ?? []) {
+    if (!GENERIC_GROUNDING_TERMS.has(token)) tokens.add(token);
+  }
+  for (const run of normalized.match(/[\p{Script=Han}]{2,}/gu) ?? []) {
+    const chars = [...run];
+    for (const size of [2, 3, 4]) {
+      for (let index = 0; index + size <= chars.length; index += 1) {
+        const token = chars.slice(index, index + size).join("");
+        if (!GENERIC_GROUNDING_TERMS.has(token)) tokens.add(token);
+      }
+    }
+  }
+  return tokens;
+}
+
+function playerExperienceText(result, outcomeText, reasonText) {
+  return [
+    outcomeText,
+    reasonText,
+    ...(result.effects ?? []).map((item) => item?.summary),
+    ...(result.new_facts ?? []),
+    ...(result.opened_hooks ?? []),
+    ...(result.next_affordances ?? []).flatMap((item) => [item?.label, item?.body_text]),
+  ].filter((value) => typeof value === "string").join("\n");
+}
+
+function consequenceText(result, outcomeText) {
+  return [
+    outcomeText,
+    ...(result.effects ?? []).map((item) => item?.summary),
+    ...(result.new_facts ?? []),
+    ...(result.opened_hooks ?? []),
+  ].filter((value) => typeof value === "string").join("\n");
+}
+
+function hasPerceivableConsequence(result, outcomeText) {
+  // `affected_entities` is deliberately not evidence here.  IDs and an
+  // `effect_kind: changed` can make a structurally valid response that still
+  // leaves the player asking "so, what happened?".
+  const statements = [
+    outcomeText,
+    ...(result.effects ?? []).map((item) => item?.summary),
+  ].filter((value) => typeof value === "string" && value.trim());
+  return statements.some((statement) => !VACUOUS_CONSEQUENCE_STATEMENT.test(statement.trim()));
+}
+
+function externalGroundingTokens(groundingContext) {
+  const sources = [
+    groundingContext?.input?.body_text,
+    groundingContext?.world?.entry_prompt,
+    groundingContext?.world?.specification?.entry_prompt,
+    groundingContext?.director_plan?.scene_contract?.required_hook,
+    groundingContext?.director_plan?.selection?.beat?.scene,
+    groundingContext?.director_plan?.selection?.beat?.description,
+    groundingContext?.director_plan?.selection?.beat?.prompt,
+  ].filter((value) => typeof value === "string" && value.trim());
+  return new Set(sources.flatMap((value) => [...groundingTokens(value)]));
+}
+
+function sharesGroundingToken(value, sourceTokens) {
+  const tokens = groundingTokens(value);
+  return [...sourceTokens].some((token) => tokens.has(token));
+}
+
+function validateExternalGrounding(result, outcomeText, reasonText, groundingContext) {
+  if (!groundingContext) return;
+  const sourceTokens = externalGroundingTokens(groundingContext);
+  if (sourceTokens.size === 0) return;
+  if (!sharesGroundingToken(consequenceText(result, outcomeText), sourceTokens)) {
+    throw new Error(
+      "accepted player-facing outcome must name a concrete entity or fact from the player's input or current World scene",
+    );
+  }
+  for (const [index, affordance] of (result.next_affordances ?? []).entries()) {
+    if (!sharesGroundingToken(`${affordance?.label ?? ""} ${affordance?.body_text ?? ""}`, sourceTokens)) {
+      throw new Error(
+        `result.next_affordances[${index}] must name a concrete entity or fact from the player's input or current World scene`,
+      );
+    }
+  }
+}
+
+function validatePlayerAffordances(result, field, { required = false } = {}) {
+  const affordances = array(result[field], `result.${field}`, { optional: !required, min: required ? 1 : 0, max: 3 });
+  if (!affordances) return;
+  const anchors = actionAnchors(result);
+  for (const [index, item] of affordances.entries()) {
+    object(item, `result.${field}[${index}]`);
+    playerFacingText(item.label, `result.${field}[${index}].label`, { min: 2, max: 160 });
+    playerFacingText(item.body_text, `result.${field}[${index}].body_text`, { min: 2, max: 4000 });
+    if (!PLAYER_ACTION_INPUT_TYPES.has(string(item.input_type, `result.${field}[${index}].input_type`, { min: 1, max: 40 }))) throw new Error(`result.${field}[${index}].input_type is not actionable`);
+    string(item.event_type, `result.${field}[${index}].event_type`, { min: 1, max: 80 });
+    if (!PLAYER_ACTION_VISIBILITIES.has(string(item.visibility, `result.${field}[${index}].visibility`, { min: 1, max: 40 }))) throw new Error(`result.${field}[${index}].visibility is unsupported`);
+    if (!actionIsGrounded(item, anchors)) throw new Error(`result.${field}[${index}] must name a concrete fact, effect, hook, or affected entity from this turn`);
+  }
+}
+
+function validateAcceptedPlayerExperience(
+  result,
+  outcomeText,
+  reasonText,
+  groundingContext,
+) {
+  // A successful adjudication must give the player a tangible consequence,
+  // identify what changed, and offer a small set of genuinely usable next
+  // attempts.  Rejection/clarification intentionally keep their older, more
+  // permissive contract.
+  playerFacingText(outcomeText, "outcome_text", { min: 8, max: 4000 });
+  playerFacingText(reasonText, "reason_text", { min: 1, max: 4000 });
+  const effects = array(result.effects, "result.effects", { min: 1, max: 50 });
+  const affectedEntities = array(result.affected_entities, "result.affected_entities", {
+    min: 1, max: 100,
+  });
+  for (const [index, item] of effects.entries()) {
+    object(item, `result.effects[${index}]`);
+    string(item.kind, `result.effects[${index}].kind`, { min: 1, max: 120 });
+    playerFacingText(item.summary, `result.effects[${index}].summary`, {
+      min: 1, max: 1000,
+    });
+  }
+  if (!hasPerceivableConsequence(result, outcomeText)) {
+    throw new Error(
+      "accepted player-facing outcome and effects must describe an action result, new concrete fact, or perceivable state; a status update alone is not a consequence",
+    );
+  }
+  for (const [index, item] of affectedEntities.entries()) {
+    object(item, `result.affected_entities[${index}]`);
+    string(item.entity_type, `result.affected_entities[${index}].entity_type`, { min: 1, max: 80 });
+    string(item.entity_id, `result.affected_entities[${index}].entity_id`, { min: 1, max: 240 });
+    string(item.effect_kind, `result.affected_entities[${index}].effect_kind`, { min: 1, max: 120 });
+  }
+  for (const field of ["new_facts", "opened_hooks"]) {
+    if (result[field] === undefined) continue;
+    const items = array(result[field], `result.${field}`, { max: 50 });
+    for (const [index, item] of items.entries()) {
+      playerFacingText(item, `result.${field}[${index}]`, { min: 1, max: 1000 });
+    }
+  }
+  validatePlayerAffordances(result, "next_affordances", { required: true });
+  validateExternalGrounding(result, outcomeText, reasonText, groundingContext);
+}
+
+function validateNonAcceptedPlayerExperience(result, outcomeText, reasonText) {
+  playerFacingText(outcomeText, "outcome_text", { min: 4, max: 4000 });
+  playerFacingText(reasonText, "reason_text", { min: 1, max: 4000 });
+  // A repair option must point at the missing/blocked object, not reset the
+  // player to an unrelated onboarding menu.
+  validatePlayerAffordances(result, "repair_affordances");
+}
 
 function parseLoopResult(result) {
   for (const key of Object.keys(result)) {
@@ -269,6 +481,7 @@ export function parseWorldHostDecision(
     directorPlan = null,
     requireLoopContract = null,
     allowLoopTransition = true,
+    groundingContext = null,
   } = {},
 ) {
   const raw = String(text ?? "").trim();
@@ -306,6 +519,11 @@ export function parseWorldHostDecision(
     throw new Error("Only an accepted World Host decision may include state patches");
   }
   const result = object(parsed.result ?? {}, "result");
+  const reasonText = string(parsed.reason_text, "reason_text", { max: 4000 });
+  const outcomeText = string(parsed.outcome_text, "outcome_text", {
+    min: 1,
+    max: 4000,
+  });
   const loopResult = parseLoopResult(result);
   const strictV3 = requireLoopContract ?? (
     Number(directorPlan?.contract_version ?? 0) >= 3 &&
@@ -327,14 +545,29 @@ export function parseWorldHostDecision(
     );
   }
   validateLoopTransitionAgainstDirectorPlan(loopResult, directorPlan);
+  // Standalone parsing remains able to read legacy persisted v1/v2 results.
+  // Every live Host execution supplies requireLoopContract (or a v3 plan), so
+  // new player-visible decisions always pass the experience gate.
+  if (decision === "accepted" && (strictV3 || requireLoopContract !== null)) {
+    validateAcceptedPlayerExperience(
+      result,
+      outcomeText,
+      reasonText,
+      groundingContext,
+    );
+    // The older next_actions field is what existing clients persist and show.
+    // Canonicalize it from the Host contract so an accepted turn never falls
+    // back to unrelated opening choices.
+    result.next_actions = result.next_affordances.map((item) => ({ ...item }));
+  } else if (requireLoopContract !== null) {
+    validateNonAcceptedPlayerExperience(result, outcomeText, reasonText);
+    if (Array.isArray(result.repair_affordances)) result.next_actions = result.repair_affordances.map((item) => ({ ...item }));
+  }
   return {
     decision,
     resolutionDisposition,
-    reasonText: string(parsed.reason_text, "reason_text", { max: 4000 }),
-    outcomeText: string(parsed.outcome_text, "outcome_text", {
-      min: 1,
-      max: 4000,
-    }),
+    reasonText,
+    outcomeText,
     result,
     loopTransition: loopResult?.transition ?? null,
     effects: loopResult?.effects ?? [],
@@ -373,7 +606,7 @@ export function worldHostPrompt(work) {
     batchMode
       ? "Do not claim an actor Loop changed as part of collective settlement."
       : "result.loop_transition is a proposal until the server validates and commits it. Do not claim that it was applied merely because the World judgement was accepted. The server must return the applied transition receipt described by director_plan.loop_transition_contract.applied_receipt; only that receipt proves the Loop transition was applied.",
-    "For every accepted decision, result must also include effects, affected_entities, and 1-3 next_affordances arrays. Every item in all three arrays must be a JSON object, never a bare string or ID. Use affected_entities items shaped like { entity_type, entity_id, effect_kind }; use next_affordances items shaped like { label, input_type, event_type, body_text, visibility }. next_affordances describe concrete actions the actor may attempt; they do not decide outcomes.",
+    "For every accepted decision, outcome_text, effects, and next_affordances must name at least one concrete person, place, object, or fact from the member's input or the current World scene; generic phrases such as 'processed the input', 'the scene changed', or 'a trace was left' are invalid even when structurally complete. result must also include effects, affected_entities, and 1-3 next_affordances arrays. Every item in all three arrays must be a JSON object, never a bare string or ID. Use effects items shaped like { kind, summary }; affected_entities items shaped like { entity_type, entity_id, effect_kind }; and next_affordances items shaped like { label, input_type, event_type, body_text, visibility }. next_affordances describe concrete actions the actor may attempt; they do not decide outcomes.",
     "result.impact_hints may describe semantic kind, reason, urgency, and relationship to the current Loop. Never provide recipient IDs, recipient lists, delivery decisions, delivery state, displayed state, or read state. The server impact router alone determines recipients and delivery timing from committed facts.",
     "If host.judgement_policy.world_mechanics.state_contract is present, patch only its declared top-level keys and preserve unrelated state. Apply the World-specific loop, tension, progression, and host directives when judging the result.",
     "If host.judgement_policy.world_mechanics.settlement.hidden_rule_policy.mutable_after_first_observation is false, any existing observed or verified anomaly rule is immutable: copy its id and claim text exactly. A confirming observation may only advance metadata such as status or confirmations; put narrower conditions, interpretations, and unresolved causality in new_facts, opened_hooks, disputed records, or a new rule ID instead of rewriting the existing claim.",
@@ -442,6 +675,48 @@ export class LocalCodexWorldHostRunner {
   }
 
   start({ prewarmPublishedWorlds = false } = {}) {
+    // Recover a process that stopped after a deadline but before its timer
+    // executed. Empty windows must not remain ready forever or occupy the
+    // one-active-window slot.
+    const timestamp = new Date().toISOString();
+    const emptyExpired = this.db.prepare(`
+      SELECT interaction.* FROM world_interactions interaction
+      WHERE interaction.status IN ('open', 'ready') AND interaction.closes_at <= ?
+        AND NOT EXISTS (
+          SELECT 1 FROM world_inputs input
+          WHERE input.interaction_id = interaction.id
+        )
+    `).all(timestamp);
+    this.db.prepare(`
+      UPDATE world_interactions
+      SET status = 'cancelled', resolved_at = COALESCE(resolved_at, ?),
+        host_last_error = COALESCE(host_last_error, 'NO_RESPONSES')
+      WHERE status IN ('open', 'ready') AND closes_at <= ?
+        AND NOT EXISTS (
+          SELECT 1 FROM world_inputs input
+          WHERE input.interaction_id = world_interactions.id
+        )
+    `).run(timestamp, timestamp);
+    for (const interaction of emptyExpired) {
+      enqueueWorldDelivery(this.db, {
+        worldId: interaction.space_id,
+        sourceWorldEventId: interaction.prompt_event_id,
+        sourceInteractionId: interaction.id,
+        eventType: "world.event_committed",
+        dedupeKey: `world:${interaction.space_id}:interaction-cancelled:${interaction.id}`,
+        envelope: {
+          interactionId: interaction.id,
+          sceneId: interaction.scene_id ?? null,
+          outcomeText: "本轮集体互动在截止前无人回应，现已取消；没有产生集体决定或世界变化。",
+          outcomeEventType: "world.interaction_cancelled",
+          interactionStatus: "cancelled",
+          closesAt: interaction.closes_at,
+          visibility: "world",
+          actorPetId: null,
+        },
+        timestamp,
+      });
+    }
     const worlds = this.db
       .prepare(`
         SELECT DISTINCT input.space_id
@@ -893,6 +1168,7 @@ export class LocalCodexWorldHostRunner {
           directorPlan: work.director_plan,
           requireLoopContract: next.kind !== "interaction",
           allowLoopTransition: next.kind !== "interaction",
+          groundingContext: next.kind === "interaction" ? null : work,
         });
         if (next.kind === "interaction" && decision.memberStatePatch !== undefined) {
           throw new Error(

@@ -194,11 +194,14 @@ test("messages reject whitespace and read cursors cannot jump beyond existing hi
       });
     }, (error) => error.code === "INVALID_MESSAGE");
 
-    store.sendMessage(left.auth, {
+    const sent = store.sendMessage(left.auth, {
       conversationId: relationship.conversationId,
       clientMessageId: "real-message",
       text: "hello"
     });
+    const received = sent.events[0];
+    store.recordEventReceipt(right.auth, received.id, "delivered");
+    store.recordEventReceipt(right.auth, received.id, "displayed");
     const firstRead = store.markRead(right.auth, relationship.conversationId, 999);
     assert.equal(firstRead.maxSequenceNo, 1);
     assert.equal(firstRead.events.length, 1);

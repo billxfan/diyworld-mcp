@@ -66,6 +66,11 @@ test("every official World provides an isolated Host and an immediate solo actio
         `world-agent:${definition.id}`,
       );
       assert.equal(entered.host_guidance.kind, "welcome");
+      assert.doesNotMatch(
+        JSON.stringify(entered.host_guidance),
+        /当前未解目标：继续你的个人旅程|继续你的个人旅程/u,
+        definition.id,
+      );
       assert.equal(entered.host_guidance.host.name, definition.host.name);
       assert.match(entered.host_guidance.message, /没有其他真人在线也可以完成完整玩法循环/);
       assert.doesNotMatch(entered.host_guidance.message, /真人成员|实时会话/u);
@@ -78,6 +83,17 @@ test("every official World provides an isolated Host and an immediate solo actio
         ),
       );
       assert.equal(entered.host_guidance.choices.length, 3);
+      // Thread IDs are stable storage keys, not story copy. A first-time
+      // visitor must receive the authored scene instead of "missing-cat" or
+      // another implementation label.
+      for (const thread of definition.initialState.world_progress.open_threads) {
+        assert.doesNotMatch(
+          entered.host_guidance.message,
+          new RegExp(thread.id.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"),
+          definition.id,
+        );
+      }
+      assert.match(entered.host_guidance.message, new RegExp(definition.entryPrompt.slice(0, 12), "u"));
       assert.doesNotMatch(
         `${definition.description} ${entered.host_guidance.host.onboarding_policy.welcome_text} ${entered.host_guidance.choices.map((choice) => choice.label).join(" ")}`,
         /Truth Package|Beat|状态机|置信度|暴露值|推进一个任务节点|可证伪假说/u,
@@ -88,6 +104,34 @@ test("every official World provides an isolated Host and an immediate solo actio
         entered.host_guidance.participation_context.participation_style,
         "independent_until_causal_intersection",
       );
+      visitor.leaveWorld({ worldId: definition.id });
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test("official Worlds replay a readable opening scene when a visitor returns before acting", () => {
+  const db = openDatabase(":memory:");
+  const visitor = createCharacter(db, "official-empty-return-visitor", "空跑回访者");
+  try {
+    for (const definition of OFFICIAL_WORLDS) {
+      visitor.joinWorld({ worldId: definition.id, ruleVersion: OFFICIAL_WORLD_VERSION });
+      visitor.enterWorld({ worldId: definition.id, clientSessionId: `empty-first:${definition.slug}` });
+      visitor.leaveWorld({ worldId: definition.id });
+      const returned = visitor.enterWorld({
+        worldId: definition.id,
+        clientSessionId: `empty-return:${definition.slug}`,
+      });
+      assert.match(returned.host_guidance.message, new RegExp(definition.entryPrompt.slice(0, 12), "u"));
+      for (const thread of definition.initialState.world_progress.open_threads) {
+        assert.doesNotMatch(
+          returned.host_guidance.message,
+          new RegExp(thread.id.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"),
+          definition.id,
+        );
+      }
+      assert.equal(returned.host_guidance.choices.length, 3);
       visitor.leaveWorld({ worldId: definition.id });
     }
   } finally {
@@ -465,6 +509,106 @@ test("official semantic contracts reject impossible ledgers and rewritten locked
         }),
       (error) => error.code === "WORLD_STATE_CONTRACT_VIOLATION",
     );
+  } finally {
+    db.close();
+  }
+});
+
+test("authoritative judgement rejects an invalid official state patch atomically", () => {
+  const db = openDatabase(":memory:");
+  const visitor = new SocialService(db, "official-commit-guard", {
+    platformHostMode: "local_codex",
+  });
+  visitor.getOrCreatePet({ name: "提交层守门员" });
+  const worldId = "official-city-detective-agency";
+  try {
+    visitor.joinWorld({ worldId, ruleVersion: OFFICIAL_WORLD_VERSION });
+    visitor.enterWorld({ worldId, clientSessionId: "commit-guard" });
+    visitor.sealPendingMysteryTruths(worldId);
+    const before = visitor.worldStateView(worldId);
+    const pending = visitor.actInWorld({
+      worldId,
+      eventType: "mystery.review_notes",
+      bodyText: "我重新核对已经记录的案件笔记。",
+      observedWorldStateVersion: before.version,
+      idempotencyKey: "official-commit-guard",
+    });
+    const changed = structuredClone(before.value);
+    changed.mystery.active_cases[0].truth_commitment = "sealed:rewritten";
+    assert.throws(
+      () => visitor.recordWorldJudgement({
+        world: visitor.requireSpace(worldId),
+        worldAgent: visitor.requireWorldAgent(worldId),
+        inputId: pending.input.id,
+        decision: "accepted",
+        decisionSource: "platform",
+        reasonText: "尝试改写已密封承诺。",
+        outcomeText: "这项结果不应被提交。",
+        worldStatePatch: { mystery: changed.mystery },
+        expectedWorldStateVersion: before.version,
+      }),
+      (error) => error.code === "WORLD_STATE_CONTRACT_VIOLATION",
+    );
+    assert.equal(visitor.worldStateView(worldId).version, before.version);
+    assert.equal(
+      db.prepare("SELECT COUNT(*) AS count FROM world_judgements WHERE input_id = ?")
+        .get(pending.input.id).count,
+      0,
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("mystery truth is privately sealed, publicly committed, and excluded from collective work", () => {
+  const db = openDatabase(":memory:");
+  const visitor = new SocialService(db, "sealed-truth-visitor", {
+    platformHostMode: "local_codex",
+  });
+  visitor.getOrCreatePet({ name: "密封验证员" });
+  const actorId = visitor.requirePet().id;
+  db.exec(`
+    ALTER TABLE pets ADD COLUMN display_name TEXT;
+    ALTER TABLE pets ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+    UPDATE pets SET display_name = name;
+  `);
+  const executor = new SocialService(db, actorId, {
+    identitySchema: "shared",
+    principalUserId: "sealed-truth-visitor",
+    principalSessionId: "sealed-truth-host",
+    platformHostExecutor: true,
+    platformHostMode: "local_codex",
+  });
+  const worldId = "official-city-detective-agency";
+  try {
+    visitor.joinWorld({ worldId, ruleVersion: OFFICIAL_WORLD_VERSION });
+    visitor.enterWorld({ worldId, clientSessionId: "sealed-truth-visitor" });
+    const pending = visitor.actInWorld({
+      worldId,
+      eventType: "mystery.investigate_scene",
+      bodyText: "我沿着湿脚印调查旧栈桥。",
+      idempotencyKey: "sealed-truth-first-investigation",
+    });
+    const privateRow = db.prepare(`
+      SELECT value_json FROM world_host_private_facts
+      WHERE space_id = ? AND fact_key = 'sealed_truth:missing-cat'
+    `).get(worldId);
+    assert.ok(privateRow);
+    const publicState = visitor.worldStateView(worldId).value;
+    assert.match(
+      publicState.mystery.active_cases[0].truth_commitment,
+      /^sealed:sha256:[a-f0-9]{64}$/u,
+    );
+    assert.doesNotMatch(JSON.stringify(visitor.observeWorld({ worldId })), /fishmonger|sealed ferry pier/u);
+    const work = executor.localCodexHostWork({ worldId, inputId: pending.input.id });
+    assert.match(JSON.stringify(work.host_private_truths), /fishmonger|sealed ferry pier/u);
+    const beforeRetry = privateRow.value_json;
+    visitor.sealPendingMysteryTruths(worldId);
+    assert.equal(
+      db.prepare(`SELECT value_json FROM world_host_private_facts WHERE space_id = ? AND fact_key = 'sealed_truth:missing-cat'`).get(worldId).value_json,
+      beforeRetry,
+    );
+    assert.doesNotMatch(JSON.stringify(executor.worldHostContextPack(executor.requireSpace(worldId), null)), /fishmonger|sealed ferry pier/u);
   } finally {
     db.close();
   }
