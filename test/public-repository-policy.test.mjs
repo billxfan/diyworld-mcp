@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 
 import {
+  isGitHubMergeCommit,
   isPublicCommitEmail,
   selectPublicHeadRevision,
   scanPublicFiles,
@@ -19,6 +20,33 @@ test("the current public tree and post-baseline commits contain no known private
   assert.deepEqual(result.findings, []);
   assert.equal(result.ok, true);
   assert.ok(result.checkedFiles > 0);
+});
+
+test("GitHub-authored merge commits may retain the account author identity", () => {
+  assert.equal(
+    isGitHubMergeCommit({
+      committerEmail: `noreply@${"github.com"}`,
+      committerName: "GitHub",
+      parents: "a".repeat(40) + " " + "b".repeat(40),
+    }),
+    true,
+  );
+  assert.equal(
+    isGitHubMergeCommit({
+      committerEmail: `noreply@${"github.com"}`,
+      committerName: "GitHub",
+      parents: "a".repeat(40),
+    }),
+    false,
+  );
+  assert.equal(
+    isGitHubMergeCommit({
+      committerEmail: `developer@${"personal.invalid"}`,
+      committerName: "GitHub",
+      parents: "a".repeat(40) + " " + "b".repeat(40),
+    }),
+    false,
+  );
 });
 
 test("future public commits require a Git hosting noreply address", () => {

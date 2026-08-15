@@ -188,6 +188,16 @@ export function isPublicCommitEmail(email) {
   return normalized === `noreply@${"github.com"}` || normalized.endsWith("@users.noreply.github.com");
 }
 
+export function isGitHubMergeCommit({ committerEmail, committerName, parents }) {
+  const normalizedCommitter = String(committerEmail ?? "").trim().toLowerCase();
+  const parentCount = String(parents ?? "").trim().split(/\s+/u).filter(Boolean).length;
+  return (
+    parentCount >= 2 &&
+    String(committerName ?? "").trim() === "GitHub" &&
+    normalizedCommitter === `noreply@${"github.com"}`
+  );
+}
+
 export function selectPublicHeadRevision(root, env = process.env) {
   if (env.GITHUB_EVENT_NAME !== "pull_request" || !env.GITHUB_EVENT_PATH) return "HEAD";
   try {
@@ -253,7 +263,7 @@ function scanNewCommitMetadata(root) {
     });
     const output = execFileSync(
       "git",
-      ["log", `--format=%H%x1f%ae%x1f%ce%x1f%B%x1e`, `${baseline}..${headRevision}`],
+      ["log", `--format=%H%x1f%ae%x1f%ce%x1f%cn%x1f%P%x1f%B%x1e`, `${baseline}..${headRevision}`],
       { cwd: root, encoding: "utf8" },
     );
     const commits = output
@@ -263,9 +273,19 @@ function scanNewCommitMetadata(root) {
     const findings = [];
 
     for (const record of commits) {
-      const [hash = "unknown", authorEmail = "", committerEmail = "", ...bodyParts] = record.split("\x1f");
+      const [
+        hash = "unknown",
+        authorEmail = "",
+        committerEmail = "",
+        committerName = "",
+        parents = "",
+        ...bodyParts
+      ] = record.split("\x1f");
       const location = `commit:${hash.slice(0, 12)}`;
-      if (!isPublicCommitEmail(authorEmail)) {
+      if (
+        !isPublicCommitEmail(authorEmail) &&
+        !isGitHubMergeCommit({ committerEmail, committerName, parents })
+      ) {
         findings.push({ file: location, rule: "public_author_email_required" });
       }
       if (!isPublicCommitEmail(committerEmail)) {
