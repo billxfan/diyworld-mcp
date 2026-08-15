@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -107,6 +108,94 @@ class SlowFakeCodexWorldHosts extends FakeCodexWorldHosts {
   }
 }
 
+class FakeHostExecutor {
+  constructor({
+    reuseContext = false,
+    wrongWorld = false,
+    missingContextId = false,
+    invalidContextId = null,
+    invalidExecution = false,
+    failPrepareOnce = false,
+    hangPrepare = false,
+    hangExecute = false,
+    closeRejects = false,
+  } = {}) {
+    this.id = "test_remote";
+    this.contextIsolation = "per_turn";
+    this.reuseContext = reuseContext;
+    this.wrongWorld = wrongWorld;
+    this.missingContextId = missingContextId;
+    this.invalidContextId = invalidContextId;
+    this.invalidExecution = invalidExecution;
+    this.failPrepareOnce = failPrepareOnce;
+    this.hangPrepare = hangPrepare;
+    this.hangExecute = hangExecute;
+    this.closeRejects = closeRejects;
+    this.delegate = new FakeCodexWorldHosts();
+    this.prepared = [];
+    this.executed = [];
+    this.closed = false;
+    this.executionStarted = new Promise((resolveStarted) => {
+      this.resolveExecutionStarted = resolveStarted;
+    });
+  }
+
+  bindingMetadata() {
+    return {
+      executor_type: this.id,
+      context_isolation: "one_fresh_execution_context_per_turn",
+    };
+  }
+
+  async prepareTurn({ worldId, worldName }) {
+    if (this.failPrepareOnce && this.prepared.length === 0) {
+      this.prepared.push({ worldId, worldName, context: null });
+      throw new Error("transient prepare failure");
+    }
+    if (this.hangPrepare) return new Promise(() => {});
+    const id = this.invalidContextId === "blank"
+      ? " "
+      : this.invalidContextId === "object"
+        ? {}
+        : this.missingContextId
+      ? undefined
+      : this.reuseContext
+        ? "remote-context:reused"
+        : `remote-context:${this.prepared.length + 1}`;
+    const context = {
+      id,
+      worldId: this.wrongWorld ? "world:wrong" : worldId,
+    };
+    this.prepared.push({ worldId, worldName, context });
+    return context;
+  }
+
+  async executeTurn({ context, prompt }) {
+    this.executed.push({ context, prompt });
+    this.resolveExecutionStarted();
+    if (this.hangExecute) return new Promise(() => {});
+    if (this.invalidExecution) return { id: null, text: null };
+    const turn = await this.delegate.runWorldHostTurn({
+      threadId: context.id,
+      prompt,
+      resume: false,
+    });
+    return { id: turn.turnId, text: turn.text };
+  }
+
+  async close() {
+    this.closed = true;
+    if (this.closeRejects) throw new Error("executor close failed");
+  }
+}
+
+class SyncThrowingCloseHostExecutor extends FakeHostExecutor {
+  close() {
+    this.closed = true;
+    throw new Error("executor close synchronously failed");
+  }
+}
+
 class PoisonInputCodexWorldHosts extends FakeCodexWorldHosts {
   async runWorldHostTurn(args) {
     const turn = await super.runWorldHostTurn(args);
@@ -195,6 +284,34 @@ test("persistent per-World Host threads are rejected to preserve Character priva
         threadIsolation: "per_world",
       }),
       /threadIsolation must be per_turn/u,
+    );
+    assert.throws(
+      () => new LocalCodexWorldHostRunner({
+        db: store.db,
+        codexClient: new FakeCodexWorldHosts(),
+        executionTimeoutMs: 0,
+      }),
+      /executionTimeoutMs must be between 10 and 600000/u,
+    );
+    assert.throws(
+      () => new LocalCodexWorldHostRunner({
+        db: store.db,
+        codexClient: new FakeCodexWorldHosts(),
+        closeTimeoutMs: 0,
+      }),
+      /closeTimeoutMs must be between 10 and 60000/u,
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test("a HostExecutor cannot be injected while the deterministic rollback mode is active", () => {
+  const store = new PetSocialStore(":memory:");
+  try {
+    assert.throws(
+      () => createAgentWorldApp({ store, worldHostExecutor: new FakeHostExecutor() }),
+      /worldHostExecutor requires worldHostMode=local_codex/u,
     );
   } finally {
     store.close();
@@ -301,6 +418,472 @@ test("every Host turn gets a fresh isolated local Codex thread", async () => {
   } finally {
     await app.close();
     store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("an injected HostExecutor runs end to end with fresh World-bound contexts", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-executor-injection-"));
+  const store = new PetSocialStore(join(directory, "social.sqlite"));
+  const executor = new FakeHostExecutor();
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostExecutor: executor,
+    worldHostCodexClient: {
+      async createWorldHostThread() {
+        throw new Error("the default Codex client must not be called");
+      },
+    },
+  });
+  const address = await app.listen();
+  try {
+    const registration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-executor-injection@example.test",
+      displayName: "执行器注入测试者",
+      agentProvider: "other",
+    });
+    const client = new AgentWorldClient({
+      serverUrl: address.url,
+      token: registration.token,
+    });
+    const world = await createPublishedWorld(client, "执行器边界世界", "EXECUTOR_ONLY");
+
+    await submitAndDrain(app, client, world, "executor-one");
+    await submitAndDrain(app, client, world, "executor-two");
+
+    assert.equal(executor.prepared.length, 2);
+    assert.equal(executor.executed.length, 2);
+    assert.equal(new Set(executor.prepared.map((item) => item.context.id)).size, 2);
+    assert.ok(executor.prepared.every((item) => item.worldId === world.id));
+    assert.deepEqual(
+      executor.executed.map((item) => item.context.id),
+      executor.prepared.map((item) => item.context.id),
+    );
+    assert.ok(executor.executed.every((item) => item.prompt.includes("EXECUTOR_ONLY")));
+
+    const row = store.db
+      .prepare(`
+        SELECT codex_thread_id, last_turn_id, status
+        FROM world_host_executors WHERE space_id = ?
+      `)
+      .get(world.id);
+    assert.equal(row.codex_thread_id, "remote-context:2");
+    assert.equal(row.last_turn_id, "turn:2");
+    assert.equal(row.status, "idle");
+  } finally {
+    await app.close();
+    assert.equal(executor.closed, true);
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the scheduler rejects observable Host execution context reuse before prompt disclosure", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-executor-reuse-"));
+  const store = new PetSocialStore(join(directory, "social.sqlite"));
+  const executor = new FakeHostExecutor({ reuseContext: true });
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostExecutor: executor,
+    worldHostMaxAttempts: 1,
+  });
+  const address = await app.listen();
+  try {
+    const registration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-executor-reuse@example.test",
+      displayName: "执行器复用测试者",
+      agentProvider: "other",
+    });
+    const client = new AgentWorldClient({
+      serverUrl: address.url,
+      token: registration.token,
+    });
+    const world = await createPublishedWorld(client, "执行器复用世界", "REUSE_ONLY");
+    await submitAndDrain(app, client, world, "reuse-first");
+
+    await client.enterWorld(world.id, { clientSessionId: "session:reuse-second" });
+    const observed = await client.observeWorld(world.id);
+    const pending = await client.submitWorldInput(world.id, {
+      inputType: "speech",
+      eventType: "speak",
+      bodyText: "触发第二轮执行器上下文",
+      observedWorldStateVersion: observed.world_state.version,
+      observedMemberStateVersion: observed.member_state.version,
+      idempotencyKey: "input:reuse-second",
+    });
+    await app.worldHostRunner.whenIdle();
+
+    const completed = await client.worldInputResult(world.id, pending.input.id, {
+      waitMs: 0,
+    });
+    assert.equal(completed.processing.state, "host_failed");
+    const audit = store.db
+      .prepare("SELECT last_error FROM world_host_executors WHERE space_id = ?")
+      .get(world.id);
+    assert.match(audit.last_error, /reused a persisted execution context/u);
+    assert.equal(executor.executed.length, 1, "the reused context receives no prompt");
+  } finally {
+    await app.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the scheduler rejects a Host context id persisted by an earlier runner", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-executor-persisted-reuse-"));
+  const store = new PetSocialStore(join(directory, "social.sqlite"));
+  const executor = new FakeHostExecutor({ reuseContext: true });
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostExecutor: executor,
+    worldHostMaxAttempts: 1,
+  });
+  const address = await app.listen();
+  try {
+    const registration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-executor-persisted-reuse@example.test",
+      displayName: "持久化复用测试者",
+      agentProvider: "other",
+    });
+    const client = new AgentWorldClient({ serverUrl: address.url, token: registration.token });
+    const world = await createPublishedWorld(client, "持久化复用世界", "PERSISTED_REUSE_ONLY");
+    store.db
+      .prepare(`
+        INSERT INTO world_host_execution_contexts (
+          context_fingerprint, executor_type, world_fingerprint, created_at
+        ) VALUES (?, ?, ?, ?)
+      `)
+      .run(
+        createHash("sha256").update("remote-context:reused").digest("hex"),
+        "test_remote",
+        createHash("sha256").update("world:earlier").digest("hex"),
+        new Date().toISOString(),
+      );
+
+    await client.enterWorld(world.id, { clientSessionId: "session:persisted-reuse" });
+    const observed = await client.observeWorld(world.id);
+    const pending = await client.submitWorldInput(world.id, {
+      inputType: "speech",
+      eventType: "speak",
+      bodyText: "触发持久化上下文复用检查",
+      observedWorldStateVersion: observed.world_state.version,
+      observedMemberStateVersion: observed.member_state.version,
+      idempotencyKey: "input:persisted-reuse",
+    });
+    await app.worldHostRunner.whenIdle();
+
+    const completed = await client.worldInputResult(world.id, pending.input.id, { waitMs: 0 });
+    const audit = store.db
+      .prepare("SELECT last_error FROM world_host_executors WHERE space_id = ?")
+      .get(world.id);
+    assert.equal(completed.processing.state, "host_failed");
+    assert.match(audit.last_error, /reused a persisted execution context/u);
+    assert.equal(executor.executed.length, 0, "a persisted context receives no prompt");
+  } finally {
+    await app.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+for (const scenario of [
+  {
+    name: "a missing context id",
+    options: { missingContextId: true },
+    error: /prepareTurn returned an invalid context/u,
+    executed: 0,
+  },
+  {
+    name: "a context bound to another World",
+    options: { wrongWorld: true },
+    error: /prepareTurn returned an invalid context/u,
+    executed: 0,
+  },
+  {
+    name: "a blank context id",
+    options: { invalidContextId: "blank" },
+    error: /prepareTurn returned an invalid context/u,
+    executed: 0,
+  },
+  {
+    name: "a non-string context id",
+    options: { invalidContextId: "object" },
+    error: /prepareTurn returned an invalid context/u,
+    executed: 0,
+  },
+  {
+    name: "an invalid execution result",
+    options: { invalidExecution: true },
+    error: /executeTurn returned an invalid result/u,
+    executed: 1,
+  },
+]) {
+  test(`the scheduler terminalizes ${scenario.name} without committing state`, async () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-world-host-executor-contract-"));
+    const store = new PetSocialStore(join(directory, "social.sqlite"));
+    const executor = new FakeHostExecutor(scenario.options);
+    const app = createAgentWorldApp({
+      store,
+      worldHostMode: "local_codex",
+      worldHostExecutor: executor,
+      worldHostMaxAttempts: 1,
+    });
+    const address = await app.listen();
+    try {
+      const registration = await AgentWorldClient.register(address.url, {
+        recoveryEmail: `${scenario.name.replaceAll(" ", "-")}@example.test`,
+        displayName: "执行器契约测试者",
+        agentProvider: "other",
+      });
+      const client = new AgentWorldClient({
+        serverUrl: address.url,
+        token: registration.token,
+      });
+      const world = await createPublishedWorld(client, "执行器契约世界", "CONTRACT_ONLY");
+      await client.enterWorld(world.id, { clientSessionId: "session:contract" });
+      const before = await client.observeWorld(world.id);
+      const pending = await client.submitWorldInput(world.id, {
+        inputType: "speech",
+        eventType: "speak",
+        bodyText: "触发执行器契约校验",
+        observedWorldStateVersion: before.world_state.version,
+        observedMemberStateVersion: before.member_state.version,
+        idempotencyKey: `input:${scenario.name}`,
+      });
+      await app.worldHostRunner.whenIdle();
+
+      const completed = await client.worldInputResult(world.id, pending.input.id, { waitMs: 0 });
+      const after = await client.observeWorld(world.id);
+      const audit = store.db
+        .prepare("SELECT last_error FROM world_host_executors WHERE space_id = ?")
+        .get(world.id);
+      assert.equal(completed.processing.state, "host_failed");
+      assert.equal(after.world_state.version, before.world_state.version);
+      assert.match(audit.last_error, scenario.error);
+      assert.equal(executor.executed.length, scenario.executed);
+    } finally {
+      await app.close();
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+test("a transient custom executor failure retries with a fresh context", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-executor-transient-"));
+  const store = new PetSocialStore(join(directory, "social.sqlite"));
+  const executor = new FakeHostExecutor({ failPrepareOnce: true });
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostExecutor: executor,
+    worldHostMaxAttempts: 2,
+    worldHostRetryBaseDelayMs: 0,
+  });
+  const address = await app.listen();
+  try {
+    const registration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-executor-transient@example.test",
+      displayName: "执行器重试测试者",
+      agentProvider: "other",
+    });
+    const client = new AgentWorldClient({ serverUrl: address.url, token: registration.token });
+    const world = await createPublishedWorld(client, "执行器重试世界", "TRANSIENT_ONLY");
+    await submitAndDrain(app, client, world, "transient-retry");
+
+    assert.equal(executor.prepared.length, 2);
+    assert.equal(executor.executed.length, 1);
+    assert.equal(executor.executed[0].context.id, "remote-context:2");
+    const input = store.db
+      .prepare("SELECT status, host_attempt_count FROM world_inputs WHERE space_id = ? ORDER BY created_at DESC LIMIT 1")
+      .get(world.id);
+    assert.equal(input.status, "accepted");
+    assert.equal(input.host_attempt_count, 2);
+  } finally {
+    await app.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a custom executor prepare timeout terminalizes safely", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-executor-timeout-"));
+  const store = new PetSocialStore(join(directory, "social.sqlite"));
+  const executor = new FakeHostExecutor({ hangPrepare: true });
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostExecutor: executor,
+    worldHostMaxAttempts: 1,
+    worldHostExecutionTimeoutMs: 20,
+  });
+  const address = await app.listen();
+  try {
+    const registration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-executor-timeout@example.test",
+      displayName: "执行器超时测试者",
+      agentProvider: "other",
+    });
+    const client = new AgentWorldClient({ serverUrl: address.url, token: registration.token });
+    const world = await createPublishedWorld(client, "执行器超时世界", "TIMEOUT_ONLY");
+    await client.enterWorld(world.id, { clientSessionId: "session:timeout" });
+    const observed = await client.observeWorld(world.id);
+    const pending = await client.submitWorldInput(world.id, {
+      inputType: "speech",
+      eventType: "speak",
+      bodyText: "触发执行器超时",
+      observedWorldStateVersion: observed.world_state.version,
+      observedMemberStateVersion: observed.member_state.version,
+      idempotencyKey: "input:timeout",
+    });
+    await app.worldHostRunner.whenIdle();
+
+    const completed = await client.worldInputResult(world.id, pending.input.id, { waitMs: 0 });
+    const audit = store.db
+      .prepare("SELECT last_error FROM world_host_executors WHERE space_id = ?")
+      .get(world.id);
+    assert.equal(completed.processing.state, "host_failed");
+    assert.match(audit.last_error, /prepareTurn timed out/u);
+    assert.equal(executor.executed.length, 0);
+  } finally {
+    await app.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("closing aborts a hanging executor turn without consuming an attempt", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-executor-abort-"));
+  const store = new PetSocialStore(join(directory, "social.sqlite"));
+  const executor = new FakeHostExecutor({ hangExecute: true });
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostExecutor: executor,
+    worldHostExecutionTimeoutMs: 60_000,
+  });
+  const address = await app.listen();
+  try {
+    const registration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-executor-abort@example.test",
+      displayName: "执行器关闭测试者",
+      agentProvider: "other",
+    });
+    const client = new AgentWorldClient({ serverUrl: address.url, token: registration.token });
+    const world = await createPublishedWorld(client, "执行器关闭世界", "ABORT_ONLY");
+    await client.enterWorld(world.id, { clientSessionId: "session:abort" });
+    const observed = await client.observeWorld(world.id);
+    const pending = await client.submitWorldInput(world.id, {
+      inputType: "speech",
+      eventType: "speak",
+      bodyText: "触发挂起的执行器",
+      observedWorldStateVersion: observed.world_state.version,
+      observedMemberStateVersion: observed.member_state.version,
+      idempotencyKey: "input:abort",
+    });
+    await executor.executionStarted;
+    await app.close();
+
+    const input = store.db
+      .prepare("SELECT status, host_attempt_count FROM world_inputs WHERE id = ?")
+      .get(pending.input.id);
+    assert.equal(input.status, "pending");
+    assert.equal(input.host_attempt_count, 0);
+    assert.equal(executor.closed, true);
+  } finally {
+    if (app.server.listening) await app.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("application resources close even when executor.close rejects", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-executor-close-error-"));
+  const databaseFile = join(directory, "social.sqlite");
+  const executor = new FakeHostExecutor({ closeRejects: true });
+  const app = createAgentWorldApp({
+    databaseFile,
+    worldHostMode: "local_codex",
+    worldHostExecutor: executor,
+  });
+  await app.listen();
+  try {
+    await assert.rejects(() => app.close(), /executor close failed/u);
+    assert.equal(app.server.listening, false);
+    assert.throws(() => app.store.db.prepare("SELECT 1").get());
+  } finally {
+    if (app.server.listening) await new Promise((resolve) => app.server.close(resolve));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("application resources close even when executor.close throws synchronously", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-executor-sync-close-error-"));
+  const databaseFile = join(directory, "social.sqlite");
+  const executor = new SyncThrowingCloseHostExecutor();
+  const app = createAgentWorldApp({
+    databaseFile,
+    worldHostMode: "local_codex",
+    worldHostExecutor: executor,
+  });
+  await app.listen();
+  try {
+    await assert.rejects(() => app.close(), /executor close synchronously failed/u);
+    assert.equal(executor.closed, true);
+    assert.equal(app.server.listening, false);
+    assert.throws(() => app.store.db.prepare("SELECT 1").get());
+  } finally {
+    if (app.server.listening) await new Promise((resolve) => app.server.close(resolve));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy executor context ids are backfilled as irreversible tombstones", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-world-host-executor-backfill-"));
+  const databaseFile = join(directory, "social.sqlite");
+  let store = new PetSocialStore(databaseFile);
+  const codex = new FakeCodexWorldHosts();
+  const app = createAgentWorldApp({
+    store,
+    worldHostMode: "local_codex",
+    worldHostCodexClient: codex,
+    worldHostRoot: join(directory, "hosts"),
+  });
+  const address = await app.listen();
+  try {
+    const registration = await AgentWorldClient.register(address.url, {
+      recoveryEmail: "host-executor-backfill@example.test",
+      displayName: "执行器迁移测试者",
+      agentProvider: "codex",
+    });
+    const client = new AgentWorldClient({ serverUrl: address.url, token: registration.token });
+    const world = await createPublishedWorld(client, "执行器迁移世界", "BACKFILL_ONLY");
+    await submitAndDrain(app, client, world, "backfill");
+    const contextId = store.db
+      .prepare("SELECT codex_thread_id FROM world_host_executors WHERE space_id = ?")
+      .get(world.id).codex_thread_id;
+    store.db.exec("DROP TABLE world_host_execution_contexts");
+    await app.close();
+    store.close();
+
+    store = new PetSocialStore(databaseFile);
+    const tombstone = store.db
+      .prepare("SELECT * FROM world_host_execution_contexts")
+      .get();
+    assert.equal(
+      tombstone.context_fingerprint,
+      createHash("sha256").update(contextId).digest("hex"),
+    );
+    assert.equal(tombstone.executor_type, "local_codex");
+    assert.equal(JSON.stringify(tombstone).includes(contextId), false);
+  } finally {
+    if (app.server.listening) await app.close();
+    try {
+      store.close();
+    } catch {}
     rmSync(directory, { recursive: true, force: true });
   }
 });
