@@ -118,22 +118,49 @@ encounter only when a verified Scene or explicit invitation already exists.
 
 ## Current implementation boundary
 
-During validation, the default platform executor is the creator's local Codex
-app-server. Every Host turn runs in a fresh ephemeral Codex task; no model thread
-is reused across Characters or turns. Ordinary inputs and ready collective
-batches are serialized within their authority boundary. Each actor turn receives
-only a freshly assembled role-perspective context pack; a collective turn receives
-only its verified interaction batch. Neither has external tools. Structured
-decisions still pass through server-side authority, visibility, version, Loop,
-Scene, and atomic state-commit checks. A failed or invalid turn leaves its input
-pending with no partial World or Loop write.
+The World Host scheduler depends on an explicit `HostExecutor` contract. An
+executor prepares one isolated turn context and returns one untrusted structured
+decision; it never receives state-writing authority. The first-party
+`LocalCodexHostExecutor` preserves the current deployment through the creator's
+local Codex app-server. Every Host turn runs in a fresh ephemeral Codex task; no
+model thread is reused across Characters or turns. Ordinary inputs and ready
+collective batches are serialized within their authority boundary. Each actor
+turn receives only a freshly assembled role-perspective context pack; a
+collective turn receives only its verified interaction batch. Neither has
+external tools. Structured decisions still pass through server-side authority,
+visibility, version, Loop, Scene, and atomic state-commit checks. A failed or
+invalid turn leaves its input pending with no partial World or Loop write.
+
+Every prepared context must return the requested `worldId` and a non-empty,
+bounded opaque identifier that is globally unique within the service database. The
+scheduler rejects observable context reuse before disclosing a prompt, including
+reuse recorded by an earlier process. Executors are trusted infrastructure
+adapters, not untrusted in-process plugins. They remain responsible for ensuring
+that the underlying model session identified by that value is genuinely fresh,
+World-local, and exposes no capabilities beyond the context supplied by the
+scheduler.
+
+The durable reuse-history table retains only SHA-256 fingerprints of used
+context IDs and World IDs. The compatibility executor row keeps only the
+current raw context ID while its World exists. Non-reversible safety tombstones
+survive World deletion so a remote model session cannot later be rebound to a
+different World.
+
+Both `prepareTurn` and `executeTurn` receive an `AbortSignal`. A trusted adapter
+must stop its external work when that signal is aborted, and `close` must be
+safe to call concurrently with an active turn. The scheduler also applies a
+deadline and releases a shutdown-aborted input for a fresh attempt after restart.
 
 Creators can bind their own current Agent session as the temporary executor
 through a short-lived lease; direct inputs wait for that Agent until it resolves
 or releases the claim. The deterministic platform policy remains an explicit
-rollback mode. A production deployment must replace the single local machine
-with durable remote Host workers without changing membership, authorization,
-or state-writing contracts.
+rollback mode. `HostExecutor` is currently an internal extension point, not a
+public third-party plugin API. Compatibility storage and player-facing runtime
+labels still use the existing Local Codex names in this phase. A future
+deployment can add durable remote Host workers behind this contract without
+changing membership, authorization, or state-writing contracts; exposing
+third-party plugins requires a separate sandboxed worker and capability
+protocol.
 
 Every settled input also stores one `world_director_turns` record containing
 the selected family, population scenario, thread, Beat, complete plan, and

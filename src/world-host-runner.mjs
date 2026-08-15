@@ -1,15 +1,44 @@
-import { mkdirSync } from "node:fs";
-import { resolve } from "node:path";
+import { createHash } from "node:crypto";
 
-import { CodexAppServerClient } from "./codex-app-server.mjs";
 import { SocialService } from "./venue-lab-core/social-service.js";
 import { enqueueWorldDelivery } from "./world-delivery-outbox.mjs";
+import {
+  assertHostExecutor,
+  LocalCodexHostExecutor,
+} from "./world-host-executor.mjs";
 import {
   WORLD_LOOP_CONTRACT_VERSION,
   WORLD_LOOP_SCOPES,
   WORLD_LOOP_TRANSITION_CAPABILITIES,
   WORLD_LOOP_TRANSITIONS,
 } from "./venue-lab-core/world-agent-system.js";
+
+function waitForExecutorCall(promise, {
+  controller,
+  timeoutMs,
+  label,
+}) {
+  const { signal } = controller;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  let timer;
+  let onAbort;
+  const interrupted = new Promise((_, reject) => {
+    onAbort = () => reject(signal.reason ?? new Error(`${label} aborted`));
+    signal.addEventListener("abort", onAbort, { once: true });
+    timer = setTimeout(() => {
+      controller.abort(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    timer.unref?.();
+  });
+  return Promise.race([Promise.resolve(promise), interrupted]).finally(() => {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", onAbort);
+  });
+}
+
+function fingerprint(value) {
+  return createHash("sha256").update(String(value)).digest("hex");
+}
 
 const DECISIONS = new Set([
   "accepted",
@@ -623,14 +652,17 @@ export function worldHostPrompt(work) {
   ].join("\n\n");
 }
 
-export class LocalCodexWorldHostRunner {
+export class WorldHostRunner {
   constructor({
     db,
-    codexClient = new CodexAppServerClient(),
+    hostExecutor,
+    codexClient,
     maxConcurrency = 2,
     maxAttempts = 3,
     retryBaseDelayMs = 1_000,
-    hostRoot = resolve(process.cwd(), "data/world-hosts"),
+    executionTimeoutMs = 180_000,
+    closeTimeoutMs = 10_000,
+    hostRoot,
     model,
     effort = "medium",
     threadIsolation = "per_turn",
@@ -651,18 +683,39 @@ export class LocalCodexWorldHostRunner {
     ) {
       throw new Error("World Host retryBaseDelayMs must be between 0 and 60000");
     }
+    if (
+      !Number.isInteger(executionTimeoutMs) ||
+      executionTimeoutMs < 10 ||
+      executionTimeoutMs > 600_000
+    ) {
+      throw new Error("World Host executionTimeoutMs must be between 10 and 600000");
+    }
+    if (
+      !Number.isInteger(closeTimeoutMs) ||
+      closeTimeoutMs < 10 ||
+      closeTimeoutMs > 60_000
+    ) {
+      throw new Error("World Host closeTimeoutMs must be between 10 and 60000");
+    }
     if (threadIsolation !== "per_turn") {
       throw new Error("World Host threadIsolation must be per_turn");
     }
     this.db = db;
-    this.codexClient = codexClient;
+    this.hostExecutor = assertHostExecutor(
+      hostExecutor ??
+        new LocalCodexHostExecutor({
+          codexClient,
+          hostRoot,
+          model,
+          effort,
+          contextIsolation: threadIsolation,
+        }),
+    );
     this.maxConcurrency = maxConcurrency;
     this.maxAttempts = maxAttempts;
     this.retryBaseDelayMs = retryBaseDelayMs;
-    this.hostRoot = hostRoot;
-    this.model = model;
-    this.effort = effort;
-    this.threadIsolation = threadIsolation;
+    this.executionTimeoutMs = executionTimeoutMs;
+    this.closeTimeoutMs = closeTimeoutMs;
     this.onCommitted = onCommitted;
     this.onError = onError;
     this.queuedWorldIds = new Set();
@@ -670,8 +723,8 @@ export class LocalCodexWorldHostRunner {
     this.activeCount = 0;
     this.closed = false;
     this.idleWaiters = [];
-    this.bindingPromises = new Map();
     this.retryTimers = new Map();
+    this.activeExecutionControllers = new Set();
   }
 
   start({ prewarmPublishedWorlds = false } = {}) {
@@ -809,8 +862,26 @@ export class LocalCodexWorldHostRunner {
     this.queuedWorldIds.clear();
     for (const timer of this.retryTimers.values()) clearTimeout(timer);
     this.retryTimers.clear();
-    await this.whenIdle();
-    this.codexClient.close?.();
+    for (const controller of this.activeExecutionControllers) {
+      controller.abort(new Error("World Host runner closed"));
+    }
+    const closeController = new AbortController();
+    const closePromise = waitForExecutorCall(
+      Promise.resolve().then(() =>
+        this.hostExecutor.close({ signal: closeController.signal }),
+      ),
+      {
+        controller: closeController,
+        timeoutMs: this.closeTimeoutMs,
+        label: "HostExecutor.close",
+      },
+    );
+    const results = await Promise.allSettled([this.whenIdle(), closePromise]);
+    const errors = results
+      .filter((result) => result.status === "rejected")
+      .map((result) => result.reason);
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "World Host runner close failed");
   }
 
   async bindWorld({ worldId, actorPetId, principalUserId }) {
@@ -823,25 +894,23 @@ export class LocalCodexWorldHostRunner {
       platformHostMode: "local_codex",
     });
     service.ensureWorldHostRuntime(worldId);
-    if (this.threadIsolation === "per_turn") {
-      const executor = this.#executor(worldId);
-      const cwd = resolve(this.hostRoot, encodeURIComponent(worldId));
-      mkdirSync(cwd, { recursive: true, mode: 0o700 });
-      return { ...executor, context_isolation: "one_fresh_thread_per_turn" };
+    const executor = this.#executor(worldId);
+    const binding = this.hostExecutor.bindingMetadata();
+    if (
+      !binding ||
+      binding.executor_type !== this.hostExecutor.id ||
+      !new Set([
+        "one_fresh_execution_context_per_turn",
+        "one_fresh_thread_per_turn",
+      ]).has(binding.context_isolation)
+    ) {
+      throw new Error("HostExecutor.bindingMetadata returned invalid metadata");
     }
-    return this.#boundThread(worldId, service);
-  }
-
-  #boundThread(worldId, service) {
-    const existing = this.bindingPromises.get(worldId);
-    if (existing) return existing;
-    const binding = this.#ensureThread(worldId, service).finally(() => {
-      if (this.bindingPromises.get(worldId) === binding) {
-        this.bindingPromises.delete(worldId);
-      }
-    });
-    this.bindingPromises.set(worldId, binding);
-    return binding;
+    return {
+      ...executor,
+      executor_type: this.hostExecutor.id,
+      context_isolation: binding.context_isolation,
+    };
   }
 
   #notifyIdle() {
@@ -1006,6 +1075,49 @@ export class LocalCodexWorldHostRunner {
     };
   }
 
+  #releaseCancelledAttempt(worldId, next) {
+    const timestamp = new Date().toISOString();
+    const interactionId = next.kind === "interaction" ? next.interaction_id : null;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (interactionId) {
+        this.db
+          .prepare(`
+            UPDATE world_interactions
+            SET host_attempt_count = MAX(host_attempt_count - 1, 0)
+            WHERE id = ? AND status = 'ready'
+          `)
+          .run(interactionId);
+        this.db
+          .prepare(`
+            UPDATE world_inputs
+            SET host_attempt_count = MAX(host_attempt_count - 1, 0)
+            WHERE interaction_id = ? AND status = 'pending'
+          `)
+          .run(interactionId);
+      } else {
+        this.db
+          .prepare(`
+            UPDATE world_inputs
+            SET host_attempt_count = MAX(host_attempt_count - 1, 0)
+            WHERE id = ? AND status = 'pending'
+          `)
+          .run(next.id);
+      }
+      this.db
+        .prepare(`
+          UPDATE world_host_executors
+          SET status = 'idle', updated_at = ?
+          WHERE space_id = ?
+        `)
+        .run(timestamp, worldId);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   #recordWorkFailure(worldId, next, error, attempt) {
     const timestamp = new Date().toISOString();
     const message = String(error?.message ?? error).slice(0, 2000);
@@ -1087,39 +1199,13 @@ export class LocalCodexWorldHostRunner {
     return terminal;
   }
 
-  async #ensureThread(worldId, service) {
-    service.ensureWorldHostRuntime(worldId);
-    let executor = this.#executor(worldId);
-    if (executor.codex_thread_id) return executor;
-    const cwd = resolve(this.hostRoot, encodeURIComponent(worldId));
-    mkdirSync(cwd, { recursive: true, mode: 0o700 });
-    const thread = await this.codexClient.createWorldHostThread({
-      worldId,
-      worldName: executor.world_name,
-      cwd,
-      model: this.model,
-    });
-    const timestamp = new Date().toISOString();
-    this.db
-      .prepare(`
-        UPDATE world_host_executors
-        SET codex_thread_id = ?, status = 'idle', last_error = NULL,
-          updated_at = ?
-        WHERE space_id = ? AND codex_thread_id IS NULL
-      `)
-      .run(thread.id, timestamp, worldId);
-    executor = this.#executor(worldId);
-    if (executor.codex_thread_id !== thread.id) {
-      throw new Error("World Host thread binding changed while it was being created");
-    }
-    return executor;
-  }
-
   async #runWorld(worldId) {
     while (!this.closed) {
       const next = this.#nextWork(worldId);
       if (!next) break;
       const retry = this.#beginAttempt(next);
+      const executionController = new AbortController();
+      this.activeExecutionControllers.add(executionController);
       try {
         const service = new SocialService(this.db, next.actor_pet_id, {
           identitySchema: "shared",
@@ -1128,10 +1214,11 @@ export class LocalCodexWorldHostRunner {
           platformHostExecutor: true,
           platformHostMode: "local_codex",
         });
-        const executor =
-          this.threadIsolation === "per_turn"
-            ? await this.#freshTurnThread(worldId, service)
-            : await this.#boundThread(worldId, service);
+        const executionContext = await this.#prepareTurnContext(
+          worldId,
+          service,
+          executionController,
+        );
         const work =
           next.kind === "interaction"
             ? service.localCodexHostInteractionWork({
@@ -1156,15 +1243,27 @@ export class LocalCodexWorldHostRunner {
             WHERE space_id = ?
           `)
           .run(next.id, startedAt, startedAt, worldId);
-        const turn = await this.codexClient.runWorldHostTurn({
-          threadId: executor.codex_thread_id,
-          prompt: worldHostPrompt(work),
-          model: this.model,
-          effort: this.effort,
-          resume: this.threadIsolation !== "per_turn",
-          ephemeral: this.threadIsolation === "per_turn",
-        });
-        const decision = parseWorldHostDecision(turn.text, {
+        const execution = await waitForExecutorCall(
+          this.hostExecutor.executeTurn({
+            context: executionContext,
+            prompt: worldHostPrompt(work),
+            signal: executionController.signal,
+          }),
+          {
+            controller: executionController,
+            timeoutMs: this.executionTimeoutMs,
+            label: "HostExecutor.executeTurn",
+          },
+        );
+        if (
+          typeof execution?.id !== "string" ||
+          execution.id.trim() === "" ||
+          execution.id.length > 512 ||
+          typeof execution.text !== "string"
+        ) {
+          throw new Error("HostExecutor.executeTurn returned an invalid result");
+        }
+        const decision = parseWorldHostDecision(execution.text, {
           directorPlan: work.director_plan,
           requireLoopContract: next.kind !== "interaction",
           allowLoopTransition: next.kind !== "interaction",
@@ -1220,9 +1319,13 @@ export class LocalCodexWorldHostRunner {
               last_completed_at = ?, last_error = NULL, updated_at = ?
             WHERE space_id = ?
           `)
-          .run(turn.turnId, latestSequence, completedAt, completedAt, worldId);
+          .run(execution.id, latestSequence, completedAt, completedAt, worldId);
         await this.onCommitted?.(result);
       } catch (error) {
+        if (this.closed && executionController.signal.aborted) {
+          this.#releaseCancelledAttempt(worldId, next);
+          break;
+        }
         const terminal = this.#recordWorkFailure(
           worldId,
           next,
@@ -1235,23 +1338,52 @@ export class LocalCodexWorldHostRunner {
           error instanceof Error ? error : new Error(String(error));
         recordedError.worldHostFailureRecorded = true;
         throw recordedError;
+      } finally {
+        this.activeExecutionControllers.delete(executionController);
       }
     }
   }
 
-  async #freshTurnThread(worldId, service) {
+  async #prepareTurnContext(worldId, service, executionController) {
     service.ensureWorldHostRuntime(worldId);
     const executor = this.#executor(worldId);
-    const cwd = resolve(this.hostRoot, encodeURIComponent(worldId));
-    mkdirSync(cwd, { recursive: true, mode: 0o700 });
-    const thread = await this.codexClient.createWorldHostThread({
-      worldId,
-      worldName: executor.world_name,
-      cwd,
-      model: this.model,
-      ephemeral: true,
-    });
+    const context = await waitForExecutorCall(
+      this.hostExecutor.prepareTurn({
+        worldId,
+        worldName: executor.world_name,
+        signal: executionController.signal,
+      }),
+      {
+        controller: executionController,
+        timeoutMs: this.executionTimeoutMs,
+        label: "HostExecutor.prepareTurn",
+      },
+    );
+    if (
+      typeof context?.id !== "string" ||
+      context.id.trim() === "" ||
+      context.id.length > 512 ||
+      context.worldId !== worldId
+    ) {
+      throw new Error("HostExecutor.prepareTurn returned an invalid context");
+    }
+    const contextId = context.id;
     const timestamp = new Date().toISOString();
+    const claimed = this.db
+      .prepare(`
+        INSERT OR IGNORE INTO world_host_execution_contexts (
+          context_fingerprint, executor_type, world_fingerprint, created_at
+        ) VALUES (?, ?, ?, ?)
+      `)
+      .run(
+        fingerprint(contextId),
+        this.hostExecutor.id,
+        fingerprint(worldId),
+        timestamp,
+      );
+    if (claimed.changes !== 1) {
+      throw new Error("HostExecutor reused a persisted execution context");
+    }
     this.db
       .prepare(`
         UPDATE world_host_executors
@@ -1259,8 +1391,8 @@ export class LocalCodexWorldHostRunner {
           status = 'idle', last_error = NULL, updated_at = ?
         WHERE space_id = ?
       `)
-      .run(thread.id, timestamp, worldId);
-    return this.#executor(worldId);
+      .run(contextId, timestamp, worldId);
+    return { ...context, id: contextId };
   }
 
   #recordFailure(worldId, error) {
@@ -1275,3 +1407,7 @@ export class LocalCodexWorldHostRunner {
     this.onError?.(error, { worldId });
   }
 }
+
+// Compatibility export for existing callers. Scheduling is now executor-neutral;
+// the default implementation remains the local Codex executor.
+export class LocalCodexWorldHostRunner extends WorldHostRunner {}

@@ -49,6 +49,14 @@ const worldHostRetryBaseDelayMs = Number.parseInt(
   process.env.AGENT_WORLD_HOST_RETRY_BASE_DELAY_MS ?? "1000",
   10,
 );
+const worldHostExecutionTimeoutMs = Number.parseInt(
+  process.env.AGENT_WORLD_HOST_EXECUTION_TIMEOUT_MS ?? "180000",
+  10,
+);
+const worldHostCloseTimeoutMs = Number.parseInt(
+  process.env.AGENT_WORLD_HOST_CLOSE_TIMEOUT_MS ?? "10000",
+  10,
+);
 const worldDeliveryMaxAttempts = Number.parseInt(
   process.env.AGENT_WORLD_DELIVERY_MAX_ATTEMPTS ?? "5",
   10,
@@ -80,6 +88,18 @@ if (
 ) {
   throw new Error(
     "Registration/referral limits must be integers with 0 <= referral <= registration",
+  );
+}
+if (
+  !Number.isInteger(worldHostExecutionTimeoutMs) ||
+  worldHostExecutionTimeoutMs < 10 ||
+  worldHostExecutionTimeoutMs > 600_000 ||
+  !Number.isInteger(worldHostCloseTimeoutMs) ||
+  worldHostCloseTimeoutMs < 10 ||
+  worldHostCloseTimeoutMs > 60_000
+) {
+  throw new Error(
+    "World Host execution/close timeouts are outside their supported ranges",
   );
 }
 if (
@@ -137,6 +157,8 @@ const app = createPetSocialApp({
   worldHostMaxConcurrency,
   worldHostMaxAttempts,
   worldHostRetryBaseDelayMs,
+  worldHostExecutionTimeoutMs,
+  worldHostCloseTimeoutMs,
   worldHostPrewarm,
   worldDeliveryMaxAttempts,
   worldDeliveryRetryBaseDelayMs,

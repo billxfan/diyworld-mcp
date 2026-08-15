@@ -13,7 +13,7 @@ import { PetSocialStore } from "./store.mjs";
 import { clampInteger, DAY_MS } from "./utils.mjs";
 import { SocialError } from "./venue-lab-core/errors.js";
 import { SocialService } from "./venue-lab-core/social-service.js";
-import { LocalCodexWorldHostRunner } from "./world-host-runner.mjs";
+import { WorldHostRunner } from "./world-host-runner.mjs";
 import { handleRemoteMcpMessage } from "./remote-mcp.mjs";
 import {
   drainWorldDeliveryOutbox as drainDurableWorldDeliveryOutbox,
@@ -203,6 +203,11 @@ export function createPetSocialApp(options = {}) {
   const cancelTimeout = options.clearTimeout ?? clearTimeout;
   const worldHostMode =
     options.worldHostMode === "local_codex" ? "local_codex" : "deterministic";
+  if (options.worldHostExecutor && worldHostMode !== "local_codex") {
+    throw new Error(
+      "worldHostExecutor requires worldHostMode=local_codex during the internal compatibility phase",
+    );
+  }
   const sseByPet = new Map();
   // A socket is registered before replay so no event can be missed between a
   // cursor read and subscribing.  Live events are buffered until all pages of
@@ -754,12 +759,15 @@ export function createPetSocialApp(options = {}) {
   const worldHostRunner =
     options.worldHostRunner ??
     (worldHostMode === "local_codex"
-      ? new LocalCodexWorldHostRunner({
+      ? new WorldHostRunner({
           db: store.db,
+          hostExecutor: options.worldHostExecutor,
           codexClient: options.worldHostCodexClient,
           maxConcurrency: options.worldHostMaxConcurrency ?? 2,
           maxAttempts: options.worldHostMaxAttempts ?? 3,
           retryBaseDelayMs: options.worldHostRetryBaseDelayMs ?? 1_000,
+          executionTimeoutMs: options.worldHostExecutionTimeoutMs ?? 180_000,
+          closeTimeoutMs: options.worldHostCloseTimeoutMs ?? 10_000,
           hostRoot: options.worldHostRoot,
           model: options.worldHostModel,
           effort: options.worldHostEffort,
@@ -2070,9 +2078,16 @@ export function createPetSocialApp(options = {}) {
       for (const devices of sseByPet.values()) {
         for (const res of devices.values()) res.end();
       }
-      await worldHostRunner?.close();
-      await new Promise((resolve) => server.close(resolve));
+      const results = await Promise.allSettled([
+        Promise.resolve().then(() => worldHostRunner?.close()),
+        new Promise((resolve) => server.close(resolve)),
+      ]);
       if (!options.store) store.close();
+      const errors = results
+        .filter((result) => result.status === "rejected")
+        .map((result) => result.reason);
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1) throw new AggregateError(errors, "Application close failed");
     }
   };
 }

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -924,6 +925,16 @@ export function migrateWorldRuntime(db) {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS world_host_execution_contexts (
+      context_fingerprint TEXT PRIMARY KEY,
+      executor_type TEXT NOT NULL,
+      world_fingerprint TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_world_host_execution_contexts_world
+      ON world_host_execution_contexts(world_fingerprint, created_at);
+
     CREATE TABLE IF NOT EXISTS world_member_journeys (
       space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
       pet_id TEXT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
@@ -1117,6 +1128,26 @@ export function migrateWorldRuntime(db) {
     CREATE INDEX IF NOT EXISTS idx_world_host_turns_input
       ON world_host_turns(causation_input_id, created_at);
   `);
+  const insertExecutionContext = db.prepare(`
+    INSERT OR IGNORE INTO world_host_execution_contexts (
+      context_fingerprint, executor_type, world_fingerprint, created_at
+    ) VALUES (?, ?, ?, ?)
+  `);
+  for (const context of db
+    .prepare(`
+      SELECT codex_thread_id, provider, space_id,
+        COALESCE(last_started_at, updated_at, created_at) AS created_at
+      FROM world_host_executors
+      WHERE codex_thread_id IS NOT NULL
+    `)
+    .all()) {
+    insertExecutionContext.run(
+      createHash("sha256").update(context.codex_thread_id).digest("hex"),
+      context.provider,
+      createHash("sha256").update(context.space_id).digest("hex"),
+      context.created_at,
+    );
+  }
   migrateWorldDeliveryOutbox(db);
   ensureColumn(
     db,

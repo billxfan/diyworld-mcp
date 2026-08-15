@@ -10,6 +10,10 @@ device, social, message, and World identifier.
 - npm package, protocol, platform, World, rules/story, and Host versions are
   independent. Content and Host changes do not consume npm versions unless the
   shipped client code changes.
+- During the `0.9` beta, a releasable client artifact advances only the patch
+  number. Minor and major increments require an explicit compatibility or
+  product milestone; service builds and content releases do not consume npm
+  versions.
 - New connections may start with `@latest`, but every generated MCP runtime
   configuration pins an exact package version.
 - Existing clients upgrade only through `npx -y @diyworld/mcp@latest upgrade`.
