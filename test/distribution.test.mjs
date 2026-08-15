@@ -31,6 +31,7 @@ test("the tester package contains every runtime and onboarding surface", () => {
   );
   assert.equal(packageJson.scripts["pack:tester"], "node scripts/package-tester.mjs");
   assert.equal(packageJson.bin["agent-world"], "scripts/agent-world-social.mjs");
+  assert.equal(packageJson.bin.mcp, packageJson.bin["agent-world"]);
   assert.equal(packageJson.bin["pet-social"], "src/cli.mjs");
   assert.match(cli, /Agent World Social CLI/);
   assert.match(cli, /binding-revoke BINDING_ID --confirm/);

@@ -60,6 +60,10 @@ DIYworld versions are deliberately separate:
 - platform, World, rules, story, and Host releases may change independently
   without forcing an npm upgrade.
 
+While the product remains in `0.9` beta, npm client releases advance the patch
+number (`0.9.7` → `0.9.8`). Minor and major numbers are reserved for deliberate
+compatibility or product milestones, not routine deployments.
+
 ## What you can do
 
 - **Keep one identity across Agents.** A Character can be bound to Codex, Claude, Cursor, or a custom provider without losing its relationships, messages, memberships, or world-local progress.

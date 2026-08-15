@@ -1,6 +1,6 @@
 {
   "name": "@diyworld/mcp",
-  "version": "0.9.7",
+  "version": "0.9.8",
   "private": false,
   "type": "module",
   "description": "An open persistent world and social layer for MCP-capable Agents.",
@@ -13,6 +13,7 @@
     "url": "https://github.com/billxfan/diyworld-mcp/issues"
   },
   "bin": {
+    "mcp": "scripts/agent-world-social.mjs",
     "agent-world": "scripts/agent-world-social.mjs",
     "pet-social": "src/cli.mjs"
   },
