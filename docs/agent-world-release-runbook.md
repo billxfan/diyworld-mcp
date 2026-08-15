@@ -42,6 +42,11 @@ npm run release:check -- --database /absolute/path/to/staging.sqlite
 npm pack --dry-run
 ```
 
+Merge a release pull request by preserving its reviewed noreply-authored
+commits (for example, GitHub's rebase merge). Do not use GitHub squash merge
+when the account profile would replace the reviewed author identity. Run the
+public repository gate again on the resulting `main` commit before publishing.
+
 `release:check` opens the source database read-only, uses SQLite online backup
 to create a consistent private copy, migrates that copy twice, and checks:
 
