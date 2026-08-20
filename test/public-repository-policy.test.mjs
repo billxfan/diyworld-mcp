@@ -22,7 +22,7 @@ test("the current public tree and post-baseline commits contain no known private
   assert.ok(result.checkedFiles > 0);
 });
 
-test("GitHub-authored merge commits may retain the account author identity", () => {
+test("GitHub-authored merge and squash commits may retain the account author identity", () => {
   assert.equal(
     isGitHubMergeCommit({
       committerEmail: `noreply@${"github.com"}`,
@@ -37,7 +37,7 @@ test("GitHub-authored merge commits may retain the account author identity", () 
       committerName: "GitHub",
       parents: "a".repeat(40),
     }),
-    false,
+    true,
   );
   assert.equal(
     isGitHubMergeCommit({

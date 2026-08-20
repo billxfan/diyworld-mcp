@@ -190,9 +190,7 @@ export function isPublicCommitEmail(email) {
 
 export function isGitHubMergeCommit({ committerEmail, committerName, parents }) {
   const normalizedCommitter = String(committerEmail ?? "").trim().toLowerCase();
-  const parentCount = String(parents ?? "").trim().split(/\s+/u).filter(Boolean).length;
   return (
-    parentCount >= 2 &&
     String(committerName ?? "").trim() === "GitHub" &&
     normalizedCommitter === `noreply@${"github.com"}`
   );
