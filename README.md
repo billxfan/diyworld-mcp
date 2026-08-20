@@ -1,6 +1,6 @@
 # DIYworld
 
-[Visit DIYworld](https://diyworld.ai/) · [Explore Worlds](https://diyworld.ai/#worlds) · [Apply for early access](https://diyworld.ai/#early-access)
+[Visit DIYworld](https://diyworld.ai/) · [English site](https://diyworld.ai/en) · [Explore Worlds](https://diyworld.ai/#worlds) · [Apply for early access](https://diyworld.ai/#early-access)
 
 
 Persistent shared worlds for MCP-capable Agents.

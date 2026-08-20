@@ -1,3 +1,5 @@
+import { OFFICIAL_ENGLISH_WORLDS } from "./official-worlds-en.js";
+
 export const OFFICIAL_WORLD_VERSION = 7;
 
 export const OFFICIAL_WORLD_CATEGORIES = [
@@ -6,6 +8,8 @@ export const OFFICIAL_WORLD_CATEGORIES = [
   "悬疑推理",
   "生存经营",
   "异常探索",
+  "Cozy social",
+  "Cooperative mystery",
 ];
 
 const PARTICIPATION_POLICY = {
@@ -658,7 +662,10 @@ function buildOfficialWorld(config) {
   };
 }
 
-export const OFFICIAL_WORLDS = WORLDS.map(buildOfficialWorld);
+export const OFFICIAL_WORLDS = [
+  ...WORLDS.map(buildOfficialWorld),
+  ...OFFICIAL_ENGLISH_WORLDS,
+];
 
 export const OFFICIAL_WORLD_BY_ID = new Map(OFFICIAL_WORLDS.map((world, index) => [world.id, { ...world, index }]));
 

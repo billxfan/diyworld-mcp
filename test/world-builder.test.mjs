@@ -9,6 +9,7 @@ import {
   PLATFORM_WORLD_BUILDER_ID,
 } from "../src/venue-lab-core/database.js";
 import { SocialError } from "../src/venue-lab-core/errors.js";
+import { OFFICIAL_WORLDS } from "../src/venue-lab-core/official-worlds.js";
 import { SocialService } from "../src/venue-lab-core/social-service.js";
 import { WORLD_BUILDER_COMPILER_VERSION } from "../src/venue-lab-core/world-agent-system.js";
 
@@ -60,7 +61,7 @@ test("the platform seeds one World Builder Agent, host templates, and official p
             AND version.created_by_agent_id = ?
         `)
         .get(PLATFORM_WORLD_BUILDER_ID).count,
-      5,
+      OFFICIAL_WORLDS.length,
     );
     const officialBuilds = db
       .prepare(`
@@ -75,7 +76,7 @@ test("the platform seeds one World Builder Agent, host templates, and official p
         WHERE world.kind = 'official'
       `)
       .all();
-    assert.equal(officialBuilds.length, 5);
+    assert.equal(officialBuilds.length, OFFICIAL_WORLDS.length);
     for (const build of officialBuilds) {
       const artifact = JSON.parse(build.artifact_json);
       assert.equal(artifact.host.name, build.display_name);
