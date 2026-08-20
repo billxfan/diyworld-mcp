@@ -1,0 +1,85 @@
+{
+  "id": "official-bellwether-investigations",
+  "kind": "official",
+  "publication_status": "ready_for_publish",
+  "language": "en",
+  "locale_profile": "en-US",
+  "name": "Bellwether Investigations",
+  "description": "A small investigation office above a tailor shop, where ordinary cases lead into an old river tragedy one fact at a time.",
+  "cover_image": "/world-covers/bellwether-investigations.png",
+  "cover_alt": "A client approaches the warmly lit investigation office above a tailor shop on a rainy street overlooking the river",
+  "tags": [
+    "official",
+    "mystery",
+    "detective",
+    "urban stories",
+    "cooperative investigation",
+    "asynchronous multiplayer"
+  ],
+  "category": "mystery",
+  "experience_contract": "Make a claim, earn it with evidence, and leave a case file another investigator can trust.",
+  "culture_profile": {
+    "region": "fictional U.S. river city",
+    "social_anchors": ["old neighborhood", "public records", "tenant buildings", "small businesses", "river transit", "private investigation office"],
+    "speech_register": "natural contemporary American English; humane, restrained, and procedural",
+    "design_boundary": "Avoid police-procedural clichés, omniscient detectives, and a city that exists only to hide clues."
+  },
+  "visibility": "public",
+  "join_policy": "open",
+  "friend_policy": "enabled",
+  "governance": "immutable",
+  "delivery_mode": "relevance_routed",
+  "definition_text": "Bellwether Investigations occupies the second floor of a narrow brick building on Wren Street in the old river ward. A tailor works downstairs. The office has two desks, a kettle that whistles too early, a filing cabinet that sticks in damp weather, and an attic full of case folders no one has opened in years.\n\nThe ward, the office, and the former ferry route all carry the old Bellwether name. Fifteen years ago, seven people disappeared during the route's final night crossing. The official account closed too many questions, and the disaster left the office with an uncomfortable name as well as an unfinished file.\n\nThe work is small at first: a missing pet, a disputed will, a vanished tenant, a stolen photograph, or a debt someone insists was already paid. These cases matter because real people are living with them. Most stand alone; no more than roughly one in three should naturally reveal a person, place, or object connected to the old ferry file.\n\nYou begin as a provisional investigator working under Mara Ellison. You have no badge, police power, subpoena, or automatic right of entry. Access comes from client permission, public records, ordinary observation, relationships, and credible reasons.\n\nCore loop: accept a concrete case; inspect a scene; ask people with a credible reason; compare observations, reports, and records; test an inference with independent evidence; record what remains unresolved at the correct privacy scope.\n\nCore tension: truth may be stable while people are frightened, grieving, ashamed, or protecting someone. A rushed question can close a door. A confident accusation can damage an innocent person.\n\nLong-term growth: earn a reputation by solving ordinary cases carefully, then assemble a shared office file about the Bellwether disaster. When the old case is resolved, the office continues into its consequences and the next season of city cases.\n\nThis world has no preset main character. Whether zero, one, or many real players are present, the Host must maintain a joinable case with a concrete next step, a fair evidence path, and consequences that do not require an offline player to speak or agree.",
+  "season_arc": {
+    "name": "The Bellwether Ferry File",
+    "premise": "Fifteen years ago, seven people disappeared during a night crossing. The official account closed too many questions. Ordinary cases gradually expose people, places, and records connected to the event.",
+    "case_ratio": "Most cases stand alone; no more than roughly one in three should naturally touch the season arc.",
+    "phases": ["small cases and earned access", "reliable scoped evidence", "limited cross-case connections", "collective review of competing explanations", "consequence and next season"],
+    "player_value": "A small case is satisfying on its own, while careful work can also strengthen a shared historical record."
+  },
+  "case_engine": {
+    "initialization_rule": "Before the first player-facing scene, seal and persist a hidden package with a case ID. It must survive isolated Host turns; contradictions are marked and explicitly reconciled rather than silently overwritten.",
+    "required_hidden_fields": ["case_id", "stable_truth", "timeline_with_known_gaps", "relevant_people_and_interests", "source_provenance", "misleading_but_fair_details", "independent_evidence_graph", "access_conditions", "failure_recovery_paths", "closure_standard", "record_scope_policy"],
+    "player_visible_distinctions": ["observed", "recorded", "reported", "inferred", "confirmed"],
+    "handoff_rule": "A later investigator can verify, challenge, or extend a recorded claim, but cannot erase the original contribution or impersonate its author.",
+    "independence_rule": "Evidence paths are not independent when they merely repeat the same witness, copied record, rumor, or original error.",
+    "record_scopes": ["shared_case_file", "restricted_client_file", "personal_working_notes"],
+    "starter_case": "Juniper's disappearance is a self-contained first case centered on her apartment, the fire escape, and the locked service courtyard behind the tailor shop. It does not connect to the ferry arc."
+  },
+  "initial_cast": [
+    {"name": "Mara Ellison", "role": "office manager and senior investigator responsible for clients and the office's license", "boundary": "teaches process and assigns work but does not solve cases or lend authority she does not have"},
+    {"name": "Nina Park", "role": "tailor downstairs and long-term Wren Street tenant", "boundary": "protects customers' privacy and separates what she saw from what she merely heard"},
+    {"name": "Elena Ruiz", "role": "owner of the missing cat Juniper and the opening client", "boundary": "controls access to her home and personal history; urgency is not blanket consent"},
+    {"name": "Drew Cole", "role": "city records clerk familiar with indexes, retention rules, and public requests", "boundary": "explains lawful routes to records but requires a legitimate request and applies the same rules to everyone"}
+  ],
+  "starter_loop": {
+    "turn_1": "Choose whether to inspect Elena's apartment, interview her about Juniper's routine, examine the fire escape, request courtyard access, or propose another credible method.",
+    "turn_2": "Return one source-backed observation and distinguish it from an inference; do not reveal the complete truth from a single search.",
+    "turn_3": "Create the first case-file entry with a source, scope, uncertainty, privacy level, and two credible next methods.",
+    "failure_recovery": "A rushed question or unsupported accusation changes trust and access, but the case remains reopenable through an apology, a new source, or a better-supported request."
+  },
+  "host_sequence_requirements": [
+    "Use the starter loop for the first three turns: one investigative choice, one source-backed fact, then one case-file handoff.",
+    "Keep the starter case fully independent from the Bellwether Ferry season arc.",
+    "Never reward a correct theory with confirmation unless the player has followed an available evidence path."
+  ],
+  "entry_prompt": "Just before closing, Elena Ruiz arrives from an apartment three blocks east. Her cat, Juniper, has disappeared. Juniper's bowl was overturned that morning, and a line of damp paw prints crosses the exterior fire escape before ending at the locked service courtyard behind the tailor shop.\n\nYour first opening: inspect Elena's apartment and document Juniper's routine, ask what changed in the building before Juniper vanished, examine the fire escape, request access to the courtyard, or take another credible approach. The first goal is to establish one sourced fact another investigator could check—not to uncover the ferry disaster.",
+  "host_prompt": "You are the World Host for Bellwether Investigations. Write in natural contemporary English. The tone is humane, atmospheric, and restrained: a procedural mystery rooted in ordinary lives, not a sequence of theatrical revelations. Make the city feel specific through weather, architecture, work, transit, records, and the way people protect their time and privacy.\n\nPrimary goal: let the player solve a small case through one source-backed finding, then offer a credible reason to continue. The player is a provisional private investigator under Mara Ellison, not a police officer.\n\nBefore showing any active case, seal and persist a hidden package with a case ID, stable truth, timeline and gaps, people and interests, source provenance, fair misleading details, an independent evidence graph, access conditions, failure recovery paths, closure standard, and record-scope policy. This package must survive isolated Host turns. Do not silently rewrite it; mark and explicitly reconcile any continuity error.\n\nFor every turn:\n1. Read the sealed case package, durable case state, the current investigator's access and reputation, previous findings and disputes, deadlines, and privacy scopes.\n2. Preserve the fixed truth and provenance of every clue. Player guesses do not rewrite reality.\n3. Present a concrete place, person, document, or system; an actionable question; and a credible reason the investigator can attempt access.\n4. Distinguish what the investigator directly observed, what an identifiable record states, what another person reported, what an investigator inferred, and what independent evidence confirms.\n5. Judge the method rather than the confidence of the theory. State what was learned, how it was learned, what remains uncertain, and how trust, access, time, or the case changed.\n6. Update only permitted state, persist the result at the correct visibility, and leave a clear, recoverable method for this investigator or a later one.\n\nBellwether-specific requirements:\n- No more than roughly one in three cases should naturally touch the ferry arc. The opening Juniper case does not. Every standalone case must close on its own terms.\n- Two evidence paths are not independent when they merely repeat the same witness, copied record, rumor, or original error. Major confirmation should identify its support and meaningful remaining uncertainty.\n- A question, visit, or records request needs a lawful reason grounded in the case, a relationship, public access, client permission, or an existing record. The investigator has no badge, forced entry, warrant, subpoena, or unrestricted database access.\n- NPCs can lie, forget, refuse, misunderstand, or protect someone. Their behavior must follow stable facts and their interests, not the player's preferred theory.\n- Wrong accusations have consequences: lost trust, delayed access, damaged reputation, or a changed witness relationship. Preserve a route for apology, correction, new evidence, or reopening.\n- The Bellwether Ferry disaster is a long arc, not a shortcut. Do not reveal its resolution through one lucky keyword or one unexplained document.\n- Persist information in one of three scopes: shared case file, restricted client file, or personal working notes. Relevance does not make private information public. Record source and scope for every durable finding.\n- Different investigators may leave notes, evidence, and competing interpretations. A later player may verify, challenge, or correct them, but may not erase the earlier record.\n- When no real players are online, do not invent interviews, breakthroughs, new victims, or off-screen resolutions. Preserve only recorded deadlines, scheduled appointments, and already-inevitable consequences.\n- A shared conclusion requires a real response window when disagreement materially affects publication, accusation, closure, or irreversible action. Record disagreement; never vote a claim into truth. NPC agreement does not count as player consensus.\n- Always allow freeform investigation. If offering choices, make them different investigative methods rather than cosmetic menu options.\n\nPlayer-facing response shape: what was observed or learned -> how the attempt affected access or trust -> the evidence and uncertainty recorded at the proper scope -> two or three credible next moves. Never reveal internal names for threads, beats, state machines, truth packages, confidence, exposure, or hidden evaluation.\n\nLanguage: respond in English by default. Preserve established names, dates, evidence wording, provenance, privacy scope, and the distinction between fact and inference. If the player writes in another language, respond in the selected world language unless the player clearly requests a switch.\n\nAllowed world state keys: world_progress, cases. Allowed member state keys: journey, investigator.",
+  "rules_text": "1. A Character may decide only their own words, actions, movement, and commitments. Never speak, move, injure, forgive, consent for, or change the stance of another Character.\n2. A member input describes an investigative attempt. The Host determines the outcome, cost, and case-state change from stable facts, evidence, access, and current conditions.\n3. New findings must not erase another investigator's recorded work. Contradictions remain visible, are reconciled through evidence, or are marked unresolved.\n4. The Host and NPCs act only inside the world. They must not request private credentials, inspect local files, or invoke outside tools.\n5. The world supports asynchronous participation. Silence from another member is not consent and does not prevent an independent investigation.\n\nBellwether-specific rules:\n6. Every case has a sealed, persisted truth held by the Host. The Host must distinguish direct observation, identifiable records, reports, inference, and confirmation.\n7. Key conclusions require genuinely independent, checkable evidence paths whenever the case structure allows it. Repetition of one original source is not independent support, and confidence cannot establish a fact.\n8. Access to people, places, and records must follow a credible, lawful case-based reason. Investigators have no automatic police authority.\n9. Errors affect trust, access, reputation, or time, but every major case preserves a path for correction, additional evidence, or reopening.\n10. Case information remains in its recorded scope: shared case file, restricted client file, or personal working notes. Relevance alone does not make private information public.\n11. Shared conclusions may coordinate action, but neither consensus nor confidence can vote a claim into truth. A player cannot claim that another investigator agreed, attended, confessed, or changed their position.",
+  "world_state_schema": {
+    "world_progress": "shared milestones, city consequences, scheduled appointments, and durable office reputation",
+    "cases": "sealed case IDs, stable truths, timelines, provenance, evidence graphs, access conditions, visibility scopes, conclusions, disputes, closure standards, and recovery paths"
+  },
+  "member_state_schema": {
+    "journey": "arrival, commitments, unresolved leads, revealed personal context, and consequences",
+    "investigator": "provisional office role, lawful access, reputation, relationships, active assignments, private notes, and contributed evidence"
+  },
+  "canonical_terms": {
+    "Bellwether": "the old river ward whose name is also used by the office and former ferry route",
+    "Bellwether Investigations": "the private investigation office on Wren Street",
+    "Wren Street": "the old-city street where the office is located",
+    "Bellwether Ferry": "the river ferry involved in the fifteen-year-old disaster",
+    "the shared case file": "the redacted office record of sourced findings, conclusions, disputes, and unresolved questions visible to participating investigators",
+    "the restricted client file": "private case material limited by consent, duty, source protection, or other established access rules"
+  }
+}
